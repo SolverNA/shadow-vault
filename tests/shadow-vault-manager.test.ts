@@ -1,9 +1,11 @@
 /**
  * Интеграционные тесты для ShadowVaultManager.
  *
- * Стратегия: реальные файловые операции в temp-директориях.
- * MockAdapter оборачивает fs-операции над originalRoot — симулирует
- * "что делал бы Obsidian без нашего патча".
+ * Архитектура:
+ *   originalRoot/<name>.enc  — зашифрованные файлы
+ *   shadowRoot/<name>        — расшифрованные файлы (рабочая копия)
+ *
+ * MockAdapter симулирует оригинальный адаптер Obsidian над originalRoot.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "@jest/globals";
@@ -16,8 +18,7 @@ import { CryptoEngine } from "../src/crypto-engine";
 import { IDataAdapter, AdapterStat, DataWriteOptions, ListedFiles } from "../src/adapter-types";
 
 // ─────────────────────────────────────────────
-// MockAdapter — симуляция оригинального адаптера Obsidian
-// Работает с реальными файлами в originalRoot через fs.promises.
+// MockAdapter — оригинальный адаптер Obsidian (работает с originalRoot напрямую)
 // ─────────────────────────────────────────────
 class MockAdapter implements IDataAdapter {
   constructor(public readonly basePath: string) {}
@@ -135,19 +136,22 @@ async function makeEnv(): Promise<TestEnv> {
 }
 
 // ─────────────────────────────────────────────
-// Утилиты для тестов
+// Утилиты
 // ─────────────────────────────────────────────
 
-/** Записывает зашифрованный файл в originalRoot напрямую (симулирует уже зашифрованные файлы) */
+/**
+ * Записывает зашифрованный файл в originalRoot как <relPath>.enc
+ * (симулирует файл, уже прошедший шифрование — нормальное состояние хранилища).
+ */
 async function writeEncrypted(env: TestEnv, relPath: string, plaintext: string): Promise<void> {
-  const absPath = nodePath.join(env.origRoot, ...relPath.split("/"));
-  await fsp.mkdir(nodePath.dirname(absPath), { recursive: true });
+  const encPath = nodePath.join(env.origRoot, ...relPath.split("/")) + ".enc";
+  await fsp.mkdir(nodePath.dirname(encPath), { recursive: true });
   const encrypted = env.engine.encryptBuffer(Buffer.from(plaintext, "utf8"));
-  await fsp.writeFile(absPath, encrypted);
+  await fsp.writeFile(encPath, encrypted);
 }
 
 // ─────────────────────────────────────────────
-// Тесты инициализации и путей
+// Инициализация и пути
 // ─────────────────────────────────────────────
 
 describe("ShadowVaultManager — инициализация и пути", () => {
@@ -176,6 +180,10 @@ describe("ShadowVaultManager — инициализация и пути", () => 
       expect(env.manager.originalAbs("Notes/MyNote.md")).toBe(
         nodePath.join(env.origRoot, "Notes", "MyNote.md")
       );
+      // originalEncAbs добавляет .enc
+      expect(env.manager.originalEncAbs("Notes/MyNote.md")).toBe(
+        nodePath.join(env.origRoot, "Notes", "MyNote.md") + ".enc"
+      );
     } finally { env.cleanup(); }
   });
 
@@ -192,27 +200,28 @@ describe("ShadowVaultManager — инициализация и пути", () => 
 });
 
 // ─────────────────────────────────────────────
-// Тесты операций чтения
+// Тесты чтения
 // ─────────────────────────────────────────────
 
 describe("ShadowVaultManager — read()", () => {
   it("читает уже зашифрованный файл: расшифровывает и возвращает plaintext", async () => {
     const env = await makeEnv();
     try {
+      // В original: note.md.enc
       await writeEncrypted(env, "note.md", "# Hello\n\nSecret content.");
       const result = await env.adapter.read("note.md");
       expect(result).toBe("# Hello\n\nSecret content.");
     } finally { env.cleanup(); }
   });
 
-  it("повторное read() берёт данные из shadow-кэша без повторной расшифровки", async () => {
+  it("повторное read() берёт данные из shadow-кэша (кэш-хит)", async () => {
     const env = await makeEnv();
     try {
       await writeEncrypted(env, "note.md", "cached content");
-      await env.adapter.read("note.md");
+      await env.adapter.read("note.md"); // первый read → decryptStream → shadow/note.md
 
-      // Удаляем зашифрованный оригинал — если повторный read() не лезет туда, тест пройдёт
-      await fsp.unlink(nodePath.join(env.origRoot, "note.md"));
+      // Удаляем .enc оригинал — повторный read() должен брать из shadow
+      await fsp.unlink(nodePath.join(env.origRoot, "note.md.enc"));
       const result = await env.adapter.read("note.md");
       expect(result).toBe("cached content");
     } finally { env.cleanup(); }
@@ -236,11 +245,11 @@ describe("ShadowVaultManager — read()", () => {
 });
 
 // ─────────────────────────────────────────────
-// Тесты операций записи
+// Тесты записи
 // ─────────────────────────────────────────────
 
 describe("ShadowVaultManager — write()", () => {
-  it("write() создаёт файл в shadow И зашифрованный файл в original", async () => {
+  it("write() создаёт plaintext в shadow и .enc файл в original", async () => {
     const env = await makeEnv();
     try {
       await env.adapter.write("new-note.md", "Hello, vault!");
@@ -251,18 +260,18 @@ describe("ShadowVaultManager — write()", () => {
       );
       expect(shadowContent).toBe("Hello, vault!");
 
-      // Оригинальное хранилище: зашифрованный блоб
-      const encBuf = await fsp.readFile(nodePath.join(env.origRoot, "new-note.md"));
-      expect(encBuf.length).toBeGreaterThan(28); // заголовок 28 байт + данные
+      // Оригинальное хранилище: зашифрованный файл с суффиксом .enc
+      const encBuf = await fsp.readFile(nodePath.join(env.origRoot, "new-note.md.enc"));
+      expect(encBuf.length).toBeGreaterThan(28); // IV(12) + AuthTag(16) + данные
     } finally { env.cleanup(); }
   });
 
-  it("зашифрованный файл в original можно расшифровать обратно", async () => {
+  it("зашифрованный .enc файл в original можно расшифровать обратно", async () => {
     const env = await makeEnv();
     try {
       await env.adapter.write("secret.md", "Top secret");
 
-      const encBuf = await fsp.readFile(nodePath.join(env.origRoot, "secret.md"));
+      const encBuf = await fsp.readFile(nodePath.join(env.origRoot, "secret.md.enc"));
       const decBuf = env.engine.decryptBuffer(encBuf);
       expect(decBuf.toString("utf8")).toBe("Top secret");
     } finally { env.cleanup(); }
@@ -274,7 +283,7 @@ describe("ShadowVaultManager — write()", () => {
       await env.adapter.write("Projects/Alpha/notes.md", "project notes");
 
       expect(fs.existsSync(nodePath.join(env.shadowRoot, "Projects", "Alpha", "notes.md"))).toBe(true);
-      expect(fs.existsSync(nodePath.join(env.origRoot,   "Projects", "Alpha", "notes.md"))).toBe(true);
+      expect(fs.existsSync(nodePath.join(env.origRoot,   "Projects", "Alpha", "notes.md.enc"))).toBe(true);
     } finally { env.cleanup(); }
   });
 
@@ -289,7 +298,7 @@ describe("ShadowVaultManager — write()", () => {
       );
       expect(shadowContent).toBe("version 2");
 
-      const encBuf = await fsp.readFile(nodePath.join(env.origRoot, "note.md"));
+      const encBuf = await fsp.readFile(nodePath.join(env.origRoot, "note.md.enc"));
       const dec = env.engine.decryptBuffer(encBuf);
       expect(dec.toString("utf8")).toBe("version 2");
     } finally { env.cleanup(); }
@@ -299,7 +308,8 @@ describe("ShadowVaultManager — write()", () => {
     const env = await makeEnv();
     try {
       await env.adapter.write("atomic.md", "data");
-      const tmpPath = nodePath.join(env.origRoot, "atomic.md.shadowtmp");
+      // Временный файл atomicWrite: note.md.enc.shadowtmp
+      const tmpPath = nodePath.join(env.origRoot, "atomic.md.enc.shadowtmp");
       expect(fs.existsSync(tmpPath)).toBe(false);
     } finally { env.cleanup(); }
   });
@@ -355,10 +365,11 @@ describe("ShadowVaultManager — process()", () => {
 // ─────────────────────────────────────────────
 
 describe("ShadowVaultManager — exists() и stat()", () => {
-  it("exists() возвращает true для зашифрованного файла", async () => {
+  it("exists() возвращает true для файла с .enc в original", async () => {
     const env = await makeEnv();
     try {
       await writeEncrypted(env, "note.md", "content");
+      // .enc файл существует → exists("note.md") → true
       expect(await env.adapter.exists("note.md")).toBe(true);
     } finally { env.cleanup(); }
   });
@@ -388,7 +399,7 @@ describe("ShadowVaultManager — exists() и stat()", () => {
       const text = "12345"; // 5 байт
       await writeEncrypted(env, "sized.md", text);
       const stat = await env.adapter.stat("sized.md");
-      // Размер должен быть 5 (без 28 байт заголовка)
+      // Размер должен быть 5 (без 28 байт заголовка IV+AuthTag)
       expect(stat!.size).toBe(5);
     } finally { env.cleanup(); }
   });
@@ -399,17 +410,44 @@ describe("ShadowVaultManager — exists() и stat()", () => {
 // ─────────────────────────────────────────────
 
 describe("ShadowVaultManager — list()", () => {
-  it("list() возвращает файлы из original хранилища", async () => {
+  it("list() возвращает файлы из original хранилища (без суффикса .enc)", async () => {
     const env = await makeEnv();
     try {
+      // В original: a.md.enc, b.md.enc
       await writeEncrypted(env, "a.md", "A");
       await writeEncrypted(env, "b.md", "B");
       fs.mkdirSync(nodePath.join(env.origRoot, "Notes"));
 
       const result = await env.adapter.list("");
+      // list() снимает .enc суффикс → Obsidian видит a.md, b.md
       expect(result.files).toContain("a.md");
       expect(result.files).toContain("b.md");
       expect(result.folders).toContain("Notes");
+    } finally { env.cleanup(); }
+  });
+
+  it("list() не показывает сырые .enc файлы (только декодированные имена)", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "note.md", "content");
+      const result = await env.adapter.list("");
+      expect(result.files).not.toContain("note.md.enc");
+      expect(result.files).toContain("note.md");
+    } finally { env.cleanup(); }
+  });
+
+  it("list() скрывает .tmp и .shadowtmp файлы", async () => {
+    const env = await makeEnv();
+    try {
+      // Создаём "мусорные" временные файлы напрямую
+      await fsp.writeFile(nodePath.join(env.origRoot, "note.md.enc.tmp"), "garbage");
+      await fsp.writeFile(nodePath.join(env.origRoot, "note.md.enc.shadowtmp"), "garbage");
+      await writeEncrypted(env, "note.md", "content");
+
+      const result = await env.adapter.list("");
+      expect(result.files).toContain("note.md");
+      expect(result.files).not.toContain("note.md.enc.tmp");
+      expect(result.files).not.toContain("note.md.enc.shadowtmp");
     } finally { env.cleanup(); }
   });
 });
@@ -433,13 +471,26 @@ describe("ShadowVaultManager — rename() и remove()", () => {
     } finally { env.cleanup(); }
   });
 
-  it("remove() удаляет из обоих хранилищ", async () => {
+  it("rename() переносит .enc файл в original", async () => {
+    const env = await makeEnv();
+    try {
+      await env.adapter.write("old.md", "data");
+      await env.adapter.rename("old.md", "new.md");
+
+      expect(fs.existsSync(nodePath.join(env.origRoot, "old.md.enc"))).toBe(false);
+      expect(fs.existsSync(nodePath.join(env.origRoot, "new.md.enc"))).toBe(true);
+    } finally { env.cleanup(); }
+  });
+
+  it("remove() удаляет из обоих хранилищ (.enc в original, plaintext в shadow)", async () => {
     const env = await makeEnv();
     try {
       await env.adapter.write("to-delete.md", "bye");
       await env.adapter.remove("to-delete.md");
 
-      expect(fs.existsSync(nodePath.join(env.origRoot, "to-delete.md"))).toBe(false);
+      // .enc удалён из original
+      expect(fs.existsSync(nodePath.join(env.origRoot, "to-delete.md.enc"))).toBe(false);
+      // plaintext удалён из shadow
       expect(fs.existsSync(nodePath.join(env.shadowRoot, "to-delete.md"))).toBe(false);
     } finally { env.cleanup(); }
   });
@@ -450,19 +501,16 @@ describe("ShadowVaultManager — rename() и remove()", () => {
 // ─────────────────────────────────────────────
 
 describe("ShadowVaultManager — bypass для .obsidian", () => {
-  it("write() к .obsidian пишет незашифрованный файл в original", async () => {
+  it("write() к .obsidian пишет незашифрованный файл в original (без .enc)", async () => {
     const env = await makeEnv();
     try {
       fs.mkdirSync(nodePath.join(env.origRoot, ".obsidian"), { recursive: true });
       await env.adapter.write(".obsidian/app.json", '{"theme":"dark"}');
 
-      // Файл должен быть в оригинальном хранилище как есть (незашифрован)
       const content = fs.readFileSync(
         nodePath.join(env.origRoot, ".obsidian", "app.json"), "utf8"
       );
       expect(content).toBe('{"theme":"dark"}');
-
-      // В теневом хранилища не должен появиться
       expect(fs.existsSync(nodePath.join(env.shadowRoot, ".obsidian"))).toBe(false);
     } finally { env.cleanup(); }
   });
@@ -485,19 +533,55 @@ describe("ShadowVaultManager — bypass для .obsidian", () => {
 // ─────────────────────────────────────────────
 
 describe("ShadowVaultManager — unpatch()", () => {
-  it("после unpatch() адаптер возвращается к оригинальному поведению", async () => {
+  it("после unpatch() адаптер читает raw файлы из original (note.md.enc не читается как текст)", async () => {
     const env = await makeEnv();
     try {
-      // Записываем через патченый адаптер — создаст зашифрованный файл в original
       await env.adapter.write("note.md", "secret");
-
-      // Снимаем патч
       env.manager.unpatch(env.adapter);
 
-      // Теперь read() читает raw-байты напрямую из original (зашифрованный блоб)
-      // — это НЕ будет "secret"
-      const rawContent = await env.adapter.read("note.md");
-      expect(rawContent).not.toBe("secret"); // сырые байты шифртекста
+      // После снятия патча: в original есть только note.md.enc (не note.md)
+      // Оригинальный адаптер ищет note.md → файла нет → throw
+      await expect(env.adapter.read("note.md")).rejects.toThrow();
+
+      // .enc файл существует
+      expect(fs.existsSync(nodePath.join(env.origRoot, "note.md.enc"))).toBe(true);
+    } finally { env.cleanup(); }
+  });
+});
+
+// ─────────────────────────────────────────────
+// Тесты миграции (encryptAllExisting)
+// ─────────────────────────────────────────────
+
+describe("ShadowVaultManager — encryptAllExisting() (миграция)", () => {
+  it("шифрует незашифрованные файлы и удаляет оригиналы", async () => {
+    const env = await makeEnv();
+    try {
+      // Пишем plaintext напрямую (как будто vault существовал до плагина)
+      await fsp.writeFile(nodePath.join(env.origRoot, "plain.md"), "plaintext content");
+
+      expect(await env.manager.hasPendingMigration()).toBe(true);
+
+      await env.manager.encryptAllExisting();
+
+      // plain.md удалён, plain.md.enc создан
+      expect(fs.existsSync(nodePath.join(env.origRoot, "plain.md"))).toBe(false);
+      expect(fs.existsSync(nodePath.join(env.origRoot, "plain.md.enc"))).toBe(true);
+
+      // .enc расшифровывается корректно
+      const encBuf = await fsp.readFile(nodePath.join(env.origRoot, "plain.md.enc"));
+      const dec = env.engine.decryptBuffer(encBuf);
+      expect(dec.toString("utf8")).toBe("plaintext content");
+
+      expect(await env.manager.hasPendingMigration()).toBe(false);
+    } finally { env.cleanup(); }
+  });
+
+  it("hasPendingMigration() = false когда все файлы зашифрованы", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "note.md", "content");
+      expect(await env.manager.hasPendingMigration()).toBe(false);
     } finally { env.cleanup(); }
   });
 });

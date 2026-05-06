@@ -150,6 +150,15 @@ export default class ShadowVaultPlugin extends Plugin {
       );
       await this.shadowManager.initialize();
 
+      // Миграция: если в оригинальном хранилище есть незашифрованные файлы
+      // (первая установка плагина на существующий vault) — шифруем их.
+      // Это КРИТИЧНО: без шифрования оригиналов пользователь видит заметки без пароля.
+      if (await this.shadowManager.hasPendingMigration()) {
+        new Notice("⏳ ShadowVault: шифруем существующие файлы хранилища...", 5000);
+        await this.shadowManager.encryptAllExisting();
+        new Notice("✅ ShadowVault: все файлы зашифрованы.", 4000);
+      }
+
       // Патчим адаптер ДО startSession — чтобы операции recovery шли
       // через правильные пути (bypass для .obsidian и т.д.)
       this.shadowManager.patch(

@@ -1,78 +1,75 @@
 /**
  * ShadowVaultManager — ядро VFS-слоя плагина ShadowVault.
  *
- * Реализует паттерн "proxy через monkey-patching":
- *   - Сохраняет ссылки на оригинальные методы адаптера Obsidian.
- *   - Заменяет их обёртками, которые перенаправляют операции через
- *     два физических хранилища: Оригинальное (зашифрованное) и Теневое (расшифрованное).
+ * Два физических хранилища:
+ *   Оригинальное  (originalRoot) — зашифрованные файлы формата <name>.<ext>.enc
+ *   Теневое       (shadowRoot)   — расшифрованные файлы <name>.<ext>, рядом с оригинальным,
+ *                                  НЕ внутри него: parentDir/.shadow-vault-<hash>
  *
- * Маршрутизация операций:
- *   ┌─────────────────────────────────────────────────────────────────────┐
- *   │  normalizedPath начинается с '.obsidian'?                           │
- *   │       ДА  →  пробрасываем в оригинальный адаптер БЕЗ шифрования    │
- *   │       НЕТ →  read/write через Теневое хранилище + шифрование       │
- *   └─────────────────────────────────────────────────────────────────────┘
+ * Маршрутизация:
+ *   ┌──────────────────────────────────────────────────────────────────┐
+ *   │  normalizedPath начинается с '.obsidian'?                        │
+ *   │       ДА  →  оригинальный адаптер без изменений                 │
+ *   │       НЕТ →  read  из shadow (lazy decrypt от оригинала)        │
+ *   │              write в shadow + немедленное шифрование в оригинал │
+ *   └──────────────────────────────────────────────────────────────────┘
  *
- * Гарантии сохранности данных:
- *   - Запись в Оригинальное хранилище всегда атомарна (tmpFile + fs.rename).
- *   - При чтении файла, которого нет в Теневом хранилище — он расшифровывается
- *     из Оригинального "на лету" (lazy decrypt / on-demand).
- *   - Метод unpatch() полностью восстанавливает оригинальный адаптер.
+ * Формат зашифрованных файлов в originalRoot:
+ *   note.md  →  note.md.enc    (IV 12б + AuthTag 16б + шифртекст)
+ *   img.png  →  img.png.enc
+ *
+ * Obsidian при вызове list() получает пути БЕЗ суффикса .enc, т.е. видит "note.md".
+ * Все внутренние операции (ensureDecrypted, write-through) добавляют .enc сами.
  */
 
 import * as fs from "fs";
 import * as fsp from "fs/promises";
 import * as nodePath from "path";
-import * as os from "os";
 import * as crypto from "crypto";
 import { CryptoEngine } from "./crypto-engine";
 import { IDataAdapter, AdapterStat, DataWriteOptions, ListedFiles } from "./adapter-types";
 
-/** Размер заголовка зашифрованного файла: IV (12 б) + AuthTag (16 б) */
+/** Суффикс зашифрованных файлов в оригинальном хранилище */
+const ENCRYPTED_EXT = ".enc";
+
+/** Размер криптографического заголовка: IV (12 б) + AuthTag (16 б) */
 const CRYPTO_HEADER_SIZE = 28;
 
 export class ShadowVaultManager {
   private readonly engine: CryptoEngine;
-  /** Абсолютный путь к зашифрованному (оригинальному) хранилищу */
+  /** Абсолютный путь к оригинальному (зашифрованному) хранилищу */
   readonly originalRoot: string;
-  /** Абсолютный путь к расшифрованному (теневому) хранилищу */
+  /** Абсолютный путь к теневому (расшифрованному) хранилищу */
   readonly shadowRoot: string;
 
-  /** Флаг — адаптер уже пропатчен */
   private patched = false;
-
-  /**
-   * Сохранённые ссылки на оригинальные методы адаптера.
-   * Восстанавливаются при вызове unpatch() или при краше.
-   */
   private originalMethods: Partial<IDataAdapter> = {};
 
   constructor(engine: CryptoEngine, originalRoot: string, shadowRoot?: string) {
     this.engine = engine;
     this.originalRoot = nodePath.normalize(originalRoot);
 
-    // По умолчанию: /tmp/shadowvault-<детерминированный хеш оригинального пути>
-    // Детерминированность важна для crash recovery — директория переживёт перезапуск
-    this.shadowRoot = shadowRoot
-      ? nodePath.normalize(shadowRoot)
-      : nodePath.join(
-          os.tmpdir(),
-          "shadowvault-" + crypto
-            .createHash("sha256")
-            .update(this.originalRoot)
-            .digest("hex")
-            .slice(0, 16)
-        );
+    if (shadowRoot) {
+      this.shadowRoot = nodePath.normalize(shadowRoot);
+    } else {
+      // Теневое хранилище — РЯДОМ с оригинальным, не внутри.
+      // Детерминированное имя на базе хеша пути: важно для crash recovery после перезапуска.
+      const vaultHash = crypto
+        .createHash("sha256")
+        .update(this.originalRoot)
+        .digest("hex")
+        .slice(0, 16);
+      this.shadowRoot = nodePath.join(
+        nodePath.dirname(this.originalRoot),
+        ".shadow-vault-" + vaultHash
+      );
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════
   // Инициализация
   // ═══════════════════════════════════════════════════════════════════════
 
-  /**
-   * Создаёт директорию Теневого хранилища (если не существует).
-   * НЕ удаляет существующее содержимое — это задача SessionManager (Шаг 5).
-   */
   async initialize(): Promise<void> {
     await fsp.mkdir(this.shadowRoot, { recursive: true });
   }
@@ -81,17 +78,9 @@ export class ShadowVaultManager {
   // Monkey-patching
   // ═══════════════════════════════════════════════════════════════════════
 
-  /**
-   * Патчит методы адаптера.
-   * Вызывается один раз после успешной деривации ключа.
-   *
-   * ВАЖНО: все обёртки обязаны совпадать по сигнатуре с интерфейсом IDataAdapter —
-   * любое несовпадение типов сломает другие плагины (Dataview, Omnisearch и пр.).
-   */
   patch(adapter: IDataAdapter): void {
     if (this.patched) return;
 
-    // Сохраняем оригиналы через .bind(), чтобы контекст не потерялся
     const orig = this.originalMethods;
     orig.read        = adapter.read.bind(adapter);
     orig.readBinary  = adapter.readBinary.bind(adapter);
@@ -109,30 +98,25 @@ export class ShadowVaultManager {
     orig.trashSystem = adapter.trashSystem.bind(adapter);
     orig.trashLocal  = adapter.trashLocal.bind(adapter);
 
-    // Подменяем методы — стрелочные функции сохраняют контекст this (ShadowVaultManager)
-    adapter.read        = (p) => this.patchedRead(p);
-    adapter.readBinary  = (p) => this.patchedReadBinary(p);
-    adapter.write       = (p, d, o) => this.patchedWrite(p, d, o);
-    adapter.writeBinary = (p, d, o) => this.patchedWriteBinary(p, d, o);
-    adapter.append      = (p, d, o) => this.patchedAppend(p, d, o);
+    adapter.read        = (p)        => this.patchedRead(p);
+    adapter.readBinary  = (p)        => this.patchedReadBinary(p);
+    adapter.write       = (p, d, o)  => this.patchedWrite(p, d, o);
+    adapter.writeBinary = (p, d, o)  => this.patchedWriteBinary(p, d, o);
+    adapter.append      = (p, d, o)  => this.patchedAppend(p, d, o);
     adapter.process     = (p, fn, o) => this.patchedProcess(p, fn, o);
-    adapter.exists      = (p, s) => this.patchedExists(p, s);
-    adapter.stat        = (p) => this.patchedStat(p);
-    adapter.list        = (p) => this.patchedList(p);
-    adapter.mkdir       = (p) => this.patchedMkdir(p);
-    adapter.remove      = (p) => this.patchedRemove(p);
-    adapter.rename      = (p, np) => this.patchedRename(p, np);
-    adapter.copy        = (p, np) => this.patchedCopy(p, np);
-    adapter.trashSystem = (p) => this.patchedTrashSystem(p);
-    adapter.trashLocal  = (p) => this.patchedTrashLocal(p);
+    adapter.exists      = (p, s)     => this.patchedExists(p, s);
+    adapter.stat        = (p)        => this.patchedStat(p);
+    adapter.list        = (p)        => this.patchedList(p);
+    adapter.mkdir       = (p)        => this.patchedMkdir(p);
+    adapter.remove      = (p)        => this.patchedRemove(p);
+    adapter.rename      = (p, np)    => this.patchedRename(p, np);
+    adapter.copy        = (p, np)    => this.patchedCopy(p, np);
+    adapter.trashSystem = (p)        => this.patchedTrashSystem(p);
+    adapter.trashLocal  = (p)        => this.patchedTrashLocal(p);
 
     this.patched = true;
   }
 
-  /**
-   * Восстанавливает все оригинальные методы адаптера.
-   * Вызывается при корректном завершении и в аварийных ситуациях.
-   */
   unpatch(adapter: IDataAdapter): void {
     if (!this.patched) return;
 
@@ -161,21 +145,21 @@ export class ShadowVaultManager {
   // Публичные утилиты путей
   // ═══════════════════════════════════════════════════════════════════════
 
-  /** normalizedPath → абсолютный путь в Теневом хранилище */
+  /** normalizedPath → абсолютный путь в теневом хранилище (без .enc) */
   shadowAbs(normalizedPath: string): string {
     return nodePath.join(this.shadowRoot, ...normalizedPath.split("/"));
   }
 
-  /** normalizedPath → абсолютный путь в Оригинальном (зашифрованном) хранилище */
+  /** normalizedPath → абсолютный путь в оригинальном хранилище (без .enc) */
   originalAbs(normalizedPath: string): string {
     return nodePath.join(this.originalRoot, ...normalizedPath.split("/"));
   }
 
-  /**
-   * Возвращает true для путей, которые НЕ шифруются:
-   *   - Конфигурация Obsidian (.obsidian/*)
-   *   - Корень хранилища (пустая строка)
-   */
+  /** normalizedPath → абсолютный путь к зашифрованному файлу в оригинальном хранилище (с .enc) */
+  originalEncAbs(normalizedPath: string): string {
+    return nodePath.join(this.originalRoot, ...normalizedPath.split("/")) + ENCRYPTED_EXT;
+  }
+
   isBypassPath(normalizedPath: string): boolean {
     return (
       normalizedPath === "" ||
@@ -185,83 +169,103 @@ export class ShadowVaultManager {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
+  // Миграция: шифрование существующих plaintext-файлов
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Возвращает true если в оригинальном хранилище есть незашифрованные файлы.
+   * Это означает, что плагин устанавливается впервые на существующий vault.
+   */
+  async hasPendingMigration(): Promise<boolean> {
+    const files = await this.scanPlaintextFiles();
+    return files.length > 0;
+  }
+
+  /**
+   * Шифрует все существующие plaintext-файлы в оригинальном хранилище.
+   * file.md → file.md.enc  (оригинал удаляется после успешного шифрования).
+   * Вызывается ОДИН РАЗ при первом запуске плагина или при обнаружении plaintext-файлов.
+   */
+  async encryptAllExisting(
+    onProgress?: (done: number, total: number) => void
+  ): Promise<void> {
+    const plainFiles = await this.scanPlaintextFiles();
+    let done = 0;
+
+    console.info(`[ShadowVault] Миграция: обнаружено ${plainFiles.length} незашифрованных файлов.`);
+
+    for (const normalizedPath of plainFiles) {
+      const origPath   = this.originalAbs(normalizedPath);
+      const encPath    = this.originalEncAbs(normalizedPath);
+
+      try {
+        await fsp.mkdir(nodePath.dirname(encPath), { recursive: true });
+        const stat = await fsp.stat(origPath);
+
+        if (stat.size === 0) {
+          // Пустой файл: создаём пустой .enc и удаляем оригинал
+          await fsp.writeFile(encPath, Buffer.alloc(0));
+        } else if (stat.size > 1024 * 1024) {
+          // Большой файл: потоковое шифрование
+          await this.engine.encryptStream(origPath, encPath);
+        } else {
+          // Маленький файл: буферное шифрование + атомарная запись
+          const content   = await fsp.readFile(origPath);
+          const encrypted = this.engine.encryptBuffer(content);
+          await atomicWrite(encPath, encrypted);
+        }
+
+        // Удаляем оригинальный plaintext только после успешного шифрования
+        await fsp.unlink(origPath);
+        done++;
+        onProgress?.(done, plainFiles.length);
+        console.info(`[ShadowVault] Зашифрован: "${normalizedPath}"`);
+      } catch (err) {
+        console.error(`[ShadowVault] Ошибка шифрования "${normalizedPath}":`, err);
+        // Продолжаем с остальными файлами
+      }
+    }
+
+    console.info(`[ShadowVault] Миграция завершена: ${done}/${plainFiles.length}`);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
   // Ядро: расшифровка по требованию (lazy decrypt)
   // ═══════════════════════════════════════════════════════════════════════
 
   /**
-   * Гарантирует, что файл присутствует в Теневом хранилище в расшифрованном виде.
-   *
-   * Алгоритм:
-   *   1. Если файл уже есть в теневом → ничего не делаем (кэш-хит).
-   *   2. Если файл есть в оригинальном → расшифровываем потоком (для любого размера).
-   *   3. Если файла нет нигде → бросаем ошибку (Obsidian должен об этом знать).
-   *
-   * Этот метод вызывается всеми операциями чтения. Приоритетная очередь
-   * (QueueManager, Шаг 4) вызывает его для горячих файлов заранее.
+   * Гарантирует наличие расшифрованного файла в теневом хранилище.
+   * Источник истины — оригинальное хранилище (файлы .enc).
    */
   async ensureDecrypted(normalizedPath: string): Promise<void> {
-    const shadowPath = this.shadowAbs(normalizedPath);
-    const origPath   = this.originalAbs(normalizedPath);
+    const shadowPath  = this.shadowAbs(normalizedPath);
+    const origEncPath = this.originalEncAbs(normalizedPath);
 
     // Кэш-хит: файл уже в теневом хранилище
     if (await fileExists(shadowPath)) return;
 
-    // Файл должен быть в оригинальном хранилище
-    if (!(await fileExists(origPath))) {
+    if (!(await fileExists(origEncPath))) {
       throw new Error(
-        `[ShadowVault] Файл не найден ни в одном хранилище: "${normalizedPath}"`
+        `[ShadowVault] Файл не найден в хранилище: "${normalizedPath}"`
       );
     }
 
-    // Создаём директорию в теневом хранилище (на случай вложенных путей)
     await fsp.mkdir(nodePath.dirname(shadowPath), { recursive: true });
 
-    // Проверяем размер: если файл меньше заголовка — скорее всего пустой или не зашифрован
-    const stat = await fsp.stat(origPath);
+    const stat = await fsp.stat(origEncPath);
     if (stat.size === 0) {
-      // Пустой файл: создаём пустой файл в теневом без расшифровки
       await fsp.writeFile(shadowPath, Buffer.alloc(0));
-      // Копируем mtime — см. комментарий ниже
       await fsp.utimes(shadowPath, stat.atime, stat.mtime);
       return;
     }
 
-    if (stat.size < CRYPTO_HEADER_SIZE) {
-      // Файл слишком маленький для зашифрованного формата — это plaintext-файл
-      // (миграция: существующий vault до установки плагина)
-      await fsp.copyFile(origPath, shadowPath);
-      await fsp.utimes(shadowPath, stat.atime, stat.mtime);
-      return;
-    }
+    // Потоковая расшифровка: origEncPath → shadowPath
+    await this.engine.decryptStream(origEncPath, shadowPath);
 
-    // Пробуем расшифровать. Если не удаётся (auth tag mismatch) —
-    // файл не зашифрован нашим плагином (существующий plaintext, режим миграции).
-    try {
-      await this.engine.decryptStream(origPath, shadowPath);
-    } catch {
-      // Режим миграции: файл существующий plaintext → копируем как есть.
-      // При следующем сохранении через write-through он будет зашифрован.
-      console.warn(`[ShadowVault] "${normalizedPath}" не зашифрован (миграция) — копируем как plaintext`);
-      // Удаляем возможные остатки от неудавшегося decryptStream
-      await fsp.unlink(shadowPath).catch(() => undefined);
-      await fsp.unlink(shadowPath + ".tmp").catch(() => undefined);
-      await fsp.copyFile(origPath, shadowPath);
-    }
-
-    /**
-     * КРИТИЧНО для Crash Recovery (Шаг 5):
-     * Копируем mtime оригинала в shadow-файл.
-     *
-     * Без этого: shadow.mtime = "сейчас" (время расшифровки),
-     *   original.mtime = "раньше" (время последней записи).
-     *   SessionManager не сможет отличить «просто расшифрованный кэш»
-     *   от «файл, изменённый пользователем во время краша».
-     *
-     * С этим: background-decrypted файлы имеют shadow.mtime == original.mtime.
-     *   Только файлы, изменённые через write-through (и потерявшие запись в original
-     *   из-за краша), будут иметь shadow.mtime > original.mtime.
-     */
-    await fsp.utimes(shadowPath, stat.atime, stat.mtime);
+    // Копируем mtime оригинала в shadow — критично для Crash Recovery:
+    // только write-through файлы будут иметь shadow.mtime > original_enc.mtime
+    const encStat = await fsp.stat(origEncPath);
+    await fsp.utimes(shadowPath, encStat.atime, encStat.mtime);
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -282,7 +286,6 @@ export class ShadowVaultManager {
     }
     await this.ensureDecrypted(normalizedPath);
     const buf = await fsp.readFile(this.shadowAbs(normalizedPath));
-    // Node.js Buffer → ArrayBuffer (zero-copy через subarray)
     return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
   }
 
@@ -295,19 +298,18 @@ export class ShadowVaultManager {
       return this.originalMethods.write!(normalizedPath, data, options);
     }
 
-    const shadowPath = this.shadowAbs(normalizedPath);
-    const origPath   = this.originalAbs(normalizedPath);
+    const shadowPath  = this.shadowAbs(normalizedPath);
+    const origEncPath = this.originalEncAbs(normalizedPath);
 
-    await fsp.mkdir(nodePath.dirname(shadowPath),   { recursive: true });
-    await fsp.mkdir(nodePath.dirname(origPath),     { recursive: true });
+    await fsp.mkdir(nodePath.dirname(shadowPath),  { recursive: true });
+    await fsp.mkdir(nodePath.dirname(origEncPath), { recursive: true });
 
-    // 1. Записываем открытый текст в теневое хранилище
+    // 1. Открытый текст → теневое хранилище
     await fsp.writeFile(shadowPath, data, "utf8");
 
-    // 2. Шифруем и атомарно записываем в оригинальное
-    //    encryptBuffer → небольшие текстовые заметки помещаются в RAM
+    // 2. Зашифровано → оригинальное хранилище (атомарно)
     const encrypted = this.engine.encryptBuffer(Buffer.from(data, "utf8"));
-    await atomicWrite(origPath, encrypted);
+    await atomicWrite(origEncPath, encrypted);
   }
 
   private async patchedWriteBinary(
@@ -319,23 +321,24 @@ export class ShadowVaultManager {
       return this.originalMethods.writeBinary!(normalizedPath, data, options);
     }
 
-    const shadowPath = this.shadowAbs(normalizedPath);
-    const origPath   = this.originalAbs(normalizedPath);
+    const shadowPath  = this.shadowAbs(normalizedPath);
+    const origEncPath = this.originalEncAbs(normalizedPath);
     const buf = Buffer.from(data);
 
-    await fsp.mkdir(nodePath.dirname(shadowPath), { recursive: true });
-    await fsp.mkdir(nodePath.dirname(origPath),   { recursive: true });
+    await fsp.mkdir(nodePath.dirname(shadowPath),  { recursive: true });
+    await fsp.mkdir(nodePath.dirname(origEncPath), { recursive: true });
 
-    // Теневое хранилище: сохраняем открытые байты
+    // Открытые байты → теневое хранилище
     await fsp.writeFile(shadowPath, buf);
 
-    // Оригинальное: для больших файлов — потоковое шифрование
+    // Зашифровано → оригинальное хранилище
     if (buf.length > 1024 * 1024) {
-      // > 1 МБ: сначала пишем в shadow, потом шифруем потоком shadow → original
-      await this.engine.encryptStream(shadowPath, origPath);
+      // > 1 МБ: потоковое шифрование shadow → origEnc
+      // Временный файл encryptStream будет origEncPath + ".tmp" — отфильтрован из patchedList
+      await this.engine.encryptStream(shadowPath, origEncPath);
     } else {
       const encrypted = this.engine.encryptBuffer(buf);
-      await atomicWrite(origPath, encrypted);
+      await atomicWrite(origEncPath, encrypted);
     }
   }
 
@@ -348,23 +351,20 @@ export class ShadowVaultManager {
       return this.originalMethods.append!(normalizedPath, data, options);
     }
 
-    const shadowPath = this.shadowAbs(normalizedPath);
+    const shadowPath  = this.shadowAbs(normalizedPath);
+    const origEncPath = this.originalEncAbs(normalizedPath);
 
-    // Расшифровываем текущий файл если его нет в теневом
-    if (await fileExists(this.originalAbs(normalizedPath))) {
+    if (await fileExists(origEncPath)) {
       await this.ensureDecrypted(normalizedPath);
     } else {
-      // Новый файл: создаём директорию
       await fsp.mkdir(nodePath.dirname(shadowPath), { recursive: true });
     }
 
-    // Дописываем в теневое хранилище
     await fsp.appendFile(shadowPath, data, "utf8");
 
-    // Перечитываем полный файл и перешифровываем оригинал
     const fullContent = await fsp.readFile(shadowPath, "utf8");
-    const encrypted = this.engine.encryptBuffer(Buffer.from(fullContent, "utf8"));
-    await atomicWrite(this.originalAbs(normalizedPath), encrypted);
+    const encrypted   = this.engine.encryptBuffer(Buffer.from(fullContent, "utf8"));
+    await atomicWrite(origEncPath, encrypted);
   }
 
   private async patchedProcess(
@@ -375,8 +375,6 @@ export class ShadowVaultManager {
     if (this.isBypassPath(normalizedPath)) {
       return this.originalMethods.process!(normalizedPath, fn, options);
     }
-
-    // process() — транзакционная операция: read → transform → write
     await this.ensureDecrypted(normalizedPath);
     const current = await fsp.readFile(this.shadowAbs(normalizedPath), "utf8");
     const result = fn(current);
@@ -391,8 +389,11 @@ export class ShadowVaultManager {
     if (this.isBypassPath(normalizedPath)) {
       return this.originalMethods.exists!(normalizedPath, sensitive);
     }
-    // Файлы живут в оригинальном хранилище — это источник истины
-    return fileExists(this.originalAbs(normalizedPath));
+    // Файл существует если есть .enc в оригинале ИЛИ уже расшифрован в shadow
+    return (
+      (await fileExists(this.originalEncAbs(normalizedPath))) ||
+      (await fileExists(this.shadowAbs(normalizedPath)))
+    );
   }
 
   private async patchedStat(normalizedPath: string): Promise<AdapterStat | null> {
@@ -400,16 +401,17 @@ export class ShadowVaultManager {
       return this.originalMethods.stat!(normalizedPath);
     }
 
-    // Если файл уже расшифрован в теневом — используем его стат (правильный размер)
-    const shadowPath = this.shadowAbs(normalizedPath);
-    const origPath   = this.originalAbs(normalizedPath);
+    const shadowPath  = this.shadowAbs(normalizedPath);
+    const origEncPath = this.originalEncAbs(normalizedPath);
 
-    const statPath = (await fileExists(shadowPath)) ? shadowPath : origPath;
+    // Если файл уже расшифрован в теневом — возвращаем его стат (точный размер)
+    const statPath = (await fileExists(shadowPath)) ? shadowPath : origEncPath;
+
     try {
-      const s = await fsp.stat(statPath);
+      const s     = await fsp.stat(statPath);
       const isDir = s.isDirectory();
-      const size  = (!isDir && statPath === origPath && s.size >= CRYPTO_HEADER_SIZE)
-        // Вычитаем заголовок шифрования, чтобы показать реальный размер данных
+      // Вычитаем заголовок шифрования если читаем размер из .enc файла
+      const size = (!isDir && statPath === origEncPath && s.size >= CRYPTO_HEADER_SIZE)
         ? s.size - CRYPTO_HEADER_SIZE
         : s.size;
 
@@ -425,12 +427,13 @@ export class ShadowVaultManager {
   }
 
   private async patchedList(normalizedPath: string): Promise<ListedFiles> {
-    if (this.isBypassPath(normalizedPath)) {
+    // "" (корень) НЕ байпасим — нам нужно перехватить список чтобы убрать .enc суффиксы.
+    // .obsidian и его содержимое — байпасим (конфигурация Obsidian хранится незашифрованно).
+    if (normalizedPath !== "" && this.isBypassPath(normalizedPath)) {
       return this.originalMethods.list!(normalizedPath);
     }
 
-    // Список файлов берём из оригинального хранилища — оно является источником истины.
-    // Имена файлов одинаковы в обоих хранилищах (шифруется только содержимое).
+    // Источник истины: оригинальное хранилище (содержит .enc файлы)
     const absDir = this.originalAbs(normalizedPath);
     const files: string[] = [];
     const folders: string[] = [];
@@ -444,13 +447,24 @@ export class ShadowVaultManager {
 
     const prefix = normalizedPath ? normalizedPath + "/" : "";
     for (const entry of entries) {
-      // Скрытые системные файлы (.session_active, .lock) не показываем Obsidian
+      // Скрытые файлы (.session_active и т.п.) — не показываем Obsidian
       if (entry.name.startsWith(".") && entry.name !== ".obsidian") continue;
-      // Временные файлы атомарных записей — не показываем Obsidian
-      if (entry.name.endsWith(".tmp") || entry.name.endsWith(".shadowtmp")) continue;
-      const rel = prefix + entry.name;
-      if (entry.isDirectory()) folders.push(rel);
-      else files.push(rel);
+      // Временные файлы атомарных операций
+      if (
+        entry.name.endsWith(".tmp")       ||
+        entry.name.endsWith(".shadowtmp") ||
+        entry.name.endsWith(".sessiontmp")
+      ) continue;
+
+      if (entry.isDirectory()) {
+        folders.push(prefix + entry.name);
+      } else if (entry.isFile() && entry.name.endsWith(ENCRYPTED_EXT)) {
+        // Снимаем суффикс .enc — Obsidian видит обычные имена файлов
+        const baseName = entry.name.slice(0, -ENCRYPTED_EXT.length);
+        files.push(prefix + baseName);
+      }
+      // Не-.enc файлы в оригинальном хранилище не показываем:
+      // они либо ещё не прошли миграцию (редко), либо системные файлы
     }
 
     return { files, folders };
@@ -460,7 +474,6 @@ export class ShadowVaultManager {
     if (this.isBypassPath(normalizedPath)) {
       return this.originalMethods.mkdir!(normalizedPath);
     }
-    // Создаём папку в обоих хранилищах синхронно
     await Promise.all([
       fsp.mkdir(this.shadowAbs(normalizedPath),   { recursive: true }),
       fsp.mkdir(this.originalAbs(normalizedPath), { recursive: true }),
@@ -471,10 +484,9 @@ export class ShadowVaultManager {
     if (this.isBypassPath(normalizedPath)) {
       return this.originalMethods.remove!(normalizedPath);
     }
-    // Удаляем из обоих хранилищ; игнорируем "не найдено" (ENOENT)
     await Promise.allSettled([
       fsp.unlink(this.shadowAbs(normalizedPath)),
-      fsp.unlink(this.originalAbs(normalizedPath)),
+      fsp.unlink(this.originalEncAbs(normalizedPath)),
     ]);
   }
 
@@ -487,19 +499,17 @@ export class ShadowVaultManager {
     }
 
     const newShadow   = this.shadowAbs(newNormalizedPath);
-    const newOriginal = this.originalAbs(newNormalizedPath);
+    const newOrigEnc  = this.originalEncAbs(newNormalizedPath);
 
-    await fsp.mkdir(nodePath.dirname(newShadow),   { recursive: true });
-    await fsp.mkdir(nodePath.dirname(newOriginal), { recursive: true });
+    await fsp.mkdir(nodePath.dirname(newShadow),  { recursive: true });
+    await fsp.mkdir(nodePath.dirname(newOrigEnc), { recursive: true });
 
-    // Переименовываем в теневом (если файл там уже есть)
     const oldShadow = this.shadowAbs(normalizedPath);
     if (await fileExists(oldShadow)) {
       await fsp.rename(oldShadow, newShadow);
     }
 
-    // Переименовываем в оригинальном (зашифрованный блоб сохраняется целиком)
-    await fsp.rename(this.originalAbs(normalizedPath), newOriginal);
+    await fsp.rename(this.originalEncAbs(normalizedPath), newOrigEnc);
   }
 
   private async patchedCopy(
@@ -510,33 +520,35 @@ export class ShadowVaultManager {
       return this.originalMethods.copy!(normalizedPath, newNormalizedPath);
     }
 
-    const newShadow   = this.shadowAbs(newNormalizedPath);
-    const newOriginal = this.originalAbs(newNormalizedPath);
+    const newShadow  = this.shadowAbs(newNormalizedPath);
+    const newOrigEnc = this.originalEncAbs(newNormalizedPath);
 
-    await fsp.mkdir(nodePath.dirname(newShadow),   { recursive: true });
-    await fsp.mkdir(nodePath.dirname(newOriginal), { recursive: true });
+    await fsp.mkdir(nodePath.dirname(newShadow),  { recursive: true });
+    await fsp.mkdir(nodePath.dirname(newOrigEnc), { recursive: true });
 
     const oldShadow = this.shadowAbs(normalizedPath);
     if (await fileExists(oldShadow)) {
       await fsp.copyFile(oldShadow, newShadow);
     }
 
-    // Копируем зашифрованный блоб — повторного шифрования не нужно,
-    // но новый файл должен иметь свой IV. Поэтому читаем из теневого и шифруем заново.
+    // Копия должна иметь свой IV → шифруем заново (нельзя просто копировать .enc блоб)
     await this.ensureDecrypted(normalizedPath);
-    const content = await fsp.readFile(this.shadowAbs(normalizedPath));
+    const content   = await fsp.readFile(this.shadowAbs(normalizedPath));
     const encrypted = this.engine.encryptBuffer(content);
-    await atomicWrite(newOriginal, encrypted);
+    await atomicWrite(newOrigEnc, encrypted);
   }
 
   private async patchedTrashSystem(normalizedPath: string): Promise<boolean> {
     if (this.isBypassPath(normalizedPath)) {
       return this.originalMethods.trashSystem!(normalizedPath);
     }
-    // Убираем из теневого хранилища (тихо, если нет)
     await fsp.unlink(this.shadowAbs(normalizedPath)).catch(() => undefined);
-    // Перемещаем оригинальный зашифрованный файл в корзину ОС
-    return this.originalMethods.trashSystem!(normalizedPath);
+    try {
+      await fsp.unlink(this.originalEncAbs(normalizedPath));
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private async patchedTrashLocal(normalizedPath: string): Promise<void> {
@@ -544,15 +556,59 @@ export class ShadowVaultManager {
       return this.originalMethods.trashLocal!(normalizedPath);
     }
     await fsp.unlink(this.shadowAbs(normalizedPath)).catch(() => undefined);
-    return this.originalMethods.trashLocal!(normalizedPath);
+    await fsp.unlink(this.originalEncAbs(normalizedPath)).catch(() => undefined);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Вспомогательные методы
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Рекурсивно сканирует оригинальное хранилище и возвращает список
+   * normalizedPath для файлов БЕЗ суффикса .enc (незашифрованных).
+   * Нужен для обнаружения файлов, которые требуют первичной миграции.
+   */
+  private async scanPlaintextFiles(relDir = ""): Promise<string[]> {
+    const result: string[] = [];
+    const absDir = relDir
+      ? nodePath.join(this.originalRoot, ...relDir.split("/"))
+      : this.originalRoot;
+
+    let entries: fs.Dirent[];
+    try {
+      entries = await fsp.readdir(absDir, { withFileTypes: true });
+    } catch {
+      return result;
+    }
+
+    const prefix = relDir ? relDir + "/" : "";
+    for (const entry of entries) {
+      if (entry.name.startsWith(".")) continue;
+      // Пропускаем уже зашифрованные и временные файлы
+      if (
+        entry.name.endsWith(ENCRYPTED_EXT)  ||
+        entry.name.endsWith(".tmp")          ||
+        entry.name.endsWith(".shadowtmp")    ||
+        entry.name.endsWith(".sessiontmp")
+      ) continue;
+
+      const rel = prefix + entry.name;
+      if (entry.isDirectory()) {
+        const sub = await this.scanPlaintextFiles(rel);
+        result.push(...sub);
+      } else if (entry.isFile()) {
+        result.push(rel);
+      }
+    }
+
+    return result;
   }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Приватные утилиты (module-level, не экспортируются)
+// Модульные утилиты
 // ═══════════════════════════════════════════════════════════════════════
 
-/** Проверяет существование файла/директории без исключений */
 async function fileExists(absPath: string): Promise<boolean> {
   try {
     await fsp.access(absPath);
@@ -562,18 +618,12 @@ async function fileExists(absPath: string): Promise<boolean> {
   }
 }
 
-/**
- * Атомарная запись Buffer в файл через временный файл + fs.rename.
- * Гарантирует: либо файл записан полностью, либо оригинал не тронут.
- * Защищает от повреждения данных при внезапном отключении питания.
- */
 async function atomicWrite(absPath: string, data: Buffer): Promise<void> {
   const tmpPath = absPath + ".shadowtmp";
   try {
     await fsp.writeFile(tmpPath, data);
     await fsp.rename(tmpPath, absPath);
   } catch (err) {
-    // Чистим временный файл при ошибке — не оставляем мусор
     await fsp.unlink(tmpPath).catch(() => undefined);
     throw err;
   }

@@ -157,17 +157,18 @@ export class SessionManager {
     const shadowFiles = await this.scanShadowFiles();
 
     for (const normalizedPath of shadowFiles) {
-      const shadowAbs   = nodePath.join(this.shadowRoot,   ...normalizedPath.split("/"));
-      const originalAbs = nodePath.join(this.originalRoot, ...normalizedPath.split("/"));
+      const shadowAbs      = nodePath.join(this.shadowRoot,   ...normalizedPath.split("/"));
+      // Файл в оригинальном хранилище хранится с суффиксом .enc
+      const originalEncAbs = nodePath.join(this.originalRoot, ...normalizedPath.split("/")) + ".enc";
 
       try {
         const shadowStat   = await fsp.stat(shadowAbs);
-        const originalStat = await fsp.stat(originalAbs).catch(() => null);
+        const originalStat = await fsp.stat(originalEncAbs).catch(() => null);
 
         const shadowMtime   = shadowStat.mtimeMs;
         const originalMtime = originalStat?.mtimeMs ?? 0;
 
-        // Файл считается «потерянным» если shadow строго новее оригинала.
+        // Файл считается «потерянным» если shadow строго новее .enc оригинала.
         // Небольшой допуск 50 мс для учёта погрешности файловой системы.
         const TOLERANCE_MS = 50;
         if (shadowMtime <= originalMtime + TOLERANCE_MS) {
@@ -175,13 +176,13 @@ export class SessionManager {
           continue;
         }
 
-        // Шифруем shadow → tmp → оригинал (атомарно)
+        // Шифруем shadow → tmp → оригинал.enc (атомарно)
         const plaintext = await fsp.readFile(shadowAbs);
         const encrypted = this.engine.encryptBuffer(plaintext);
-        await atomicWrite(originalAbs, encrypted);
+        await atomicWrite(originalEncAbs, encrypted);
 
         recoveredFiles.push(normalizedPath);
-        console.info(`[SessionManager] Восстановлен: "${normalizedPath}"`);
+        console.info(`[SessionManager] Восстановлен: "${normalizedPath}" → original.enc`);
       } catch (err) {
         failedFiles.push(normalizedPath);
         console.error(`[SessionManager] Ошибка recovery для "${normalizedPath}":`, err);

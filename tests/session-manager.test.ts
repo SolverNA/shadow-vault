@@ -45,11 +45,14 @@ async function makeEnv(): Promise<TestEnv> {
   };
 }
 
-/** Записывает зашифрованный файл в originalRoot (симуляция нормальной записи) */
+/**
+ * Записывает зашифрованный файл в originalRoot как <relPath>.enc
+ * (нормальное состояние хранилища после работы плагина).
+ */
 async function writeEncryptedOriginal(
   env: TestEnv, relPath: string, plaintext: string
 ): Promise<void> {
-  const absPath = nodePath.join(env.originalRoot, ...relPath.split("/"));
+  const absPath = nodePath.join(env.originalRoot, ...relPath.split("/")) + ".enc";
   await fsp.mkdir(nodePath.dirname(absPath), { recursive: true });
   const enc = env.engine.encryptBuffer(Buffer.from(plaintext, "utf8"));
   await fsp.writeFile(absPath, enc);
@@ -65,9 +68,9 @@ async function writePlaintextShadow(
   if (mtime) await fsp.utimes(absPath, mtime, mtime);
 }
 
-/** Возвращает mtime файла в originalRoot */
-async function origMtime(env: TestEnv, relPath: string): Promise<number> {
-  const s = await fsp.stat(nodePath.join(env.originalRoot, ...relPath.split("/")));
+/** Возвращает mtime .enc файла в originalRoot */
+async function origEncMtime(env: TestEnv, relPath: string): Promise<number> {
+  const s = await fsp.stat(nodePath.join(env.originalRoot, ...relPath.split("/")) + ".enc");
   return s.mtimeMs;
 }
 
@@ -192,8 +195,8 @@ describe("SessionManager — endSession()", () => {
       await env.session.startSession();
       await env.session.endSession();
 
-      // Оригинальное хранилище должно быть цело
-      expect(fs.existsSync(nodePath.join(env.originalRoot, "important.md"))).toBe(true);
+      // .enc файл в оригинальном хранилище должен быть цел
+      expect(fs.existsSync(nodePath.join(env.originalRoot, "important.md.enc"))).toBe(true);
     } finally { env.cleanup(); }
   });
 });
@@ -215,9 +218,9 @@ describe("SessionManager — recoverFromCrash()", () => {
   it("shadow файл с тем же mtime что original: не восстанавливает (кэш-хит)", async () => {
     const env = await makeEnv();
     try {
-      // Создаём оригинал
+      // Создаём оригинал (.enc)
       await writeEncryptedOriginal(env, "note.md", "original content");
-      const origStat = await fsp.stat(nodePath.join(env.originalRoot, "note.md"));
+      const origStat = await fsp.stat(nodePath.join(env.originalRoot, "note.md.enc"));
 
       // Создаём shadow с ТОЖДЕСТВЕННЫМ mtime (как после ensureDecrypted)
       await writePlaintextShadow(env, "note.md", "original content", origStat.mtime);
@@ -244,7 +247,7 @@ describe("SessionManager — recoverFromCrash()", () => {
     } finally { env.cleanup(); }
   });
 
-  it("после recovery оригинал содержит данные из shadow", async () => {
+  it("после recovery оригинал (.enc) содержит данные из shadow", async () => {
     const env = await makeEnv();
     try {
       await writeEncryptedOriginal(env, "modified.md", "old content");
@@ -253,14 +256,14 @@ describe("SessionManager — recoverFromCrash()", () => {
 
       await env.session.recoverFromCrash();
 
-      // Расшифровываем оригинал — должен содержать данные из shadow
-      const encBuf = await fsp.readFile(nodePath.join(env.originalRoot, "modified.md"));
+      // Расшифровываем оригинал .enc — должен содержать данные из shadow
+      const encBuf = await fsp.readFile(nodePath.join(env.originalRoot, "modified.md.enc"));
       const dec = env.engine.decryptBuffer(encBuf);
       expect(dec.toString("utf8")).toBe("recovered content");
     } finally { env.cleanup(); }
   });
 
-  it("файл только в shadow (нет в original): восстанавливает как новый", async () => {
+  it("файл только в shadow (нет в original): восстанавливает как новый .enc", async () => {
     const env = await makeEnv();
     try {
       // Файл создан в shadow, оригинал не успел записаться до краша
@@ -269,8 +272,8 @@ describe("SessionManager — recoverFromCrash()", () => {
       const result = await env.session.recoverFromCrash();
 
       expect(result.recoveredFiles).toContain("brand-new.md");
-      // Теперь оригинал должен существовать
-      expect(fs.existsSync(nodePath.join(env.originalRoot, "brand-new.md"))).toBe(true);
+      // Теперь оригинал .enc должен существовать
+      expect(fs.existsSync(nodePath.join(env.originalRoot, "brand-new.md.enc"))).toBe(true);
     } finally { env.cleanup(); }
   });
 
@@ -302,7 +305,7 @@ describe("SessionManager — recoverFromCrash()", () => {
       expect(result.recoveredFiles).toContain("Projects/Alpha/notes.md");
 
       const encBuf = await fsp.readFile(
-        nodePath.join(env.originalRoot, "Projects", "Alpha", "notes.md")
+        nodePath.join(env.originalRoot, "Projects", "Alpha", "notes.md.enc")
       );
       const dec = env.engine.decryptBuffer(encBuf);
       expect(dec.toString("utf8")).toBe("new notes");
@@ -414,8 +417,8 @@ describe("SessionManager — сквозной сценарий краша", () =
       expect(second.hadCrash).toBe(true);
       expect(second.recovery?.recoveredFiles).toContain("diary.md");
 
-      // ── Шаг 5: Проверяем, что original обновлён данными из shadow ──────
-      const encBuf = fs.readFileSync(nodePath.join(env.originalRoot, "diary.md"));
+      // ── Шаг 5: Проверяем, что original.enc обновлён данными из shadow ──
+      const encBuf = fs.readFileSync(nodePath.join(env.originalRoot, "diary.md.enc"));
       const plaintext = env.engine.decryptBuffer(encBuf);
       expect(plaintext.toString("utf8")).toBe("Tuesday: power cut during save!");
 
