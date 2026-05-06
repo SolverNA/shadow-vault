@@ -221,6 +221,8 @@ export class ShadowVaultManager {
     if (stat.size === 0) {
       // Пустой файл: создаём пустой файл в теневом без расшифровки
       await fsp.writeFile(shadowPath, Buffer.alloc(0));
+      // Копируем mtime — см. комментарий ниже
+      await fsp.utimes(shadowPath, stat.atime, stat.mtime);
       return;
     }
 
@@ -233,6 +235,21 @@ export class ShadowVaultManager {
 
     // Потоковая расшифровка — не грузит тяжёлые файлы в RAM целиком
     await this.engine.decryptStream(origPath, shadowPath);
+
+    /**
+     * КРИТИЧНО для Crash Recovery (Шаг 5):
+     * Копируем mtime оригинала в shadow-файл.
+     *
+     * Без этого: shadow.mtime = "сейчас" (время расшифровки),
+     *   original.mtime = "раньше" (время последней записи).
+     *   SessionManager не сможет отличить «просто расшифрованный кэш»
+     *   от «файл, изменённый пользователем во время краша».
+     *
+     * С этим: background-decrypted файлы имеют shadow.mtime == original.mtime.
+     *   Только файлы, изменённые через write-through (и потерявшие запись в original
+     *   из-за краша), будут иметь shadow.mtime > original.mtime.
+     */
+    await fsp.utimes(shadowPath, stat.atime, stat.mtime);
   }
 
   // ═══════════════════════════════════════════════════════════════════════
