@@ -22,6 +22,9 @@
  *   SessionManager.endSession() ← ключ уничтожается последним
  */
 
+import * as fs from "fs";
+import * as fsp from "fs/promises";
+import * as nodePath from "path";
 import { App, Notice, Plugin, TFile } from "obsidian";
 import { CryptoEngine } from "./crypto-engine";
 import { AuthResult } from "./auth-service";
@@ -31,8 +34,9 @@ import { SessionManager } from "./session-manager";
 import { QueueManager } from "./queue-manager";
 import { QueueIntegration } from "./queue-integration";
 import { ShadowVaultSettingTab } from "./settings-tab";
-import { DEFAULT_SETTINGS, PluginSettings } from "./types";
-import { IDataAdapter } from "./adapter-types";
+import { DEFAULT_SETTINGS, PluginSettings, VERIFICATION_PLAINTEXT } from "./types";
+import { IDataAdapter, ListedFiles } from "./adapter-types";
+import { AuthService, PasswordError } from "./auth-service";
 
 export default class ShadowVaultPlugin extends Plugin {
   /** Настройки плагина — читаются из data.json, записываются через saveSettings() */
@@ -46,12 +50,24 @@ export default class ShadowVaultPlugin extends Plugin {
   /** true только пока сессия активна (между onUnlock и shutdown) */
   private sessionActive = false;
 
+  /**
+   * Ссылка на оригинальный adapter.list() до ранней подмены.
+   * Нужна чтобы перед полным патчингом восстановить настоящий оригинал,
+   * иначе unpatch() вернёт раннюю подмену вместо нетронутого метода.
+   */
+  private earlyListOriginal: ((path: string) => Promise<ListedFiles>) | null = null;
+
   // ═══════════════════════════════════════════════════════════════════════
   // Жизненный цикл плагина
   // ═══════════════════════════════════════════════════════════════════════
 
   async onload(): Promise<void> {
     await this.loadSettings();
+
+    // Подменяем adapter.list() ДО того как Obsidian построит индекс файлов.
+    // Без этого при первом запуске Obsidian видит только .enc файлы и создаёт пустой индекс.
+    // Ранняя подмена только транслирует имена (.enc → .md), ключ шифрования не нужен.
+    this.patchListEarly();
 
     // Вкладка настроек появляется всегда, независимо от состояния блокировки
     this.addSettingTab(new ShadowVaultSettingTab(this.app, this));
@@ -97,6 +113,72 @@ export default class ShadowVaultPlugin extends Plugin {
     await this.shutdown();
     // После блокировки показываем модал повторно (без перезапуска Obsidian)
     this.openInitModal();
+  }
+
+  isUnlocked(): boolean {
+    return this.sessionActive;
+  }
+
+  /**
+   * Меняет пароль хранилища: пере-шифровывает все .enc файлы с новым ключом.
+   * Вызывать только при активной сессии.
+   * После успеха блокирует хранилище — пользователь должен войти с новым паролем.
+   *
+   * @throws PasswordError если oldPassword неверный
+   */
+  async changePassword(
+    oldPassword: string,
+    newPassword: string,
+    onProgress: (done: number, total: number) => void
+  ): Promise<void> {
+    if (!this.sessionActive) {
+      throw new Error("Хранилище не разблокировано.");
+    }
+
+    // 1. Верифицируем старый пароль независимо от активной сессии —
+    //    защита от смены пароля на разблокированном чужом устройстве
+    const checkEngine = new CryptoEngine();
+    try {
+      await checkEngine.deriveKey(oldPassword, this.settings.saltHex!);
+      const decrypted = checkEngine.decryptBuffer(
+        Buffer.from(this.settings.verificationBlob!, "hex")
+      );
+      if (decrypted.toString("utf8") !== VERIFICATION_PLAINTEXT) {
+        throw new PasswordError("Неверный текущий пароль.");
+      }
+    } catch (err) {
+      checkEngine.destroy();
+      if (err instanceof PasswordError) throw err;
+      throw new PasswordError("Неверный текущий пароль.");
+    }
+    checkEngine.destroy();
+
+    // 2. Создаём движок с новым паролем
+    const newEngine = new CryptoEngine();
+    const newSaltHex = await newEngine.deriveKey(newPassword);
+
+    // 3. Пере-шифруем все файлы (двухфазно, атомарно)
+    try {
+      await this.shadowManager!.reEncryptAll(newEngine, onProgress);
+    } catch (err) {
+      newEngine.destroy();
+      throw err;
+    }
+
+    // 4. Сохраняем новые настройки — только после успешной пере-шифровки
+    const newVerificationBuf = newEngine.encryptBuffer(
+      Buffer.from(VERIFICATION_PLAINTEXT, "utf8")
+    );
+    await this.saveSettings({
+      ...this.settings,
+      saltHex: newSaltHex,
+      verificationBlob: newVerificationBuf.toString("hex"),
+    });
+
+    newEngine.destroy();
+
+    // 5. Блокируем — при следующем входе используется новый пароль
+    await this.lockVault();
   }
 
   async loadSettings(): Promise<void> {
@@ -159,11 +241,17 @@ export default class ShadowVaultPlugin extends Plugin {
         new Notice("✅ ShadowVault: все файлы зашифрованы.", 4000);
       }
 
+      // Перед полным патчингом восстанавливаем оригинальный list(),
+      // иначе shadowManager.patch() сохранит раннюю подмену и unpatch()
+      // при блокировке вернёт её, показывая файлы без пароля.
+      const adapterForPatch = this.app.vault.adapter as unknown as IDataAdapter;
+      if (this.earlyListOriginal) {
+        adapterForPatch.list = this.earlyListOriginal;
+      }
+
       // Патчим адаптер ДО startSession — чтобы операции recovery шли
       // через правильные пути (bypass для .obsidian и т.д.)
-      this.shadowManager.patch(
-        this.app.vault.adapter as unknown as IDataAdapter
-      );
+      this.shadowManager.patch(adapterForPatch);
 
       // ── Шаг 5: Управление сессией и crash recovery ──────────────────
       this.sessionManager = new SessionManager(
@@ -189,6 +277,13 @@ export default class ShadowVaultPlugin extends Plugin {
         this.shadowManager
       );
       await this.queueIntegration.setup();
+
+      // ── Переиндексация файлового индекса Obsidian ────────────────────
+      // Obsidian строит индекс TFile-объектов ДО того, как наш патч активен.
+      // После патча adapter.list() уже возвращает правильные .md пути,
+      // но индекс устарел. Отправляем "raw" событие для каждого файла —
+      // Obsidian проверит stat() и создаст недостающие TFile-записи.
+      await this.reconcileVaultIndex();
 
       // ── Хук beforeunload (дополнительно к onunload) ─────────────────
       // Electron не всегда вызывает plugin.onunload() при закрытии окна
@@ -317,5 +412,123 @@ export default class ShadowVaultPlugin extends Plugin {
     }
 
     new Notice(msg, 10000);
+  }
+
+  /**
+   * Подменяет adapter.list() сразу при загрузке плагина, до ввода пароля.
+   * Obsidian строит индекс файлов (TFile-объекты) при запуске — если в этот
+   * момент adapter.list() возвращает только .enc имена, индекс будет пустым.
+   * Ранняя подмена транслирует .enc → .md без ключа шифрования, только
+   * переименование, чтобы первичный скан видел правильные имена файлов.
+   */
+  private patchListEarly(): void {
+    const adapter = this.app.vault.adapter as unknown as IDataAdapter;
+    if (typeof adapter.getBasePath !== "function") return;
+
+    const originalRoot = adapter.getBasePath();
+    const originalList = adapter.list.bind(adapter);
+    this.earlyListOriginal = originalList;
+
+    console.info("[ShadowVault:early] patchListEarly установлен, root:", originalRoot);
+
+    adapter.list = async (normalizedPath: string): Promise<ListedFiles> => {
+      if (normalizedPath !== "" && (
+        normalizedPath === ".obsidian" ||
+        normalizedPath.startsWith(".obsidian/")
+      )) {
+        return originalList(normalizedPath);
+      }
+
+      const absDir = normalizedPath
+        ? nodePath.join(originalRoot, ...normalizedPath.split("/"))
+        : originalRoot;
+
+      const files: string[] = [];
+      const folders: string[] = [];
+
+      let entries: fs.Dirent[];
+      try {
+        entries = await fsp.readdir(absDir, { withFileTypes: true });
+      } catch {
+        return { files: [], folders: [] };
+      }
+
+      const prefix = normalizedPath ? normalizedPath + "/" : "";
+      for (const entry of entries) {
+        if (entry.name.startsWith(".") && entry.name !== ".obsidian") continue;
+        if (
+          entry.name.endsWith(".tmp")       ||
+          entry.name.endsWith(".shadowtmp") ||
+          entry.name.endsWith(".sessiontmp")
+        ) continue;
+
+        if (entry.isDirectory()) {
+          folders.push(prefix + entry.name);
+        } else if (entry.isFile() && entry.name.endsWith(".enc")) {
+          const baseName = entry.name.slice(0, -".enc".length);
+          files.push(prefix + baseName);
+        }
+      }
+
+      return { files, folders };
+    };
+  }
+
+  /**
+   * Принудительно добавляет .md файлы в индекс Obsidian.
+   *
+   * Почему raw-события не работают:
+   *   reconcileFileInternal() вызывает нативный fsPromises.lstat() через original-fs.
+   *   note.md физически не существует на диске (только note.md.enc), поэтому
+   *   Obsidian всегда получает ENOENT и игнорирует path.
+   *
+   * Правильный путь: слать adapter.trigger("file-created") напрямую.
+   *   Vault подписан на это событие адаптера и создаёт TFile в fileMap
+   *   без проверки нативного FS.
+   */
+  private async reconcileVaultIndex(): Promise<void> {
+    const adapter = this.app.vault.adapter as any;
+    if (typeof adapter.trigger !== "function") return;
+    try {
+      await this.notifyFilesCreated("", adapter);
+    } catch (err) {
+      console.warn("[ShadowVault] reconcileVaultIndex:", err);
+    }
+  }
+
+  private async notifyFilesCreated(dir: string, adapter: any): Promise<void> {
+    const listed = await this.app.vault.adapter.list(dir);
+
+    // Сначала папки — чтобы vault.getDirectParent() нашёл родителя для файлов
+    for (const folderPath of listed.folders) {
+      if (!adapter.files?.[folderPath]) {
+        adapter.files ??= {};
+        adapter.files[folderPath] = { type: "folder", realpath: folderPath };
+        adapter.trigger("folder-created", folderPath);
+      }
+      await this.notifyFilesCreated(folderPath, adapter);
+    }
+
+    for (const filePath of listed.files) {
+      // Пропускаем если адаптер уже знает этот path (напр. файлы .obsidian)
+      if (adapter.files?.[filePath]) continue;
+
+      // Читаем метаданные из .enc файла в оригинальном хранилище
+      const origEncPath = this.shadowManager!.originalEncAbs(filePath);
+      let statObj = { ctime: Date.now(), mtime: Date.now(), size: 0 };
+      try {
+        const s = await fsp.stat(origEncPath);
+        statObj = {
+          ctime: Math.round(s.birthtimeMs ?? s.ctimeMs),
+          mtime: Math.round(s.mtimeMs),
+          size:  Math.max(0, s.size - 28), // минус заголовок IV+AuthTag
+        };
+      } catch { /* enc файл не найден — используем заглушку */ }
+
+      adapter.files ??= {};
+      adapter.files[filePath] = { type: "file", realpath: filePath, ...statObj };
+      // vault слушает "file-created" → создаёт TFile, добавляет в fileMap, стреляет "create"
+      adapter.trigger("file-created", filePath, filePath, statObj);
+    }
   }
 }

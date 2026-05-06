@@ -9,6 +9,7 @@
 
 import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type ShadowVaultPlugin from "./main";
+import { ChangePasswordModal } from "./change-password-modal";
 
 export class ShadowVaultSettingTab extends PluginSettingTab {
   constructor(app: App, private readonly plugin: ShadowVaultPlugin) {
@@ -58,14 +59,18 @@ export class ShadowVaultSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Сменить пароль")
       .setDesc(
-        "Расшифровать все файлы и зашифровать их заново с новым паролем. " +
-        "Операция необратима. Создайте резервную копию перед сменой."
+        "Пере-шифровать все файлы с новым паролем. " +
+        "Требует разблокированного хранилища. Создайте резервную копию заранее."
       )
       .addButton((btn) => {
         btn
           .setButtonText("Сменить пароль")
           .onClick(() => {
-            new Notice("⚠️ Смена пароля будет доступна в следующей версии.", 4000);
+            if (!this.plugin.isUnlocked()) {
+              new Notice("🔒 Сначала разблокируйте хранилище.", 4000);
+              return;
+            }
+            new ChangePasswordModal(this.app, this.plugin).open();
           });
       });
 

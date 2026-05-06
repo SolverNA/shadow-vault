@@ -230,6 +230,108 @@ export class ShadowVaultManager {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
+  // Смена пароля: двухфазная атомарная пере-шифровка
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Пере-шифровывает все .enc файлы с новым ключом.
+   *
+   * Двухфазный алгоритм:
+   *   Фаза 1 — создаём <file>.enc.new рядом с оригиналом (оригинал не трогаем).
+   *            Если что-то пошло не так — удаляем все .enc.new и бросаем ошибку.
+   *   Фаза 2 — переименовываем .enc.new → .enc (атомарно, по одному).
+   *            После успешного переименования всех файлов оригинал заменён новым.
+   *
+   * Настройки (saltHex, verificationBlob) обновляются снаружи ПОСЛЕ успеха.
+   */
+  async reEncryptAll(
+    newEngine: CryptoEngine,
+    onProgress?: (done: number, total: number) => void
+  ): Promise<void> {
+    const encFiles = await this.scanEncryptedFiles();
+    const total = encFiles.length;
+
+    console.info(`[ShadowVault] Пере-шифровка: ${total} файлов.`);
+
+    // ── Фаза 1: создаём .enc.new ──────────────────────────────────────────
+    const LARGE = 4 * 1024 * 1024; // 4 МБ
+
+    for (let i = 0; i < total; i++) {
+      const encPath    = this.originalEncAbs(encFiles[i]);
+      const newEncPath = encPath + ".new";
+
+      try {
+        const stat = await fsp.stat(encPath);
+
+        if (stat.size === 0) {
+          await fsp.writeFile(newEncPath, Buffer.alloc(0));
+        } else if (stat.size > LARGE) {
+          // Потоковый подход для больших файлов чтобы не грузить RAM целиком
+          const tmpDec = encPath + ".retmp";
+          try {
+            await this.engine.decryptStream(encPath, tmpDec);
+            await newEngine.encryptStream(tmpDec, newEncPath);
+          } finally {
+            await fsp.unlink(tmpDec).catch(() => undefined);
+          }
+        } else {
+          const encrypted = await fsp.readFile(encPath);
+          const plain     = this.engine.decryptBuffer(encrypted);
+          const reenc     = newEngine.encryptBuffer(plain);
+          await fsp.writeFile(newEncPath, reenc);
+        }
+
+        onProgress?.(i + 1, total * 2);
+      } catch (err) {
+        // Откат: удаляем все созданные .enc.new
+        for (let j = 0; j <= i; j++) {
+          await fsp.unlink(this.originalEncAbs(encFiles[j]) + ".new").catch(() => undefined);
+        }
+        throw err;
+      }
+    }
+
+    // ── Фаза 2: атомарная замена .enc.new → .enc ─────────────────────────
+    for (let i = 0; i < total; i++) {
+      const encPath = this.originalEncAbs(encFiles[i]);
+      await fsp.rename(encPath + ".new", encPath);
+      onProgress?.(total + i + 1, total * 2);
+    }
+
+    console.info(`[ShadowVault] Пере-шифровка завершена: ${total} файлов.`);
+  }
+
+  /**
+   * Сканирует оригинальное хранилище и возвращает normalizedPath
+   * для всех зашифрованных файлов (.enc).
+   */
+  private async scanEncryptedFiles(relDir = ""): Promise<string[]> {
+    const result: string[] = [];
+    const absDir = relDir
+      ? nodePath.join(this.originalRoot, ...relDir.split("/"))
+      : this.originalRoot;
+
+    let entries: fs.Dirent[];
+    try {
+      entries = await fsp.readdir(absDir, { withFileTypes: true });
+    } catch {
+      return result;
+    }
+
+    const prefix = relDir ? relDir + "/" : "";
+    for (const entry of entries) {
+      if (entry.name.startsWith(".")) continue;
+      const rel = prefix + entry.name;
+      if (entry.isDirectory()) {
+        result.push(...await this.scanEncryptedFiles(rel));
+      } else if (entry.isFile() && entry.name.endsWith(ENCRYPTED_EXT)) {
+        result.push(rel.slice(0, -ENCRYPTED_EXT.length));
+      }
+    }
+    return result;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
   // Ядро: расшифровка по требованию (lazy decrypt)
   // ═══════════════════════════════════════════════════════════════════════
 

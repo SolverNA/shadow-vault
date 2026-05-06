@@ -33,6 +33,8 @@ export class InitModal extends Modal {
   private loadingEl!: HTMLElement;
 
   private isFirstRun: boolean;
+  /** Разрешить закрытие только после успешного ввода пароля */
+  private allowClose = false;
 
   constructor(
     app: App,
@@ -129,6 +131,11 @@ export class InitModal extends Modal {
     setTimeout(() => this.inputPassword.focus(), 50);
   }
 
+  /** Запрещаем любое закрытие (фон, Esc, внешний вызов) пока пароль не принят */
+  close(): void {
+    if (this.allowClose) super.close();
+  }
+
   onClose(): void {
     this.contentEl.empty();
   }
@@ -207,6 +214,7 @@ export class InitModal extends Modal {
       this.inputPassword.value = "";
       if (this.inputConfirm) this.inputConfirm.value = "";
 
+      this.allowClose = true;
       this.close();
       this.onUnlock(result);
     } catch (err) {
