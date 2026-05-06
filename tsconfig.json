@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "inlineSourceMap": true,
+    "inlineSources": true,
+    "module": "ESNext",
+    "target": "ES2018",
+    "allowSyntheticDefaultImports": true,
+    "outDir": ".",
+    "moduleResolution": "node",
+    "importHelpers": true,
+    "isolatedModules": true,
+    "strictNullChecks": true,
+    "strict": true,
+    "lib": ["ES2018", "DOM"]
+  },
+  "include": ["**/*.ts"],
+  "exclude": ["node_modules", "tests"]
+}

@@ -1,0 +1,10 @@
+{
+  "id": "you-encrypt",
+  "name": "ShadowVault Encryption",
+  "version": "0.1.0",
+  "minAppVersion": "1.0.0",
+  "description": "Transparent AES-256-GCM encryption via Virtual File System. Encrypted on disk, native Obsidian experience.",
+  "author": "",
+  "authorUrl": "",
+  "isDesktopOnly": true
+}
