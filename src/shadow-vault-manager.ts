@@ -227,14 +227,26 @@ export class ShadowVaultManager {
     }
 
     if (stat.size < CRYPTO_HEADER_SIZE) {
-      throw new Error(
-        `[ShadowVault] Файл "${normalizedPath}" повреждён: ` +
-        `размер ${stat.size} б < минимального заголовка ${CRYPTO_HEADER_SIZE} б`
-      );
+      // Файл слишком маленький для зашифрованного формата — это plaintext-файл
+      // (миграция: существующий vault до установки плагина)
+      await fsp.copyFile(origPath, shadowPath);
+      await fsp.utimes(shadowPath, stat.atime, stat.mtime);
+      return;
     }
 
-    // Потоковая расшифровка — не грузит тяжёлые файлы в RAM целиком
-    await this.engine.decryptStream(origPath, shadowPath);
+    // Пробуем расшифровать. Если не удаётся (auth tag mismatch) —
+    // файл не зашифрован нашим плагином (существующий plaintext, режим миграции).
+    try {
+      await this.engine.decryptStream(origPath, shadowPath);
+    } catch {
+      // Режим миграции: файл существующий plaintext → копируем как есть.
+      // При следующем сохранении через write-through он будет зашифрован.
+      console.warn(`[ShadowVault] "${normalizedPath}" не зашифрован (миграция) — копируем как plaintext`);
+      // Удаляем возможные остатки от неудавшегося decryptStream
+      await fsp.unlink(shadowPath).catch(() => undefined);
+      await fsp.unlink(shadowPath + ".tmp").catch(() => undefined);
+      await fsp.copyFile(origPath, shadowPath);
+    }
 
     /**
      * КРИТИЧНО для Crash Recovery (Шаг 5):
@@ -434,6 +446,8 @@ export class ShadowVaultManager {
     for (const entry of entries) {
       // Скрытые системные файлы (.session_active, .lock) не показываем Obsidian
       if (entry.name.startsWith(".") && entry.name !== ".obsidian") continue;
+      // Временные файлы атомарных записей — не показываем Obsidian
+      if (entry.name.endsWith(".tmp") || entry.name.endsWith(".shadowtmp")) continue;
       const rel = prefix + entry.name;
       if (entry.isDirectory()) folders.push(rel);
       else files.push(rel);

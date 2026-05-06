@@ -4,7 +4,7 @@ import builtins from "builtin-modules";
 
 const prod = process.argv[2] === "production";
 
-esbuild.build({
+const context = await esbuild.context({
   banner: { js: "/* ShadowVault / you-encrypt */" },
   entryPoints: ["src/main.ts"],
   bundle: true,
@@ -35,10 +35,16 @@ esbuild.build({
     ...builtins,
   ],
   format: "cjs",
-  watch: !prod,
   target: "es2018",
   logLevel: "info",
   sourcemap: prod ? false : "inline",
   treeShaking: true,
   outfile: "main.js",
-}).catch(() => process.exit(1));
+});
+
+if (prod) {
+  await context.rebuild();
+  await context.dispose();
+} else {
+  await context.watch();
+}

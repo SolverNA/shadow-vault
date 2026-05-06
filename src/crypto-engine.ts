@@ -148,39 +148,45 @@ export class CryptoEngine {
     // Временный файл в той же директории — rename на другой ФС-том может быть не атомарным
     const tmpPath = dstPath + ".tmp";
 
-    await new Promise<void>((resolve, reject) => {
-      const readStream = fs.createReadStream(srcPath);
-      const cipher = crypto.createCipheriv(ALGORITHM, this.keyBuffer!, iv);
-      const writeStream = fs.createWriteStream(tmpPath);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const readStream = fs.createReadStream(srcPath);
+        const cipher = crypto.createCipheriv(ALGORITHM, this.keyBuffer!, iv);
+        const writeStream = fs.createWriteStream(tmpPath);
 
-      // Записываем IV в начало файла до начала шифрованного потока
-      writeStream.write(iv);
+        // Записываем IV в начало файла до начала шифрованного потока
+        writeStream.write(iv);
 
-      // Auth Tag в GCM-режиме доступен только ПОСЛЕ cipher.final(),
-      // поэтому мы буферизируем зашифрованный контент и вставляем тег перед ним
-      const chunks: Buffer[] = [];
+        // Auth Tag в GCM-режиме доступен только ПОСЛЕ cipher.final(),
+        // поэтому мы буферизируем зашифрованный контент и вставляем тег перед ним
+        const chunks: Buffer[] = [];
 
-      cipher.on("data", (chunk: Buffer) => chunks.push(chunk));
-      cipher.on("end", () => {
-        const authTag = cipher.getAuthTag();
-        writeStream.write(authTag);
-        for (const chunk of chunks) writeStream.write(chunk);
-        writeStream.end();
-      });
-
-      cipher.on("error", reject);
-      writeStream.on("error", reject);
-      writeStream.on("finish", () => {
-        // Атомарная замена: tmpPath → dstPath
-        fs.rename(tmpPath, dstPath, (err) => {
-          if (err) reject(err);
-          else resolve();
+        cipher.on("data", (chunk: Buffer) => chunks.push(chunk));
+        cipher.on("end", () => {
+          const authTag = cipher.getAuthTag();
+          writeStream.write(authTag);
+          for (const chunk of chunks) writeStream.write(chunk);
+          writeStream.end();
         });
-      });
 
-      readStream.on("error", reject);
-      readStream.pipe(cipher);
-    });
+        cipher.on("error", reject);
+        writeStream.on("error", reject);
+        writeStream.on("finish", () => {
+          // Атомарная замена: tmpPath → dstPath
+          fs.rename(tmpPath, dstPath, (err) => {
+            if (err) reject(err);
+            else resolve();
+          });
+        });
+
+        readStream.on("error", reject);
+        readStream.pipe(cipher);
+      });
+    } catch (err) {
+      // Удаляем временный файл при любой ошибке
+      await new Promise<void>((res) => fs.unlink(tmpPath, () => res()));
+      throw err;
+    }
   }
 
   /**
@@ -192,6 +198,7 @@ export class CryptoEngine {
 
     const tmpPath = dstPath + ".tmp";
 
+    try {
     await new Promise<void>((resolve, reject) => {
       const readStream = fs.createReadStream(srcPath);
       const writeStream = fs.createWriteStream(tmpPath);
@@ -246,6 +253,10 @@ export class CryptoEngine {
       });
       writeStream.on("error", reject);
     });
+    } catch (err) {
+      await new Promise<void>((res) => fs.unlink(tmpPath, () => res()));
+      throw err;
+    }
   }
 
   /**
