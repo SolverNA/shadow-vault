@@ -25,6 +25,11 @@ export async function fileExists(absPath: string): Promise<boolean> {
 /**
  * Атомарная запись через временный файл и rename.
  * Гарантирует что absPath либо содержит старые данные, либо новые — не половину.
+ *
+ * Уникальный tmp-suffix (с PID + случайным хвостом) защищает от race condition
+ * когда два параллельных atomicWrite на одном файле дрались за `.shadowtmp` —
+ * второй writeFile перетирал tmp первого, потом первый rename перемещал чужие
+ * данные на target, второй rename падал с ENOENT, итог — повреждённый файл.
  */
 export async function atomicWrite(
   absPath: string,
@@ -32,7 +37,8 @@ export async function atomicWrite(
   tmpExt = ".shadowtmp"
 ): Promise<void> {
   await fsp.mkdir(nodePath.dirname(absPath), { recursive: true });
-  const tmpPath = absPath + tmpExt;
+  const unique = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const tmpPath = absPath + "." + unique + tmpExt;
   try {
     await fsp.writeFile(tmpPath, data);
     await fsp.rename(tmpPath, absPath);

@@ -144,8 +144,10 @@ export class CryptoEngine {
     this.assertUnlocked();
 
     const iv = crypto.randomBytes(IV_LENGTH);
-    // Временный файл в той же директории — rename на другой ФС-том может быть не атомарным
-    const tmpPath = dstPath + ".tmp";
+    // Уникальный tmp-suffix защищает от race между параллельными encryptStream
+    // на одном dst — иначе два потока пишут в один tmp, потом dst получает torn data.
+    const unique = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const tmpPath = `${dstPath}.${unique}.tmp`;
 
     try {
       await new Promise<void>((resolve, reject) => {
@@ -195,7 +197,8 @@ export class CryptoEngine {
   async decryptStream(srcPath: string, dstPath: string): Promise<void> {
     this.assertUnlocked();
 
-    const tmpPath = dstPath + ".tmp";
+    const unique = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const tmpPath = `${dstPath}.${unique}.tmp`;
 
     try {
     await new Promise<void>((resolve, reject) => {

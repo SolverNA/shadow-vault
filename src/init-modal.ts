@@ -33,6 +33,13 @@ export class InitModal extends Modal {
   private loadingEl!: HTMLElement;
 
   private isFirstRun: boolean;
+  /**
+   * true если в оригинальном vault уже есть .enc файлы, но settings.saltHex
+   * пустой — значит data.json потерян (например, пользователь скопировал
+   * только сами файлы между машинами без папки .obsidian/plugins).
+   * Без оригинального saltHex расшифровать данные невозможно.
+   */
+  private orphanEncryptedVault: boolean;
   /** Разрешить закрытие только после успешного ввода пароля */
   private allowClose = false;
 
@@ -40,7 +47,8 @@ export class InitModal extends Modal {
     app: App,
     settings: PluginSettings,
     saveFn: SaveSettingsFn,
-    onUnlock: UnlockCallback
+    onUnlock: UnlockCallback,
+    orphanEncryptedVault = false
   ) {
     super(app);
     this.settings = settings;
@@ -48,6 +56,7 @@ export class InitModal extends Modal {
     this.onUnlock = onUnlock;
     this.authService = new AuthService();
     this.isFirstRun = settings.saltHex === null;
+    this.orphanEncryptedVault = orphanEncryptedVault;
   }
 
   onOpen(): void {
@@ -63,18 +72,29 @@ export class InitModal extends Modal {
     modalEl.addClass("shadow-vault-modal");
     contentEl.empty();
 
+    // Убираем нативный крестик закрытия — без пароля закрыть нельзя
+    modalEl.querySelectorAll(".modal-close-button").forEach((el) => el.remove());
+
     // ── Шапка ────────────────────────────────────────────────────────────
     contentEl.createEl("div", { cls: "shadow-vault-header" }, (header) => {
-      header.createEl("div", { cls: "shadow-vault-icon", text: "🔐" });
+      header.createEl("div", { cls: "shadow-vault-icon", text: this.orphanEncryptedVault ? "⚠️" : "🔐" });
       header.createEl("h2", {
         cls: "shadow-vault-title",
-        text: this.isFirstRun
+        text: this.orphanEncryptedVault
+          ? "Хранилище зашифровано, но настройки утеряны"
+          : this.isFirstRun
           ? "Создать зашифрованное хранилище"
           : "Разблокировать хранилище",
       });
       header.createEl("p", {
         cls: "shadow-vault-subtitle",
-        text: this.isFirstRun
+        text: this.orphanEncryptedVault
+          ? "В хранилище найдены .enc файлы, но data.json с криптографической " +
+            "солью отсутствует. Без неё расшифровать существующие файлы невозможно " +
+            "даже с правильным паролем. Восстановите .obsidian/plugins/shadow-vault/" +
+            "data.json из резервной копии. Если продолжить — будет создано НОВОЕ " +
+            "хранилище, существующие .enc останутся, но станут недоступны."
+          : this.isFirstRun
           ? "Придумайте надёжный пароль. Восстановить его будет невозможно."
           : "Введите пароль для расшифровки хранилища.",
       });

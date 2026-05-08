@@ -38,7 +38,7 @@ import { SessionManager } from "./session-manager";
 import { ShadowVaultSettingTab } from "./settings-tab";
 import { DEFAULT_SETTINGS, PluginSettings, VERIFICATION_PLAINTEXT } from "./types";
 import { IDataAdapter, ListedFiles } from "./adapter-types";
-import { CRYPTO_HEADER_SIZE, ENCRYPTED_EXT, isTempFile } from "./fs-utils";
+import { ENCRYPTED_EXT, isTempFile } from "./fs-utils";
 
 interface AdapterWithInternals extends IDataAdapter {
   files?: Record<string, { type: string; realpath: string; ctime?: number; mtime?: number; size?: number }>;
@@ -188,12 +188,52 @@ export default class ShadowVaultPlugin extends Plugin {
   // ═══════════════════════════════════════════════════════════════════════
 
   private openInitModal(): void {
+    // Детекция: settings.saltHex пустой (первый запуск с точки зрения плагина),
+    // но в оригинале уже есть .enc файлы — значит data.json утерян и расшифровать
+    // существующее не получится. Сразу предупреждаем пользователя.
+    const orphan = this.settings.saltHex === null && this.detectOrphanEncryptedVault();
+    if (orphan) {
+      console.warn("[ShadowVault] orphan encrypted vault detected: .enc файлы есть, saltHex отсутствует");
+    }
     new InitModal(
       this.app,
       this.settings,
       (s) => this.saveSettings(s),
-      (result) => { void this.onUnlock(result); }
+      (result) => { void this.onUnlock(result); },
+      orphan
     ).open();
+  }
+
+  /**
+   * Синхронно сканирует корень оригинального vault на наличие .enc файлов.
+   * Используется для детекции "orphan encrypted vault" — когда .enc на диске
+   * есть, но data.json с saltHex отсутствует (например, скопировали vault
+   * между машинами без папки плагина).
+   */
+  private detectOrphanEncryptedVault(): boolean {
+    const basePath = this.getVaultBasePath();
+    if (!basePath) return false;
+    try {
+      return this.scanDirForEnc(basePath, 3); // глубина 3 уровня — для скорости
+    } catch {
+      return false;
+    }
+  }
+
+  private scanDirForEnc(absDir: string, depth: number): boolean {
+    if (depth < 0) return false;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(absDir, { withFileTypes: true });
+    } catch { return false; }
+    for (const e of entries) {
+      if (e.name.startsWith(".")) continue;
+      if (e.isFile() && e.name.endsWith(ENCRYPTED_EXT)) return true;
+      if (e.isDirectory() && this.scanDirForEnc(nodePath.join(absDir, e.name), depth - 1)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -680,16 +720,31 @@ export default class ShadowVaultPlugin extends Plugin {
         continue;
       }
 
-      const origEncPath = this.shadowManager!.originalEncAbs(filePath);
-      let statObj = { ctime: Date.now(), mtime: Date.now(), size: 0 };
+      // Защита от каскадных ENOENT: регистрируем файл только если он
+      // ФАКТИЧЕСКИ существует в shadow (т.е. был успешно расшифрован).
+      // Файлы из decryptAllToShadow.failed[] есть в .enc, но не в shadow —
+      // если их зарегистрировать, любой клик пользователя приведёт к
+      // ENOENT при native readFile/lstat.
+      const shadowAbs = this.shadowManager!.shadowAbs(filePath);
       try {
-        const s = await fsp.stat(origEncPath);
-        statObj = {
-          ctime: Math.round(s.birthtimeMs ?? s.ctimeMs),
-          mtime: Math.round(s.mtimeMs),
-          size:  Math.max(0, s.size - CRYPTO_HEADER_SIZE),
-        };
-      } catch { /* .enc нет — заглушка */ }
+        await fsp.access(shadowAbs);
+      } catch {
+        console.warn(
+          `[ShadowVault] reconcile skip: "${filePath}" нет в shadow ` +
+          `(decrypt failed?), не регистрируем в fileMap`
+        );
+        stats.skipped++;
+        continue;
+      }
+
+      const s = await fsp.stat(shadowAbs).catch(() => null);
+      const statObj = s
+        ? {
+            ctime: Math.round(s.birthtimeMs ?? s.ctimeMs),
+            mtime: Math.round(s.mtimeMs),
+            size: s.size,
+          }
+        : { ctime: Date.now(), mtime: Date.now(), size: 0 };
 
       adapter.files ??= {};
       adapter.files[filePath] = { type: "file", realpath: filePath, ...statObj };

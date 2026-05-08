@@ -223,13 +223,39 @@ export class ShadowVaultManager {
   // ═══════════════════════════════════════════════════════════════════════
 
   /**
+   * Per-file mutex для encryptOne. Если для path уже идёт шифрование —
+   * новый вызов цепляется в хвост promise-цепочки и ждёт. Защита от race:
+   * Obsidian при autosave может стрельнуть modify несколько раз подряд,
+   * параллельные encryptOne на одном пути приводили к torn writes в .enc.
+   */
+  private encryptLocks: Map<string, Promise<void>> = new Map();
+
+  /**
    * Шифрует один файл из shadow в оригинал .enc.
    * Вызывается из vault.on("create" | "modify") в main.ts.
    *
-   * Атомарно: пишет .enc.shadowtmp, потом rename → .enc.
-   * Большие файлы (>4 МБ) — потоковое шифрование, иначе буферное.
+   * Атомарно: пишет .enc.<unique>.shadowtmp, потом rename → .enc.
+   * Per-file сериализация через encryptLocks — гарантирует что два
+   * последовательных save'а на одном файле обработаются строго по порядку.
    */
   async encryptOne(normalizedPath: string): Promise<void> {
+    const previous = this.encryptLocks.get(normalizedPath) ?? Promise.resolve();
+    const next = previous.then(
+      () => this.encryptOneInner(normalizedPath),
+      () => this.encryptOneInner(normalizedPath) // даже если предыдущий упал, шифруем
+    );
+    this.encryptLocks.set(normalizedPath, next);
+    try {
+      await next;
+    } finally {
+      // Удаляем себя из карты только если никто не встал в очередь после нас
+      if (this.encryptLocks.get(normalizedPath) === next) {
+        this.encryptLocks.delete(normalizedPath);
+      }
+    }
+  }
+
+  private async encryptOneInner(normalizedPath: string): Promise<void> {
     const shadowAbs = this.shadowAbs(normalizedPath);
     const encAbs = this.originalEncAbs(normalizedPath);
 
@@ -244,6 +270,7 @@ export class ShadowVaultManager {
     if (stat.size === 0) {
       await atomicWrite(encAbs, Buffer.alloc(0));
     } else if (stat.size > 4 * 1024 * 1024) {
+      // encryptStream сам пишет в encAbs + ".tmp" + rename, своя атомарность
       await this.engine.encryptStream(shadowAbs, encAbs);
     } else {
       const buf = await fsp.readFile(shadowAbs);
