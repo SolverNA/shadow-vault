@@ -22,8 +22,10 @@
 import * as fsp from "fs/promises";
 import * as fs from "fs";
 import * as nodePath from "path";
+import * as os from "os";
 import { CryptoEngine } from "./crypto-engine";
 import { atomicWrite, fileExists } from "./fs-utils";
+import { checkFileIntegrity, compareSemantic } from "./integrity-check";
 
 /** Имя файла-индикатора активной сессии */
 const SESSION_FILE = ".session_active";
@@ -35,10 +37,12 @@ interface SessionFileContent {
 }
 
 export interface CrashRecoveryResult {
-  /** Пути файлов, которые были успешно перешифрованы */
+  /** Пути файлов, которые были успешно перешифрованы (изменения из shadow → оригинал) */
   recoveredFiles: string[];
-  /** Пути файлов, которые не удалось восстановить (ошибки шифрования/ФС) */
+  /** Пути файлов, которые не удалось восстановить (ошибки шифрования/ФС/целостности) */
   failedFiles:    string[];
+  /** Пути файлов, где shadow оказался повреждён (Этап 2) — данные оставлены в оригинале */
+  corruptedShadow: string[];
 }
 
 export interface SessionStartResult {
@@ -134,63 +138,111 @@ export class SessionManager {
   }
 
   /**
-   * Crash Recovery: находит и восстанавливает «потерянные» записи.
+   * Crash Recovery: двухэтапная проверка целостности и восстановление потерянных записей.
    *
-   * «Потерянный» файл = файл в Теневом хранилище, чей mtime
-   * строго новее соответствующего файла в Оригинальном хранилище.
-   *
-   * Это означает: write-through записал данные в shadow, но не успел
-   * атомарно обновить оригинал до краша питания/приложения.
+   * Алгоритм:
+   *   Этап 0 (фильтр): берём только файлы, чей shadow строго новее оригинала
+   *     (с допуском 50 мс на погрешность ФС).
+   *   Этап 1 (semantic): расшифровываем оригинал и сравниваем побайтово с shadow.
+   *     Идентичны → пропускаем (нет реальных изменений несмотря на mtime).
+   *     Различаются → переходим к Этапу 2.
+   *   Этап 2 (integrity): проверяем что shadow-файл не битый (UTF-8/magic bytes).
+   *     OK → шифруем shadow → оригинал, восстанавливаем правку.
+   *     Битый → оставляем оригинал, помечаем corruptedShadow, не теряем данные пользователя.
+   *   Если оригинал отсутствует или повреждён (decrypt fails) — относимся как к
+   *     "original-missing": доверяем shadow, если он прошёл Этап 2.
    *
    * После recovery shadow vault не удаляется — его чистит endSession().
-   * startSession() вызывает recoverFromCrash() ДО создания нового .session_active,
-   * поэтому recovery идёт в «чистом» состоянии.
+   * startSession() вызывает recoverFromCrash() ДО создания нового .session_active.
    */
   async recoverFromCrash(): Promise<CrashRecoveryResult> {
     const recoveredFiles: string[] = [];
     const failedFiles:    string[] = [];
+    const corruptedShadow: string[] = [];
 
-    // Теневое хранилище могло не существовать (краш до инициализации)
     if (!(await fileExists(this.shadowRoot))) {
-      return { recoveredFiles, failedFiles };
+      return { recoveredFiles, failedFiles, corruptedShadow };
     }
 
     const shadowFiles = await this.scanShadowFiles();
+    const TOLERANCE_MS = 50;
 
     for (const normalizedPath of shadowFiles) {
       const shadowAbs      = nodePath.join(this.shadowRoot,   ...normalizedPath.split("/"));
-      // Файл в оригинальном хранилище хранится с суффиксом .enc
       const originalEncAbs = nodePath.join(this.originalRoot, ...normalizedPath.split("/")) + ".enc";
 
       try {
+        // ── Этап 0: фильтр по mtime ───────────────────────────────────────
         const shadowStat   = await fsp.stat(shadowAbs);
         const originalStat = await fsp.stat(originalEncAbs).catch(() => null);
 
-        const shadowMtime   = shadowStat.mtimeMs;
-        const originalMtime = originalStat?.mtimeMs ?? 0;
-
-        // Файл считается «потерянным» если shadow строго новее .enc оригинала.
-        // Небольшой допуск 50 мс для учёта погрешности файловой системы.
-        const TOLERANCE_MS = 50;
-        if (shadowMtime <= originalMtime + TOLERANCE_MS) {
-          // Оригинал актуален — восстанавливать нечего
+        if (originalStat && shadowStat.mtimeMs <= originalStat.mtimeMs + TOLERANCE_MS) {
           continue;
         }
 
-        // Шифруем shadow → tmp → оригинал.enc (атомарно)
-        const plaintext = await fsp.readFile(shadowAbs);
-        const encrypted = this.engine.encryptBuffer(plaintext);
+        // ── Этап 1: семантическая сверка с расшифрованным оригиналом ──────
+        const shadowBuf = await fsp.readFile(shadowAbs);
+        const originalBuf = await this.tryDecryptOriginal(originalEncAbs);
+
+        const semantic = compareSemantic(shadowBuf, originalBuf);
+        if (semantic.kind === "equal") {
+          // Контент одинаков несмотря на mtime → ничего не делаем
+          continue;
+        }
+
+        // ── Этап 2: проверка целостности shadow ───────────────────────────
+        const integrity = checkFileIntegrity(normalizedPath, shadowBuf);
+        if (!integrity.ok) {
+          corruptedShadow.push(normalizedPath);
+          console.warn(
+            `[SessionManager] Recovery: shadow "${normalizedPath}" повреждён (${integrity.reason}), ` +
+            `оригинал не трогаем`
+          );
+          continue;
+        }
+
+        // ── Запись: shadow прошёл проверки → шифруем в оригинал ───────────
+        const encrypted = this.engine.encryptBuffer(shadowBuf);
         await atomicWrite(originalEncAbs, encrypted, ".sessiontmp");
 
         recoveredFiles.push(normalizedPath);
-        console.debug(`[SessionManager] Восстановлен: "${normalizedPath}" → original.enc`);
+        console.debug(
+          `[SessionManager] Recovery: "${normalizedPath}" восстановлен ` +
+          `(${semantic.kind === "different" ? semantic.reason : semantic.kind})`
+        );
       } catch (err) {
         failedFiles.push(normalizedPath);
-        console.error(`[SessionManager] Ошибка recovery для "${normalizedPath}":`, err);
+        console.error(`[SessionManager] Recovery для "${normalizedPath}":`, err);
       }
     }
 
-    return { recoveredFiles, failedFiles };
+    return { recoveredFiles, failedFiles, corruptedShadow };
+  }
+
+  /**
+   * Пытается расшифровать оригинал во временный файл и вернуть его содержимое.
+   * Возвращает null если файла нет ИЛИ расшифровка/AuthTag-проверка провалилась.
+   * Используется в Этапе 1 recovery — нужен только plaintext оригинала, не его shadow-копия.
+   */
+  private async tryDecryptOriginal(encAbsPath: string): Promise<Buffer | null> {
+    if (!(await fileExists(encAbsPath))) return null;
+
+    const stat = await fsp.stat(encAbsPath);
+    if (stat.size === 0) return Buffer.alloc(0);
+
+    const tmpPath = nodePath.join(
+      os.tmpdir(),
+      `shadowvault-recover-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    );
+    try {
+      await this.engine.decryptStream(encAbsPath, tmpPath);
+      return await fsp.readFile(tmpPath);
+    } catch (err) {
+      console.warn(`[SessionManager] Recovery: оригинал "${encAbsPath}" не расшифровался:`, err);
+      return null;
+    } finally {
+      await fsp.unlink(tmpPath).catch(() => undefined);
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════

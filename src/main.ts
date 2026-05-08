@@ -427,11 +427,11 @@ export default class ShadowVaultPlugin extends Plugin {
   }
 
   private notifyCrashRecovery(
-    recovery: { recoveredFiles: string[]; failedFiles: string[] }
+    recovery: { recoveredFiles: string[]; failedFiles: string[]; corruptedShadow: string[] }
   ): void {
-    const { recoveredFiles, failedFiles } = recovery;
+    const { recoveredFiles, failedFiles, corruptedShadow } = recovery;
 
-    if (recoveredFiles.length === 0 && failedFiles.length === 0) {
+    if (recoveredFiles.length === 0 && failedFiles.length === 0 && corruptedShadow.length === 0) {
       // Краш был, но потерянных данных нет — тихо пропускаем
       return;
     }
@@ -440,12 +440,16 @@ export default class ShadowVaultPlugin extends Plugin {
     if (recoveredFiles.length > 0) {
       msg += `✅ Восстановлено файлов: ${recoveredFiles.length}.\n`;
     }
+    if (corruptedShadow.length > 0) {
+      msg += `⚠️ Битых файлов в теневом хранилище: ${corruptedShadow.length} ` +
+             `(использован оригинал, правки могли быть потеряны).\n`;
+    }
     if (failedFiles.length > 0) {
       msg += `❌ Не удалось восстановить: ${failedFiles.length}.\n`;
       msg += `Проверьте консоль разработчика для деталей.`;
     }
 
-    new Notice(msg, 10000);
+    new Notice(msg, 12000);
   }
 
   /**
