@@ -128,6 +128,14 @@ export class SessionManager {
     return { hadCrash, recovery };
   }
 
+  /**
+   * Синхронно уничтожает ключ. Используется в sync-cleanup при закрытии Obsidian,
+   * когда async endSession не успевает завершиться.
+   */
+  destroyEngineSync(): void {
+    this.engine.destroy();
+  }
+
   /** true если в shadowRoot есть хотя бы один обычный файл (не считая .obsidian symlink) */
   private async shadowHasFiles(): Promise<boolean> {
     if (!(await fileExists(this.shadowRoot))) return false;
