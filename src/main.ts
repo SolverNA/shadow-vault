@@ -316,13 +316,28 @@ export default class ShadowVaultPlugin extends Plugin {
     this.sessionManager = new SessionManager(
       engine,
       basePath,
-      this.shadowManager!.shadowRoot
+      this.shadowManager!.shadowRoot,
+      this.getPluginDirAbs(basePath)
     );
     const sessionResult = await this.sessionManager.startSession();
 
     if (sessionResult.hadCrash) {
       this.notifyCrashRecovery(sessionResult.recovery!);
     }
+  }
+
+  /**
+   * Абсолютный путь к папке плагина: <vault>/.obsidian/plugins/<id>.
+   * Используем для хранения session.lock — чтобы не засорять оригинальное
+   * хранилище и не попадать под Obsidian-индексацию.
+   */
+  private getPluginDirAbs(originalRoot: string): string {
+    return nodePath.join(
+      originalRoot,
+      this.app.vault.configDir,
+      "plugins",
+      this.manifest.id
+    );
   }
 
   // setupQueue() удалён: bulk decrypt в setupShadow покрывает весь vault единоразово.

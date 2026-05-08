@@ -27,13 +27,21 @@ import { CryptoEngine } from "./crypto-engine";
 import { atomicWrite, fileExists } from "./fs-utils";
 import { checkFileIntegrity, compareSemantic } from "./integrity-check";
 
-/** Имя файла-индикатора активной сессии */
-const SESSION_FILE = ".session_active";
+/**
+ * Имя файла-индикатора активной сессии.
+ * Хранится в папке плагина (<vault>/.obsidian/plugins/shadow-vault/session.lock)
+ * чтобы не засорять оригинальное хранилище и не попадать под Obsidian-индексацию.
+ */
+const SESSION_FILE = "session.lock";
 
-/** JSON-структура файла .session_active */
+/** Старый путь индикатора (до v1.1.0) — используется для миграции */
+const LEGACY_SESSION_FILE = ".session_active";
+
+/** JSON-структура session.lock */
 interface SessionFileContent {
   startedAt: string;   // ISO-строка
   shadowRoot: string;  // абсолютный путь к теневому хранилищу
+  pid?: number;        // PID процесса Obsidian — диагностика, не используется в логике
 }
 
 export interface CrashRecoveryResult {
@@ -54,13 +62,17 @@ export interface SessionStartResult {
 
 export class SessionManager {
   private readonly sessionFilePath: string;
+  /** Старый путь — проверяется и удаляется при обнаружении (миграция) */
+  private readonly legacySessionFilePath: string;
 
   constructor(
     private readonly engine:       CryptoEngine,
     private readonly originalRoot: string,
-    private readonly shadowRoot:   string
+    private readonly shadowRoot:   string,
+    pluginDirAbs:                  string
   ) {
-    this.sessionFilePath = nodePath.join(originalRoot, SESSION_FILE);
+    this.sessionFilePath = nodePath.join(pluginDirAbs, SESSION_FILE);
+    this.legacySessionFilePath = nodePath.join(originalRoot, LEGACY_SESSION_FILE);
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -71,31 +83,62 @@ export class SessionManager {
    * Вызывается при старте плагина после успешной деривации ключа.
    *
    * Алгоритм:
-   *   1. Проверяем наличие .session_active → если есть: запускаем recovery.
-   *   2. Создаём новый .session_active с меткой времени и путём к shadow.
-   *   3. Возвращаем результат (был ли краш и что восстановлено).
+   *   1. Миграция: если старый .session_active есть в originalRoot, считаем
+   *      это маркером краша и сразу удаляем (он больше там не нужен).
+   *   2. Проверяем наличие session.lock в папке плагина. Дополнительно — наличие
+   *      shadow vault: даже если lock потерялся, существование shadow с файлами
+   *      означает что предыдущая сессия не завершилась корректно.
+   *   3. Если краш обнаружен → recover.
+   *   4. Создаём новый session.lock.
    */
   async startSession(): Promise<SessionStartResult> {
     let hadCrash = false;
     let recovery: CrashRecoveryResult | undefined;
 
-    const sessionFileExists = await fileExists(this.sessionFilePath);
-
-    if (sessionFileExists) {
-      // Предыдущая сессия не завершилась корректно
+    // ── Миграция: убираем старый .session_active из оригинала ──────────────
+    if (await fileExists(this.legacySessionFilePath)) {
       hadCrash = true;
-      console.warn("[SessionManager] Обнаружен краш предыдущей сессии. Запускаем Crash Recovery...");
+      console.warn("[SessionManager] Найден legacy .session_active в оригинале — миграция и recovery");
+      await fsp.unlink(this.legacySessionFilePath).catch(() => undefined);
+    }
+
+    // ── Текущий session.lock (в папке плагина) ─────────────────────────────
+    if (await fileExists(this.sessionFilePath)) {
+      hadCrash = true;
+      console.warn("[SessionManager] session.lock существует — предыдущая сессия не завершилась");
+    }
+
+    // ── Дополнительный сигнал: shadow vault существует и не пуст ───────────
+    // Если плагин крашнулся ДО создания lock'а (или lock удалён вручную),
+    // присутствие shadow с файлами — однозначный признак незавершённой сессии.
+    if (!hadCrash && (await this.shadowHasFiles())) {
+      hadCrash = true;
+      console.warn("[SessionManager] shadow vault не пуст — обнаружен краш без lock-файла");
+    }
+
+    if (hadCrash) {
       recovery = await this.recoverFromCrash();
       console.debug(
-        `[SessionManager] Recovery завершён: ${recovery.recoveredFiles.length} файлов восстановлено, ` +
-        `${recovery.failedFiles.length} ошибок.`
+        `[SessionManager] Recovery: ${recovery.recoveredFiles.length} ok, ` +
+        `${recovery.corruptedShadow.length} corrupted, ${recovery.failedFiles.length} failed`
       );
     }
 
-    // Создаём новый файл-индикатор для текущей сессии
     await this.createSessionFile();
-
     return { hadCrash, recovery };
+  }
+
+  /** true если в shadowRoot есть хотя бы один обычный файл (не считая .obsidian symlink) */
+  private async shadowHasFiles(): Promise<boolean> {
+    if (!(await fileExists(this.shadowRoot))) return false;
+    try {
+      const entries = await fsp.readdir(this.shadowRoot, { withFileTypes: true });
+      for (const e of entries) {
+        if (e.name.startsWith(".")) continue;
+        if (e.isFile() || e.isDirectory()) return true;
+      }
+    } catch { /* нет доступа — считаем что shadow пуст */ }
+    return false;
   }
 
   /**
@@ -253,8 +296,10 @@ export class SessionManager {
     const content: SessionFileContent = {
       startedAt:  new Date().toISOString(),
       shadowRoot: this.shadowRoot,
+      pid:        process.pid,
     };
-    // Атомарная запись: не хотим частично записанного .session_active
+    // mkdir на случай если папка плагина ещё не создана (свежая установка)
+    await fsp.mkdir(nodePath.dirname(this.sessionFilePath), { recursive: true });
     await atomicWrite(
       this.sessionFilePath,
       Buffer.from(JSON.stringify(content, null, 2), "utf8"),
