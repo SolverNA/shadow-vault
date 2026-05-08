@@ -109,6 +109,49 @@ export async function removeSymlink(linkPath: string): Promise<void> {
 }
 
 /**
+ * Параллельный map с ограниченной concurrency — обрабатывает items одновременно
+ * не более чем `concurrency` штук. Сохраняет порядок результатов.
+ *
+ * Используется в bulk-операциях шифрования: AES-GCM нельзя распараллелить
+ * внутри одного файла (auth tag покрывает весь поток), но несколько файлов
+ * можно гонять одновременно — node:crypto использует hardware AES,
+ * I/O идёт через Node's libuv thread pool.
+ *
+ * @param items        Список элементов для обработки
+ * @param concurrency  Сколько одновременно (>=1)
+ * @param fn           async-функция обработки одного элемента
+ * @param onItemDone   Опц. колбэк при завершении каждого элемента —
+ *                     вызывается после resolve/reject, последовательно
+ *                     (не параллельно), для безопасного обновления UI/счётчиков.
+ */
+export async function parallelMap<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>,
+  onItemDone?: (index: number, result: R) => void
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+
+  const worker = async (): Promise<void> => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      const r = await fn(items[i], i);
+      results[i] = r;
+      onItemDone?.(i, r);
+    }
+  };
+
+  const workers = Array.from(
+    { length: Math.max(1, Math.min(concurrency, items.length)) },
+    () => worker()
+  );
+  await Promise.all(workers);
+  return results;
+}
+
+/**
  * Сравнивает содержимое двух файлов поблочно. Возвращает true если они идентичны.
  * Используется для верификации что расшифровка дала тот же plaintext, который был зашифрован.
  */

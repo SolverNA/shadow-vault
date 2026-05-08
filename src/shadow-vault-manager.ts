@@ -26,6 +26,7 @@ import * as fs from "fs";
 import * as fsp from "fs/promises";
 import * as nodePath from "path";
 import * as crypto from "crypto";
+import * as os from "os";
 import { CryptoEngine } from "./crypto-engine";
 import { IDataAdapter, AdapterStat, DataWriteOptions, ListedFiles } from "./adapter-types";
 import {
@@ -36,8 +37,19 @@ import {
   fileExists,
   filesEqual,
   isTempFile,
+  parallelMap,
   removeSymlink,
 } from "./fs-utils";
+
+/**
+ * Параллелизм bulk-операций.
+ * Берём min(8, max(2, cpus-1)) — оставляем CPU для UI Obsidian'а на слабом железе.
+ * 8 — практический потолок: дальше упираемся в I/O, а не в CPU.
+ */
+function bulkConcurrency(): number {
+  const cpus = os.cpus()?.length ?? 4;
+  return Math.max(2, Math.min(8, cpus - 1));
+}
 
 export class ShadowVaultManager {
   private readonly engine: CryptoEngine;
@@ -203,22 +215,32 @@ export class ShadowVaultManager {
     const encFiles = await this.scanEncryptedFiles();
     const decrypted: string[] = [];
     const failed: Array<{ path: string; error: string }> = [];
+    const concurrency = bulkConcurrency();
 
-    console.debug(`[ShadowVault] Bulk decrypt: ${encFiles.length} файлов в shadow`);
+    console.debug(`[ShadowVault] Bulk decrypt: ${encFiles.length} файлов, concurrency=${concurrency}`);
 
-    for (let i = 0; i < encFiles.length; i++) {
-      const normalizedPath = encFiles[i];
-      onProgress?.(i, encFiles.length, normalizedPath);
-
-      try {
-        await this.ensureDecrypted(normalizedPath);
-        decrypted.push(normalizedPath);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        failed.push({ path: normalizedPath, error: msg });
-        console.error(`[ShadowVault] decryptAllToShadow: "${normalizedPath}" failed:`, err);
+    let done = 0;
+    await parallelMap(
+      encFiles,
+      concurrency,
+      async (normalizedPath): Promise<{ ok: true } | { ok: false; error: string }> => {
+        try {
+          await this.ensureDecrypted(normalizedPath);
+          return { ok: true };
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[ShadowVault] decryptAllToShadow: "${normalizedPath}" failed:`, err);
+          return { ok: false, error: msg };
+        }
+      },
+      (index, result) => {
+        const path = encFiles[index];
+        if (result.ok) decrypted.push(path);
+        else failed.push({ path, error: result.error });
+        done++;
+        onProgress?.(done, encFiles.length, path);
       }
-    }
+    );
 
     onProgress?.(encFiles.length, encFiles.length, "");
     console.debug(`[ShadowVault] Bulk decrypt done: ${decrypted.length} ok, ${failed.length} failed`);
@@ -248,24 +270,33 @@ export class ShadowVaultManager {
     const failed: Array<{ path: string; error: string }> = [];
 
     const shadowFiles = await this.scanShadowFilesForSync();
-    console.debug(`[ShadowVault] encrypt-back: проверяем ${shadowFiles.length} файлов в shadow`);
+    const concurrency = bulkConcurrency();
+    console.debug(`[ShadowVault] encrypt-back: ${shadowFiles.length} файлов, concurrency=${concurrency}`);
 
-    for (let i = 0; i < shadowFiles.length; i++) {
-      const normalizedPath = shadowFiles[i];
-      onProgress?.(i, shadowFiles.length, normalizedPath);
-
-      try {
-        const changed = await this.shadowFileChanged(normalizedPath);
-        if (!changed) continue;
-
-        await this.encryptShadowToOriginalVerified(normalizedPath);
-        encrypted.push(normalizedPath);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        failed.push({ path: normalizedPath, error: msg });
-        console.error(`[ShadowVault] encrypt-back: "${normalizedPath}" failed:`, err);
+    let done = 0;
+    await parallelMap(
+      shadowFiles,
+      concurrency,
+      async (normalizedPath): Promise<"unchanged" | "encrypted" | { failed: string }> => {
+        try {
+          const changed = await this.shadowFileChanged(normalizedPath);
+          if (!changed) return "unchanged";
+          await this.encryptShadowToOriginalVerified(normalizedPath);
+          return "encrypted";
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[ShadowVault] encrypt-back: "${normalizedPath}" failed:`, err);
+          return { failed: msg };
+        }
+      },
+      (index, result) => {
+        const path = shadowFiles[index];
+        if (result === "encrypted") encrypted.push(path);
+        else if (typeof result === "object") failed.push({ path, error: result.failed });
+        done++;
+        onProgress?.(done, shadowFiles.length, path);
       }
-    }
+    );
 
     onProgress?.(shadowFiles.length, shadowFiles.length, "");
     console.debug(`[ShadowVault] encrypt-back done: ${encrypted.length} encrypted, ${failed.length} failed`);
