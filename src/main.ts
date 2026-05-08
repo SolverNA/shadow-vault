@@ -29,7 +29,7 @@
 import * as fs from "fs";
 import * as fsp from "fs/promises";
 import * as nodePath from "path";
-import { Notice, Plugin } from "obsidian";
+import { Notice, Plugin, TAbstractFile, TFile, TFolder } from "obsidian";
 import { CryptoEngine } from "./crypto-engine";
 import { AuthResult, AuthService } from "./auth-service";
 import { InitModal } from "./init-modal";
@@ -218,19 +218,90 @@ export default class ShadowVaultPlugin extends Plugin {
 
     try {
       console.info("[ShadowVault] onUnlock: старт, basePath =", basePath);
-      await this.setupShadow(engine, basePath);
-      await this.setupSession(engine, basePath);
 
-      // patchListEarly работает над оригиналом и Obsidian не успел нативно
-      // зарегистрировать файлы (т.к. на диске только .enc, lstat фейлится).
-      // После mount файлы лежат в shadow, но Obsidian уже завершил первичный
-      // скан и vault.fileMap может быть неполным. Принудительно переоткрываем
-      // индекс через adapter.trigger("file-created"/"folder-created"):
-      console.info("[ShadowVault] reconcileVaultIndex: forcing fileMap refresh");
+      // ── Phase 1: создаём shadow manager и initialize ──────────────────
+      this.shadowManager = new ShadowVaultManager(
+        engine,
+        basePath,
+        this.settings.shadowVaultPath || undefined,
+        this.app.vault.configDir
+      );
+      await this.shadowManager.initialize();
+
+      // ── Phase 2: миграция plaintext → .enc (если нужна) ───────────────
+      if (await this.shadowManager.hasPendingMigration()) {
+        new Notice("⏳ Shadow Vault: шифруем существующие файлы хранилища...", 5000);
+        await this.shadowManager.encryptAllExisting();
+        new Notice("✅ Shadow Vault: все файлы зашифрованы.", 4000);
+      }
+
+      // ── Phase 3: SessionManager + crash recovery ──────────────────────
+      // recoverFromCrash шифрует правки из shadow (если они есть) обратно
+      // в .enc. Это ДО reset/decrypt — иначе мы потеряли бы недосохранённые
+      // изменения с прошлой сессии.
+      this.sessionManager = new SessionManager(
+        engine, basePath, this.shadowManager.shadowRoot, this.getPluginDirAbs(basePath)
+      );
+      const sessionResult = await this.sessionManager.startSession();
+      if (sessionResult.hadCrash) this.notifyCrashRecovery(sessionResult.recovery!);
+
+      // ── Phase 4: reset shadow если был краш ───────────────────────────
+      // После recovery .enc актуальные. Старый shadow чистим и расшифруем
+      // заново — гарантия чистого состояния, без stale-файлов и битых
+      // частично-расшифрованных артефактов.
+      if (sessionResult.hadCrash) {
+        await this.shadowManager.resetShadow();
+      }
+
+      // ── Phase 5: восстанавливаем оригинальный list() ──────────────────
+      const adapter = this.app.vault.adapter as unknown as IDataAdapter;
+      if (this.earlyListOriginal) {
+        adapter.list = this.earlyListOriginal;
+        this.earlyListOriginal = null;
+      }
+
+      // ── Phase 6: bulk decrypt всё в shadow ────────────────────────────
+      const progressNotice = new Notice("🔓 Shadow Vault: расшифровка хранилища...", 0);
+      let decResult: { decrypted: string[]; failed: Array<{ path: string; error: string }> };
+      try {
+        decResult = await this.shadowManager.decryptAllToShadow((done, total, current) => {
+          const percent = total > 0 ? Math.round((done / total) * 100) : 0;
+          progressNotice.setMessage(
+            `🔓 Расшифровка хранилища: ${done}/${total} (${percent}%)\n${current.slice(-60)}`
+          );
+        });
+      } finally {
+        progressNotice.hide();
+      }
+      if (decResult.failed.length > 0) {
+        new Notice(
+          `⚠️ Shadow Vault: ${decResult.failed.length} файл(ов) не удалось расшифровать. См. консоль.`,
+          10000
+        );
+      }
+
+      // ── Phase 7: symlink .obsidian → original/.obsidian ───────────────
+      await this.shadowManager.setupObsidianSymlink();
+
+      // ── Phase 8: MOUNT — basePath → shadowRoot ────────────────────────
+      // После этой строки Obsidian работает с shadow натив но: read/write/list/
+      // mkdir/rename/remove — всё через стандартный FileSystemAdapter, без
+      // наших monkey-патчей. getResourcePath возвращает URL на shadow → PNG/PDF
+      // открываются. fileMap синхронизируется через стандартные внутренние
+      // механизмы Obsidian.
+      this.shadowManager.mount(adapter);
+
+      // ── Phase 9: reconcile fileMap (file-created для существующих) ────
+      // Obsidian при первичном скане прошёл по оригиналу через patchListEarly,
+      // но lstat транслированных имён фейлился (на диске .enc). Теперь файлы
+      // в shadow реально существуют — толкаем file-created чтобы fileMap
+      // получил TFile-объекты с актуальной мета-инфой.
       await this.reconcileVaultIndex();
 
-      // Electron не всегда вызывает plugin.onunload() при закрытии окна.
-      // Используем sync cleanup — асинхронный shutdown не успевает завершиться.
+      // ── Phase 10: подписки на vault events для мирроринга в .enc ──────
+      this.setupVaultEventHandlers();
+
+      // ── Phase 11: lifecycle hooks ─────────────────────────────────────
       this.registerDomEvent(window as Window, "beforeunload", () => {
         if (this.sessionActive) {
           console.info("[ShadowVault] beforeunload: sync cleanup");
@@ -247,7 +318,7 @@ export default class ShadowVaultPlugin extends Plugin {
       }
 
       console.info(
-        `[ShadowVault] Сессия запущена. shadowRoot=${this.shadowManager!.shadowRoot}, originalRoot=${basePath}`
+        `[ShadowVault] Сессия запущена. shadowRoot=${this.shadowManager.shadowRoot}, originalRoot=${basePath}`
       );
     } catch (err) {
       console.error("[ShadowVault] Ошибка инициализации:", err);
@@ -259,80 +330,90 @@ export default class ShadowVaultPlugin extends Plugin {
     }
   }
 
-  /** Создаёт ShadowVaultManager, проводит миграцию (если нужна), расшифровывает оригинал в shadow, монтирует shadow как basePath и патчит адаптер для write-through. */
-  private async setupShadow(engine: CryptoEngine, basePath: string): Promise<void> {
-    this.shadowManager = new ShadowVaultManager(
-      engine,
-      basePath,
-      this.settings.shadowVaultPath || undefined,
-      this.app.vault.configDir
-    );
-    await this.shadowManager.initialize();
+  /**
+   * Подписки на vault-события: Obsidian работает в shadow натив но,
+   * мы только зеркалим изменения в оригинал.enc через стандартный API.
+   *
+   *   create  → encryptOne (или mkdirOriginal для папок)
+   *   modify  → encryptOne
+   *   rename  → renameEnc (переименовать .enc; для папок — переименовать в оригинале)
+   *   delete  → unlinkEnc (или rmdirOriginal для папок)
+   *
+   * Фильтр configDir: события для .obsidian/* игнорируем — конфиг живёт
+   * через symlink, шифровать его не нужно (и Obsidian заваливал бы handler
+   * каждое сохранение workspace.json).
+   */
+  private setupVaultEventHandlers(): void {
+    const configDir = this.app.vault.configDir;
+    const isConfigPath = (p: string) => p === configDir || p.startsWith(configDir + "/");
 
-    // 1. Миграция первичной установки: шифруем plaintext-файлы существующего vault
-    if (await this.shadowManager.hasPendingMigration()) {
-      new Notice("⏳ Shadow Vault: шифруем существующие файлы хранилища...", 5000);
-      await this.shadowManager.encryptAllExisting();
-      new Notice("✅ Shadow Vault: все файлы зашифрованы.", 4000);
-    }
+    this.registerEvent(this.app.vault.on("create", (file) => {
+      if (isConfigPath(file.path)) return;
+      console.debug(`[ShadowVault:event] create ${file.path}`);
+      void this.handleCreate(file);
+    }));
 
-    // 2. Восстанавливаем оригинальный list() до полного патчинга
-    const adapter = this.app.vault.adapter as unknown as IDataAdapter;
-    if (this.earlyListOriginal) {
-      adapter.list = this.earlyListOriginal;
-    }
-
-    // 3. Bulk decrypt: расшифровываем ВСЁ в shadow ПЕРЕД mount.
-    //    Так Obsidian увидит готовое хранилище плейнтекста и сможет рендерить картинки/PDF
-    //    через нативный getResourcePath без дополнительной магии.
-    const progressNotice = new Notice("🔓 Shadow Vault: расшифровка хранилища...", 0);
-    let result: { decrypted: string[]; failed: Array<{ path: string; error: string }> };
-    try {
-      result = await this.shadowManager.decryptAllToShadow((done, total, current) => {
-        const percent = total > 0 ? Math.round((done / total) * 100) : 0;
-        progressNotice.setMessage(
-          `🔓 Расшифровка хранилища: ${done}/${total} (${percent}%)\n${current.slice(-60)}`
-        );
-      });
-    } finally {
-      progressNotice.hide();
-    }
-
-    if (result.failed.length > 0) {
-      new Notice(
-        `⚠️ Shadow Vault: ${result.failed.length} файл(ов) не удалось расшифровать. ` +
-        `См. консоль разработчика. Хранилище работает в режиме read-only для них.`,
-        10000
+    this.registerEvent(this.app.vault.on("modify", (file) => {
+      if (isConfigPath(file.path)) return;
+      if (!(file instanceof TFile)) return;
+      console.debug(`[ShadowVault:event] modify ${file.path}`);
+      void this.shadowManager!.encryptOne(file.path).catch((err) =>
+        console.error(`[ShadowVault:event] modify ${file.path} failed:`, err)
       );
-    }
+    }));
 
-    // 4. Symlink .obsidian: shadowRoot/.obsidian → originalRoot/.obsidian
-    //    Конфиг плагинов/тем/workspace персистится напрямую в оригинале без шифрования
-    //    (зашифровать невозможно: Obsidian читает .obsidian ДО загрузки нашего плагина).
-    await this.shadowManager.setupObsidianSymlink();
+    this.registerEvent(this.app.vault.on("delete", (file) => {
+      if (isConfigPath(file.path)) return;
+      console.debug(`[ShadowVault:event] delete ${file.path}`);
+      void this.handleDelete(file);
+    }));
 
-    // 5. Mount: подменяем basePath адаптера на shadow.
-    //    После этого все нативные операции Obsidian (read/write/getResourcePath)
-    //    идут в shadow — изображения, PDF, attachment'ы рендерятся натив но.
-    this.shadowManager.mount(adapter);
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+      if (isConfigPath(file.path) || isConfigPath(oldPath)) return;
+      console.debug(`[ShadowVault:event] rename ${oldPath} → ${file.path}`);
+      void this.handleRename(file, oldPath);
+    }));
 
-    // 6. Patch (страховочный слой поверх mount): write-through encrypt в оригинал.
-    //    Когда Obsidian вызывает adapter.write — мы дублируем шифрованную копию в .enc.
-    this.shadowManager.patch(adapter);
+    console.info("[ShadowVault] vault event handlers подписаны");
   }
 
-  /** Запускает SessionManager и обрабатывает crash recovery. */
-  private async setupSession(engine: CryptoEngine, basePath: string): Promise<void> {
-    this.sessionManager = new SessionManager(
-      engine,
-      basePath,
-      this.shadowManager!.shadowRoot,
-      this.getPluginDirAbs(basePath)
-    );
-    const sessionResult = await this.sessionManager.startSession();
+  private async handleCreate(file: TAbstractFile): Promise<void> {
+    try {
+      if (file instanceof TFile) {
+        await this.shadowManager!.encryptOne(file.path);
+      } else if (file instanceof TFolder) {
+        await this.shadowManager!.mkdirOriginal(file.path);
+      }
+    } catch (err) {
+      console.error(`[ShadowVault:event] create ${file.path}:`, err);
+    }
+  }
 
-    if (sessionResult.hadCrash) {
-      this.notifyCrashRecovery(sessionResult.recovery!);
+  private async handleDelete(file: TAbstractFile): Promise<void> {
+    try {
+      if (file instanceof TFile) {
+        await this.shadowManager!.unlinkEnc(file.path);
+      } else if (file instanceof TFolder) {
+        await this.shadowManager!.rmdirOriginal(file.path);
+      }
+    } catch (err) {
+      console.error(`[ShadowVault:event] delete ${file.path}:`, err);
+    }
+  }
+
+  private async handleRename(file: TAbstractFile, oldPath: string): Promise<void> {
+    try {
+      if (file instanceof TFile) {
+        await this.shadowManager!.renameEnc(oldPath, file.path);
+      } else if (file instanceof TFolder) {
+        // Папка: переименовать в оригинале (там тоже структура с .enc)
+        const oldOrig = nodePath.join(this.shadowManager!.originalRoot, ...oldPath.split("/"));
+        const newOrig = nodePath.join(this.shadowManager!.originalRoot, ...file.path.split("/"));
+        await fsp.mkdir(nodePath.dirname(newOrig), { recursive: true });
+        await fsp.rename(oldOrig, newOrig);
+      }
+    } catch (err) {
+      console.error(`[ShadowVault:event] rename ${oldPath} → ${file.path}:`, err);
     }
   }
 

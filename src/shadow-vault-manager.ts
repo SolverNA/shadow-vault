@@ -206,6 +206,108 @@ export class ShadowVaultManager {
     await removeSymlink(shadowConfig);
   }
 
+  /**
+   * Полное удаление и пересоздание shadow vault.
+   * Вызывается ПОСЛЕ recoverFromCrash: recovery записал актуальные правки
+   * в original.enc, теперь shadow можно безопасно сбросить и заново
+   * расшифровать с нуля — это гарантирует чистое состояние без stale-файлов.
+   */
+  async resetShadow(): Promise<void> {
+    console.info(`[ShadowVault] resetShadow: rm ${this.shadowRoot}`);
+    await fsp.rm(this.shadowRoot, { recursive: true, force: true });
+    await fsp.mkdir(this.shadowRoot, { recursive: true });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Точечный мирроринг shadow → .enc через vault events
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Шифрует один файл из shadow в оригинал .enc.
+   * Вызывается из vault.on("create" | "modify") в main.ts.
+   *
+   * Атомарно: пишет .enc.shadowtmp, потом rename → .enc.
+   * Большие файлы (>4 МБ) — потоковое шифрование, иначе буферное.
+   */
+  async encryptOne(normalizedPath: string): Promise<void> {
+    const shadowAbs = this.shadowAbs(normalizedPath);
+    const encAbs = this.originalEncAbs(normalizedPath);
+
+    if (!(await fileExists(shadowAbs))) {
+      console.warn(`[ShadowVault:encryptOne] ${normalizedPath}: нет файла в shadow, пропускаем`);
+      return;
+    }
+
+    await fsp.mkdir(nodePath.dirname(encAbs), { recursive: true });
+    const stat = await fsp.stat(shadowAbs);
+
+    if (stat.size === 0) {
+      await atomicWrite(encAbs, Buffer.alloc(0));
+    } else if (stat.size > 4 * 1024 * 1024) {
+      await this.engine.encryptStream(shadowAbs, encAbs);
+    } else {
+      const buf = await fsp.readFile(shadowAbs);
+      const enc = this.engine.encryptBuffer(buf);
+      await atomicWrite(encAbs, enc);
+    }
+
+    console.debug(`[ShadowVault:encryptOne] ${normalizedPath} → .enc (${stat.size}B)`);
+  }
+
+  /** Удаляет .enc файл в оригинале (вызывается из vault.on("delete")) */
+  async unlinkEnc(normalizedPath: string): Promise<void> {
+    const encAbs = this.originalEncAbs(normalizedPath);
+    try {
+      await fsp.unlink(encAbs);
+      console.debug(`[ShadowVault:unlinkEnc] ${normalizedPath}`);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT") {
+        console.error(`[ShadowVault:unlinkEnc] ${normalizedPath}:`, err);
+      }
+    }
+  }
+
+  /** Переименование .enc файла (вызывается из vault.on("rename")) */
+  async renameEnc(oldPath: string, newPath: string): Promise<void> {
+    const oldEnc = this.originalEncAbs(oldPath);
+    const newEnc = this.originalEncAbs(newPath);
+
+    await fsp.mkdir(nodePath.dirname(newEnc), { recursive: true });
+
+    if (await fileExists(oldEnc)) {
+      await fsp.rename(oldEnc, newEnc);
+      console.debug(`[ShadowVault:renameEnc] ${oldPath} → ${newPath}`);
+    } else {
+      // Старого .enc нет (мог не успеть зашифроваться) — шифруем новый
+      console.warn(`[ShadowVault:renameEnc] oldEnc ${oldEnc} не найден, шифруем новый из shadow`);
+      await this.encryptOne(newPath);
+    }
+  }
+
+  /** Создаёт пустую папку в оригинале (зеркалирует mkdir в shadow) */
+  async mkdirOriginal(normalizedPath: string): Promise<void> {
+    const orig = this.originalAbs(normalizedPath);
+    await fsp.mkdir(orig, { recursive: true });
+    console.debug(`[ShadowVault:mkdirOriginal] ${normalizedPath}`);
+  }
+
+  /** Удаляет пустую папку в оригинале (зеркалирует rmdir в shadow) */
+  async rmdirOriginal(normalizedPath: string): Promise<void> {
+    const orig = this.originalAbs(normalizedPath);
+    try {
+      await fsp.rmdir(orig);
+      console.debug(`[ShadowVault:rmdirOriginal] ${normalizedPath}`);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      // ENOTEMPTY → папка не пуста (Obsidian мог удалить только часть детей).
+      // ENOENT → уже удалена. Оба — ок.
+      if (code !== "ENOENT" && code !== "ENOTEMPTY") {
+        console.error(`[ShadowVault:rmdirOriginal] ${normalizedPath}:`, err);
+      }
+    }
+  }
+
   // ═══════════════════════════════════════════════════════════════════════
   // Bulk decrypt: расшифровываем весь оригинал в shadow при unlock
   // ═══════════════════════════════════════════════════════════════════════
