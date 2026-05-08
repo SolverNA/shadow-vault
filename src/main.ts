@@ -38,7 +38,12 @@ import { SessionManager } from "./session-manager";
 import { ShadowVaultSettingTab } from "./settings-tab";
 import { DEFAULT_SETTINGS, PluginSettings, VERIFICATION_PLAINTEXT } from "./types";
 import { IDataAdapter, ListedFiles } from "./adapter-types";
-import { ENCRYPTED_EXT, isTempFile } from "./fs-utils";
+import { CRYPTO_HEADER_SIZE, ENCRYPTED_EXT, isTempFile } from "./fs-utils";
+
+interface AdapterWithInternals extends IDataAdapter {
+  files?: Record<string, { type: string; realpath: string; ctime?: number; mtime?: number; size?: number }>;
+  trigger(event: string, ...args: unknown[]): void;
+}
 
 export default class ShadowVaultPlugin extends Plugin {
   /** Настройки плагина — читаются из data.json, записываются через saveSettings() */
@@ -212,19 +217,25 @@ export default class ShadowVaultPlugin extends Plugin {
     }
 
     try {
+      console.info("[ShadowVault] onUnlock: старт, basePath =", basePath);
       await this.setupShadow(engine, basePath);
       await this.setupSession(engine, basePath);
-      // Bulk decrypt уже расшифровал всё в shadow ДО mount, и patchListEarly
-      // уже наполнил vault.fileMap транслированными именами при первичном скане.
-      // После mount Obsidian читает shadow натив но — никаких ручных
-      // file-created/folder-created триггеров не нужно (они были источником
-      // багов: .obsidian регистрировался как обычная папка, fileMap получал
-      // дубли, "already exists" при создании заметок).
+
+      // patchListEarly работает над оригиналом и Obsidian не успел нативно
+      // зарегистрировать файлы (т.к. на диске только .enc, lstat фейлится).
+      // После mount файлы лежат в shadow, но Obsidian уже завершил первичный
+      // скан и vault.fileMap может быть неполным. Принудительно переоткрываем
+      // индекс через adapter.trigger("file-created"/"folder-created"):
+      console.info("[ShadowVault] reconcileVaultIndex: forcing fileMap refresh");
+      await this.reconcileVaultIndex();
 
       // Electron не всегда вызывает plugin.onunload() при закрытии окна.
       // Используем sync cleanup — асинхронный shutdown не успевает завершиться.
       this.registerDomEvent(window as Window, "beforeunload", () => {
-        if (this.sessionActive) this.syncCleanup();
+        if (this.sessionActive) {
+          console.info("[ShadowVault] beforeunload: sync cleanup");
+          this.syncCleanup();
+        }
       });
 
       this.sessionActive = true;
@@ -235,8 +246,8 @@ export default class ShadowVaultPlugin extends Plugin {
         new Notice("🔓 Shadow Vault: хранилище разблокировано.", 2500);
       }
 
-      console.debug(
-        `[ShadowVault] Сессия запущена. Shadow: ${this.shadowManager!.shadowRoot}`
+      console.info(
+        `[ShadowVault] Сессия запущена. shadowRoot=${this.shadowManager!.shadowRoot}, originalRoot=${basePath}`
       );
     } catch (err) {
       console.error("[ShadowVault] Ошибка инициализации:", err);
@@ -524,6 +535,89 @@ export default class ShadowVaultPlugin extends Plugin {
   }
 
   /**
+   * Принудительно регистрирует файлы и папки в Obsidian's vault.fileMap
+   * после bulk decrypt + mount. Без этого первичный скан Obsidian'а
+   * не находит .md файлы (на диске только .enc, lstat фейлится),
+   * vault.fileMap получает «битые» TFile-объекты, и пользователь видит
+   * только папки или вообще пусто.
+   *
+   * Фильтр: пропускаем .obsidian и всё внутри него. Иначе adapter.trigger
+   * регистрирует .obsidian как обычную пользовательскую папку в обход
+   * стандартной фильтрации dotfiles → она появляется в file tree.
+   */
+  private async reconcileVaultIndex(): Promise<void> {
+    const adapter = this.app.vault.adapter as unknown as AdapterWithInternals;
+    if (typeof adapter.trigger !== "function") {
+      console.warn("[ShadowVault] reconcileVaultIndex: adapter.trigger недоступен");
+      return;
+    }
+    try {
+      const stats = { folders: 0, files: 0, skipped: 0 };
+      await this.notifyFilesCreated("", adapter, stats);
+      console.info(
+        `[ShadowVault] reconcileVaultIndex: registered ${stats.folders} folders, ` +
+        `${stats.files} files, skipped ${stats.skipped}`
+      );
+    } catch (err) {
+      console.error("[ShadowVault] reconcileVaultIndex:", err);
+    }
+  }
+
+  private async notifyFilesCreated(
+    dir: string,
+    adapter: AdapterWithInternals,
+    stats: { folders: number; files: number; skipped: number }
+  ): Promise<void> {
+    const configDir = this.app.vault.configDir;
+    const isConfigPath = (p: string) => p === configDir || p.startsWith(configDir + "/");
+
+    const listed = await this.app.vault.adapter.list(dir);
+
+    // Сначала папки (vault.getDirectParent должен находить родителя для файлов)
+    for (const folderPath of listed.folders) {
+      if (isConfigPath(folderPath)) {
+        stats.skipped++;
+        continue;
+      }
+      if (!adapter.files?.[folderPath]) {
+        adapter.files ??= {};
+        adapter.files[folderPath] = { type: "folder", realpath: folderPath };
+        adapter.trigger("folder-created", folderPath);
+        stats.folders++;
+      }
+      await this.notifyFilesCreated(folderPath, adapter, stats);
+    }
+
+    for (const filePath of listed.files) {
+      if (isConfigPath(filePath)) {
+        stats.skipped++;
+        continue;
+      }
+      if (adapter.files?.[filePath]) {
+        // Уже зарегистрирован Obsidian'ом ранее — не дублируем
+        stats.skipped++;
+        continue;
+      }
+
+      const origEncPath = this.shadowManager!.originalEncAbs(filePath);
+      let statObj = { ctime: Date.now(), mtime: Date.now(), size: 0 };
+      try {
+        const s = await fsp.stat(origEncPath);
+        statObj = {
+          ctime: Math.round(s.birthtimeMs ?? s.ctimeMs),
+          mtime: Math.round(s.mtimeMs),
+          size:  Math.max(0, s.size - CRYPTO_HEADER_SIZE),
+        };
+      } catch { /* .enc нет — заглушка */ }
+
+      adapter.files ??= {};
+      adapter.files[filePath] = { type: "file", realpath: filePath, ...statObj };
+      adapter.trigger("file-created", filePath, filePath, statObj);
+      stats.files++;
+    }
+  }
+
+  /**
    * Синхронная очистка для onunload и beforeunload.
    *
    * Зачем sync: Obsidian/Electron не ждут async-shutdown при закрытии окна.
@@ -544,44 +638,72 @@ export default class ShadowVaultPlugin extends Plugin {
    *   5. engine.destroy() — обнуляем ключ в RAM.
    */
   private syncCleanup(): void {
-    if (!this.sessionActive) return;
+    if (!this.sessionActive) {
+      console.debug("[ShadowVault] syncCleanup: сессия не активна, пропускаем");
+      return;
+    }
     this.sessionActive = false;
 
     const adapter = this.app.vault.adapter as unknown as IDataAdapter;
+    console.info("[ShadowVault] syncCleanup: старт");
 
     if (this.shadowManager) {
+      const shadowRoot = this.shadowManager.shadowRoot;
+      const originalRoot = this.shadowManager.originalRoot;
+
       // 1. unpatch + unmount
-      try { this.shadowManager.unpatch(adapter); } catch (e) { console.error("[ShadowVault] sync unpatch:", e); }
-      try { this.shadowManager.unmount(adapter); } catch (e) { console.error("[ShadowVault] sync unmount:", e); }
+      try { this.shadowManager.unpatch(adapter); console.debug("[ShadowVault] sync unpatch ok"); }
+      catch (e) { console.error("[ShadowVault] sync unpatch:", e); }
+      try { this.shadowManager.unmount(adapter); console.debug("[ShadowVault] sync unmount ok"); }
+      catch (e) { console.error("[ShadowVault] sync unmount:", e); }
 
       // 2. .obsidian symlink — удаляем только если это действительно симлинк
-      const symlinkPath = nodePath.join(this.shadowManager.shadowRoot, this.app.vault.configDir);
+      const symlinkPath = nodePath.join(shadowRoot, this.app.vault.configDir);
       try {
         const lst = fs.lstatSync(symlinkPath);
-        if (lst.isSymbolicLink()) fs.unlinkSync(symlinkPath);
-      } catch { /* нет — ок */ }
+        if (lst.isSymbolicLink()) {
+          fs.unlinkSync(symlinkPath);
+          console.debug(`[ShadowVault] sync unlink symlink: ${symlinkPath}`);
+        } else {
+          console.warn(`[ShadowVault] sync: ${symlinkPath} не симлинк, пропускаем`);
+        }
+      } catch (e) {
+        const code = (e as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT") console.error("[ShadowVault] sync lstat .obsidian:", e);
+      }
 
       // 3. shadow vault recursive
       try {
-        fs.rmSync(this.shadowManager.shadowRoot, { recursive: true, force: true });
+        fs.rmSync(shadowRoot, { recursive: true, force: true });
+        console.info(`[ShadowVault] sync rm shadow ok: ${shadowRoot}`);
       } catch (e) {
-        console.error("[ShadowVault] sync rm shadow:", e);
+        console.error(`[ShadowVault] sync rm shadow ${shadowRoot}:`, e);
       }
 
       // 4. session.lock
-      const lockPath = nodePath.join(
-        this.getPluginDirAbs(this.shadowManager.originalRoot),
-        "session.lock"
-      );
-      try { fs.unlinkSync(lockPath); } catch { /* нет — ок */ }
+      const lockPath = nodePath.join(this.getPluginDirAbs(originalRoot), "session.lock");
+      try {
+        fs.unlinkSync(lockPath);
+        console.debug(`[ShadowVault] sync unlink lock: ${lockPath}`);
+      } catch (e) {
+        const code = (e as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT") console.error("[ShadowVault] sync unlink lock:", e);
+      }
+    } else {
+      console.warn("[ShadowVault] syncCleanup: shadowManager == null, нет данных для очистки");
     }
 
-    // 5. engine.destroy через sessionManager (он держит ссылку)
-    try { this.sessionManager?.destroyEngineSync(); } catch { /* ignore */ }
+    // 5. engine.destroy через sessionManager
+    try {
+      this.sessionManager?.destroyEngineSync();
+      console.debug("[ShadowVault] sync engine destroy ok");
+    } catch (e) {
+      console.error("[ShadowVault] sync engine destroy:", e);
+    }
 
     this.shadowManager = null;
     this.sessionManager = null;
 
-    console.debug("[ShadowVault] sync cleanup завершён");
+    console.info("[ShadowVault] syncCleanup: завершён");
   }
 }

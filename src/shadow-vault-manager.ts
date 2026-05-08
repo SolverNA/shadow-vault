@@ -116,13 +116,20 @@ export class ShadowVaultManager {
    * После mount необходимо вызвать setupObsidianSymlink() чтобы конфиг был доступен.
    */
   mount(adapter: IDataAdapter): void {
-    if (this.mounted) return;
+    if (this.mounted) {
+      console.warn("[ShadowVault] mount: уже примонтирован, пропускаем");
+      return;
+    }
 
     const adapterAny = adapter as unknown as { basePath?: string };
 
     this.originalBasePath = adapterAny.basePath ?? adapter.getBasePath();
     this.originalGetBasePath = adapter.getBasePath.bind(adapter);
     this.originalGetResourcePath = adapter.getResourcePath.bind(adapter);
+
+    console.info(
+      `[ShadowVault] mount: basePath ${this.originalBasePath} → ${this.shadowRoot}`
+    );
 
     // Подменяем basePath на shadow — все нативные fs-операции внутри адаптера
     // (которые используют this.basePath) будут работать с shadow.
@@ -149,6 +156,10 @@ export class ShadowVaultManager {
     if (!this.mounted) return;
 
     const adapterAny = adapter as unknown as { basePath?: string };
+    console.info(
+      `[ShadowVault] unmount: basePath ${this.shadowRoot} → ${this.originalBasePath}`
+    );
+
     if (this.originalBasePath !== null) {
       adapterAny.basePath = this.originalBasePath;
     }
@@ -217,7 +228,13 @@ export class ShadowVaultManager {
     const failed: Array<{ path: string; error: string }> = [];
     const concurrency = bulkConcurrency();
 
-    console.debug(`[ShadowVault] Bulk decrypt: ${encFiles.length} файлов, concurrency=${concurrency}`);
+    console.info(
+      `[ShadowVault] Bulk decrypt: ${encFiles.length} файлов из ${this.originalRoot} → ${this.shadowRoot}, ` +
+      `concurrency=${concurrency}`
+    );
+    if (encFiles.length > 0 && encFiles.length <= 50) {
+      console.debug("[ShadowVault] Файлы для decrypt:", encFiles);
+    }
 
     let done = 0;
     await parallelMap(
@@ -762,11 +779,14 @@ export class ShadowVaultManager {
     options?: DataWriteOptions
   ): Promise<void> {
     if (this.isBypassPath(normalizedPath)) {
+      console.debug(`[ShadowVault:write] bypass → ${normalizedPath}`);
       return this.originalMethods.write!(normalizedPath, data, options);
     }
 
     const shadowPath  = this.shadowAbs(normalizedPath);
     const origEncPath = this.originalEncAbs(normalizedPath);
+
+    console.debug(`[ShadowVault:write] ${normalizedPath} (${data.length} chars) → shadow + .enc`);
 
     await fsp.mkdir(nodePath.dirname(shadowPath),  { recursive: true });
     await fsp.mkdir(nodePath.dirname(origEncPath), { recursive: true });
@@ -935,8 +955,10 @@ export class ShadowVaultManager {
 
   private async patchedMkdir(normalizedPath: string): Promise<void> {
     if (this.isBypassPath(normalizedPath)) {
+      console.debug(`[ShadowVault:mkdir] bypass ${normalizedPath}`);
       return this.originalMethods.mkdir!(normalizedPath);
     }
+    console.debug(`[ShadowVault:mkdir] ${normalizedPath} → shadow + original`);
     await Promise.all([
       fsp.mkdir(this.shadowAbs(normalizedPath),   { recursive: true }),
       fsp.mkdir(this.originalAbs(normalizedPath), { recursive: true }),
@@ -945,8 +967,10 @@ export class ShadowVaultManager {
 
   private async patchedRemove(normalizedPath: string): Promise<void> {
     if (this.isBypassPath(normalizedPath)) {
+      console.debug(`[ShadowVault:remove] bypass ${normalizedPath}`);
       return this.originalMethods.remove!(normalizedPath);
     }
+    console.debug(`[ShadowVault:remove] ${normalizedPath} → shadow + .enc`);
     await Promise.allSettled([
       fsp.unlink(this.shadowAbs(normalizedPath)),
       fsp.unlink(this.originalEncAbs(normalizedPath)),
@@ -958,21 +982,37 @@ export class ShadowVaultManager {
     newNormalizedPath: string
   ): Promise<void> {
     if (this.isBypassPath(normalizedPath)) {
+      console.debug(`[ShadowVault:rename] bypass ${normalizedPath} → ${newNormalizedPath}`);
       return this.originalMethods.rename!(normalizedPath, newNormalizedPath);
     }
 
     const newShadow   = this.shadowAbs(newNormalizedPath);
     const newOrigEnc  = this.originalEncAbs(newNormalizedPath);
+    const oldShadow   = this.shadowAbs(normalizedPath);
+    const oldOrigEnc  = this.originalEncAbs(normalizedPath);
+
+    console.debug(`[ShadowVault:rename] ${normalizedPath} → ${newNormalizedPath}`);
 
     await fsp.mkdir(nodePath.dirname(newShadow),  { recursive: true });
     await fsp.mkdir(nodePath.dirname(newOrigEnc), { recursive: true });
 
-    const oldShadow = this.shadowAbs(normalizedPath);
-    if (await fileExists(oldShadow)) {
+    const shadowExists = await fileExists(oldShadow);
+    const encExists = await fileExists(oldOrigEnc);
+    console.debug(
+      `[ShadowVault:rename] oldShadow exists=${shadowExists}, oldEnc exists=${encExists}`
+    );
+
+    if (shadowExists) {
       await fsp.rename(oldShadow, newShadow);
+    } else {
+      console.warn(`[ShadowVault:rename] oldShadow ${oldShadow} НЕ НАЙДЕН — пропускаем shadow rename`);
     }
 
-    await fsp.rename(this.originalEncAbs(normalizedPath), newOrigEnc);
+    if (encExists) {
+      await fsp.rename(oldOrigEnc, newOrigEnc);
+    } else {
+      console.warn(`[ShadowVault:rename] oldEnc ${oldOrigEnc} НЕ НАЙДЕН — пропускаем .enc rename`);
+    }
   }
 
   private async patchedCopy(
