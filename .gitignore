@@ -3,3 +3,8 @@ main.js
 *.js.map
 .DS_Store
 .directory
+obsidian-releases
+
+# Внутренняя проектная документация — не публикуется в репозитории
+.docs/
+ARCHITECTURE.md

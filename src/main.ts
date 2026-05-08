@@ -1,25 +1,29 @@
 /**
  * ShadowVault — плагин прозрачного шифрования для Obsidian.
  *
- * Точка входа. Здесь происходит:
- *   1. Загрузка настроек из data.json.
- *   2. Показ InitModal (блокирует workspace до ввода пароля).
- *   3. После разблокировки: инициализация всех модулей в строгом порядке.
- *   4. Регистрация хуков завершения работы.
- *   5. Предоставление команды "Заблокировать" из палитры команд.
+ * Архитектура:
+ *   Оригинальное хранилище (originalRoot)  — содержит .enc + plaintext .obsidian/
+ *   Теневое хранилище (shadowRoot)         — сиблинг оригинала, расшифрованный клон
+ *
+ *   После unlock плагин расшифровывает ВСЁ в shadow и монтирует shadow как
+ *   adapter.basePath — Obsidian работает с shadow натив но (включая getResourcePath
+ *   для картинок/PDF). Параллельно patch() ставит write-through encrypt в оригинал.
  *
  * Порядок инициализации (важен):
  *   AuthResult (engine) →
  *   ShadowVaultManager.initialize() →
- *   ShadowVaultManager.patch(adapter) ← патчим ДО startSession,
- *     чтобы recovery-операции (re-encrypt) тоже шли через защищённый путь →
- *   SessionManager.startSession() →
- *   QueueIntegration.setup() (сканирует и запускает фоновую расшифровку)
+ *   miграция plaintext (если есть) →
+ *   decryptAllToShadow() — расшифровываем .enc → shadow →
+ *   setupObsidianSymlink() — shadow/.obsidian → original/.obsidian →
+ *   mount(adapter) — adapter.basePath = shadowRoot →
+ *   patch(adapter) — write-through encrypt в оригинал →
+ *   SessionManager.startSession() — recovery + .session_active
  *
  * Порядок завершения (также важен):
- *   QueueIntegration.teardown() →
- *   ShadowVaultManager.unpatch(adapter) →
- *   SessionManager.endSession() ← ключ уничтожается последним
+ *   encryptShadowChangesToOriginal() — финальная синхронизация изменений →
+ *   unpatch + unmount(adapter) — восстанавливаем оригинальный basePath →
+ *   teardownObsidianSymlink() →
+ *   SessionManager.endSession() — удаление shadow + ключ destroy
  */
 
 import * as fs from "fs";
@@ -31,8 +35,6 @@ import { AuthResult, AuthService } from "./auth-service";
 import { InitModal } from "./init-modal";
 import { ShadowVaultManager } from "./shadow-vault-manager";
 import { SessionManager } from "./session-manager";
-import { QueueManager } from "./queue-manager";
-import { QueueIntegration } from "./queue-integration";
 import { ShadowVaultSettingTab } from "./settings-tab";
 import { DEFAULT_SETTINGS, PluginSettings, VERIFICATION_PLAINTEXT } from "./types";
 import { IDataAdapter, ListedFiles } from "./adapter-types";
@@ -50,7 +52,6 @@ export default class ShadowVaultPlugin extends Plugin {
   // Модули, создаются только после успешной аутентификации
   private shadowManager:    ShadowVaultManager | null = null;
   private sessionManager:   SessionManager     | null = null;
-  private queueIntegration: QueueIntegration   | null = null;
 
   /** true только пока сессия активна (между onUnlock и shutdown) */
   private sessionActive = false;
@@ -218,7 +219,8 @@ export default class ShadowVaultPlugin extends Plugin {
     try {
       await this.setupShadow(engine, basePath);
       await this.setupSession(engine, basePath);
-      await this.setupQueue();
+      // Bulk decrypt в setupShadow уже расшифровал всё в shadow — фоновая очередь
+      // больше не нужна. После mount Obsidian читает shadow натив но.
       await this.reconcileVaultIndex();
 
       // Electron не всегда вызывает plugin.onunload() при закрытии окна
@@ -247,7 +249,7 @@ export default class ShadowVaultPlugin extends Plugin {
     }
   }
 
-  /** Создаёт ShadowVaultManager, проводит миграцию (если нужна) и патчит адаптер. */
+  /** Создаёт ShadowVaultManager, проводит миграцию (если нужна), расшифровывает оригинал в shadow, монтирует shadow как basePath и патчит адаптер для write-through. */
   private async setupShadow(engine: CryptoEngine, basePath: string): Promise<void> {
     this.shadowManager = new ShadowVaultManager(
       engine,
@@ -257,22 +259,55 @@ export default class ShadowVaultPlugin extends Plugin {
     );
     await this.shadowManager.initialize();
 
-    // Миграция первичной установки: шифруем plaintext-файлы существующего vault.
-    // Без этого пользователь увидит заметки без пароля.
+    // 1. Миграция первичной установки: шифруем plaintext-файлы существующего vault
     if (await this.shadowManager.hasPendingMigration()) {
       new Notice("⏳ Shadow Vault: шифруем существующие файлы хранилища...", 5000);
       await this.shadowManager.encryptAllExisting();
       new Notice("✅ Shadow Vault: все файлы зашифрованы.", 4000);
     }
 
-    // Перед полным патчингом восстанавливаем оригинальный list(), иначе unpatch()
-    // при блокировке вернёт раннюю подмену вместо нетронутого метода.
+    // 2. Восстанавливаем оригинальный list() до полного патчинга
     const adapter = this.app.vault.adapter as unknown as IDataAdapter;
     if (this.earlyListOriginal) {
       adapter.list = this.earlyListOriginal;
     }
 
-    // Патчим ДО startSession — чтобы операции recovery шли через bypass для configDir
+    // 3. Bulk decrypt: расшифровываем ВСЁ в shadow ПЕРЕД mount.
+    //    Так Obsidian увидит готовое хранилище плейнтекста и сможет рендерить картинки/PDF
+    //    через нативный getResourcePath без дополнительной магии.
+    const progressNotice = new Notice("🔓 Shadow Vault: расшифровка хранилища...", 0);
+    let result: { decrypted: string[]; failed: Array<{ path: string; error: string }> };
+    try {
+      result = await this.shadowManager.decryptAllToShadow((done, total, current) => {
+        const percent = total > 0 ? Math.round((done / total) * 100) : 0;
+        progressNotice.setMessage(
+          `🔓 Расшифровка хранилища: ${done}/${total} (${percent}%)\n${current.slice(-60)}`
+        );
+      });
+    } finally {
+      progressNotice.hide();
+    }
+
+    if (result.failed.length > 0) {
+      new Notice(
+        `⚠️ Shadow Vault: ${result.failed.length} файл(ов) не удалось расшифровать. ` +
+        `См. консоль разработчика. Хранилище работает в режиме read-only для них.`,
+        10000
+      );
+    }
+
+    // 4. Symlink .obsidian: shadowRoot/.obsidian → originalRoot/.obsidian
+    //    Конфиг плагинов/тем/workspace персистится напрямую в оригинале без шифрования
+    //    (зашифровать невозможно: Obsidian читает .obsidian ДО загрузки нашего плагина).
+    await this.shadowManager.setupObsidianSymlink();
+
+    // 5. Mount: подменяем basePath адаптера на shadow.
+    //    После этого все нативные операции Obsidian (read/write/getResourcePath)
+    //    идут в shadow — изображения, PDF, attachment'ы рендерятся натив но.
+    this.shadowManager.mount(adapter);
+
+    // 6. Patch (страховочный слой поверх mount): write-through encrypt в оригинал.
+    //    Когда Obsidian вызывает adapter.write — мы дублируем шифрованную копию в .enc.
     this.shadowManager.patch(adapter);
   }
 
@@ -290,32 +325,20 @@ export default class ShadowVaultPlugin extends Plugin {
     }
   }
 
-  /** Запускает фоновую расшифровку с приоритетами. */
-  private async setupQueue(): Promise<void> {
-    const queueManager = new QueueManager(
-      (normalizedPath: string) => this.shadowManager!.ensureDecrypted(normalizedPath),
-      { concurrency: 3 }
-    );
-    this.queueIntegration = new QueueIntegration(
-      this.app,
-      this,
-      queueManager,
-      this.shadowManager!
-    );
-    await this.queueIntegration.setup();
-  }
+  // setupQueue() удалён: bulk decrypt в setupShadow покрывает весь vault единоразово.
+  // QueueManager/QueueIntegration оставлены в кодовой базе на случай восстановления
+  // lazy-режима в будущем — но не вызываются в текущем flow.
 
   /** Освобождает частично созданное состояние при ошибке инициализации. */
   private rollbackInitialization(engine: CryptoEngine): void {
     engine.destroy();
     if (this.shadowManager) {
-      this.shadowManager.unpatch(
-        this.app.vault.adapter as unknown as IDataAdapter
-      );
+      const adapter = this.app.vault.adapter as unknown as IDataAdapter;
+      this.shadowManager.unpatch(adapter);
+      this.shadowManager.unmount(adapter);
       this.shadowManager = null;
     }
     this.sessionManager = null;
-    this.queueIntegration = null;
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -327,10 +350,12 @@ export default class ShadowVaultPlugin extends Plugin {
    * повторные вызовы — no-op если сессия уже неактивна.
    *
    * Порядок операций строго определён:
-   *   1. QueueIntegration.teardown() — останавливаем фоновые процессы
-   *   2. ShadowVaultManager.unpatch() — восстанавливаем оригинальный адаптер
-   *      ПЕРЕД удалением shadow vault, чтобы Obsidian не обращался к нему
-   *   3. SessionManager.endSession() — удаляем shadow vault, уничтожаем ключ
+   *   1. encryptShadowChangesToOriginal() — финальная синхронизация изменений
+   *      из shadow в оригинал.enc (страховка от пропущенных write-through).
+   *   2. unpatch() и unmount() — восстанавливаем адаптер до оригинала,
+   *      ПЕРЕД удалением shadow vault, чтобы Obsidian не обращался к нему.
+   *   3. teardownObsidianSymlink() — снимаем symlink .obsidian.
+   *   4. SessionManager.endSession() — удаляем shadow vault, уничтожаем ключ.
    */
   async shutdown(): Promise<void> {
     if (!this.sessionActive) return;
@@ -338,24 +363,37 @@ export default class ShadowVaultPlugin extends Plugin {
 
     console.debug("[ShadowVault] Завершение сессии...");
 
-    // 1. Останавливаем очередь и снимаем хуки UI
-    try {
-      this.queueIntegration?.teardown();
-    } catch (err) {
-      console.error("[ShadowVault] teardown QueueIntegration:", err);
-    } finally {
-      this.queueIntegration = null;
+    // 1. Финальный encrypt-back: страховка на случай если write-through
+    //    что-то пропустил (например, файл был изменён сторонним процессом в shadow)
+    if (this.shadowManager) {
+      try {
+        const r = await this.shadowManager.encryptShadowChangesToOriginal();
+        if (r.encrypted.length > 0) {
+          console.debug(`[ShadowVault] shutdown encrypt-back: ${r.encrypted.length} файлов синхронизировано`);
+        }
+        if (r.failed.length > 0) {
+          console.error("[ShadowVault] shutdown encrypt-back: failed:", r.failed);
+          new Notice(
+            `⚠️ Shadow Vault: не удалось зашифровать ${r.failed.length} файл(ов) при выходе. ` +
+            `Shadow vault сохранён для recovery при следующем запуске.`,
+            10000
+          );
+        }
+      } catch (err) {
+        console.error("[ShadowVault] shutdown encrypt-back ошибка:", err);
+      }
     }
 
-    // 2. Снимаем патч с адаптера
+    // 2. Снимаем патч и mount с адаптера
     try {
       if (this.shadowManager) {
-        this.shadowManager.unpatch(
-          this.app.vault.adapter as unknown as IDataAdapter
-        );
+        const adapter = this.app.vault.adapter as unknown as IDataAdapter;
+        this.shadowManager.unpatch(adapter);
+        this.shadowManager.unmount(adapter);
+        await this.shadowManager.teardownObsidianSymlink();
       }
     } catch (err) {
-      console.error("[ShadowVault] unpatch адаптера:", err);
+      console.error("[ShadowVault] unpatch/unmount адаптера:", err);
     } finally {
       this.shadowManager = null;
     }

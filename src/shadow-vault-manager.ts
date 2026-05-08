@@ -32,8 +32,11 @@ import {
   CRYPTO_HEADER_SIZE,
   ENCRYPTED_EXT,
   atomicWrite,
+  ensureSymlink,
   fileExists,
+  filesEqual,
   isTempFile,
+  removeSymlink,
 } from "./fs-utils";
 
 export class ShadowVaultManager {
@@ -46,6 +49,15 @@ export class ShadowVaultManager {
   private patched = false;
   private originalMethods: Partial<IDataAdapter> = {};
   private readonly configDir: string;
+
+  /** Сохранённое значение adapter.basePath ДО mount — для отката при unmount */
+  private originalBasePath: string | null = null;
+  /** Сохранённый getResourcePath ДО подмены — для отката при unmount */
+  private originalGetResourcePath: ((normalizedPath: string) => string) | null = null;
+  /** Сохранённый getBasePath ДО подмены — для отката при unmount */
+  private originalGetBasePath: (() => string) | null = null;
+  /** true пока shadow примонтирован как basePath адаптера */
+  private mounted = false;
 
   constructor(engine: CryptoEngine, originalRoot: string, shadowRoot?: string, configDir = ".obsidian") {
     this.engine = engine;
@@ -75,6 +87,325 @@ export class ShadowVaultManager {
 
   async initialize(): Promise<void> {
     await fsp.mkdir(this.shadowRoot, { recursive: true });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Mount/unmount: shadow становится basePath адаптера Obsidian
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Монтирует shadow vault как basePath адаптера. После этого:
+   *   - adapter.getBasePath() возвращает shadowRoot
+   *   - adapter.getResourcePath(p) возвращает app://-URL указывающий внутрь shadow
+   *     (чем рендерятся изображения, PDF и другие attachment'ы)
+   *
+   * Не трогает методы адаптера — они уже пропатчены через patch().
+   *
+   * После mount необходимо вызвать setupObsidianSymlink() чтобы конфиг был доступен.
+   */
+  mount(adapter: IDataAdapter): void {
+    if (this.mounted) return;
+
+    const adapterAny = adapter as unknown as { basePath?: string };
+
+    this.originalBasePath = adapterAny.basePath ?? adapter.getBasePath();
+    this.originalGetBasePath = adapter.getBasePath.bind(adapter);
+    this.originalGetResourcePath = adapter.getResourcePath.bind(adapter);
+
+    // Подменяем basePath на shadow — все нативные fs-операции внутри адаптера
+    // (которые используют this.basePath) будут работать с shadow.
+    adapterAny.basePath = this.shadowRoot;
+    adapter.getBasePath = () => this.shadowRoot;
+
+    // getResourcePath собирает app://-URL из basePath. После подмены basePath он
+    // автоматически вернёт URL на shadow, но чтобы не зависеть от внутренней
+    // реализации адаптера, явно перевычисляем через сохранённый original.
+    adapter.getResourcePath = (normalizedPath: string): string => {
+      // Конфиг отдаём через оригинал — он symlink'нут, но Obsidian может
+      // обращаться по абсолютному пути напрямую
+      if (this.isBypassPath(normalizedPath)) {
+        return this.originalGetResourcePath!(normalizedPath);
+      }
+      // Базовый путь уже подменён, оригинальный getResourcePath вернёт URL на shadow
+      return this.originalGetResourcePath!(normalizedPath);
+    };
+
+    this.mounted = true;
+  }
+
+  unmount(adapter: IDataAdapter): void {
+    if (!this.mounted) return;
+
+    const adapterAny = adapter as unknown as { basePath?: string };
+    if (this.originalBasePath !== null) {
+      adapterAny.basePath = this.originalBasePath;
+    }
+    if (this.originalGetBasePath) {
+      adapter.getBasePath = this.originalGetBasePath;
+    }
+    if (this.originalGetResourcePath) {
+      adapter.getResourcePath = this.originalGetResourcePath;
+    }
+
+    this.originalBasePath = null;
+    this.originalGetBasePath = null;
+    this.originalGetResourcePath = null;
+    this.mounted = false;
+  }
+
+  /**
+   * Создаёт в shadow символическую ссылку .obsidian → originalRoot/.obsidian.
+   * Конфиг плагинов, тем и workspace'а персистится напрямую в оригинал — без шифрования.
+   * Это нужно потому что Obsidian читает .obsidian ДО того как наш плагин загрузится:
+   * шифровать config невозможно без bootstrap-парадокса.
+   */
+  async setupObsidianSymlink(): Promise<void> {
+    const origConfig = nodePath.join(this.originalRoot, this.configDir);
+    const shadowConfig = nodePath.join(this.shadowRoot, this.configDir);
+
+    // Гарантируем что папка конфига существует в оригинале
+    await fsp.mkdir(origConfig, { recursive: true });
+
+    // Если в shadow на этом месте лежит обычная папка (от прошлой неудачной сессии) —
+    // удаляем её рекурсивно, чтобы не конфликтовало с symlink
+    try {
+      const lst = await fsp.lstat(shadowConfig);
+      if (lst.isDirectory() && !lst.isSymbolicLink()) {
+        await fsp.rm(shadowConfig, { recursive: true, force: true });
+      }
+    } catch { /* нет — отлично, создадим линк ниже */ }
+
+    await ensureSymlink(origConfig, shadowConfig);
+  }
+
+  async teardownObsidianSymlink(): Promise<void> {
+    const shadowConfig = nodePath.join(this.shadowRoot, this.configDir);
+    await removeSymlink(shadowConfig);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Bulk decrypt: расшифровываем весь оригинал в shadow при unlock
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Расшифровывает все .enc файлы из originalRoot в shadowRoot.
+   * Вызывается ОДИН РАЗ при unlock — после этого Obsidian работает в shadow натив но.
+   *
+   * Гарантии надёжности:
+   *   - Каждый файл расшифровывается через decryptStream (atomic write через .tmp).
+   *   - Auth Tag GCM проверяется при final() → ловим повреждённые .enc сразу.
+   *   - Если расшифровка одного файла провалилась — продолжаем остальные, не падаем.
+   *   - Failed-список возвращается наверх для уведомления пользователя.
+   */
+  async decryptAllToShadow(
+    onProgress?: (done: number, total: number, current: string) => void
+  ): Promise<{ decrypted: string[]; failed: Array<{ path: string; error: string }> }> {
+    const encFiles = await this.scanEncryptedFiles();
+    const decrypted: string[] = [];
+    const failed: Array<{ path: string; error: string }> = [];
+
+    console.debug(`[ShadowVault] Bulk decrypt: ${encFiles.length} файлов в shadow`);
+
+    for (let i = 0; i < encFiles.length; i++) {
+      const normalizedPath = encFiles[i];
+      onProgress?.(i, encFiles.length, normalizedPath);
+
+      try {
+        await this.ensureDecrypted(normalizedPath);
+        decrypted.push(normalizedPath);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        failed.push({ path: normalizedPath, error: msg });
+        console.error(`[ShadowVault] decryptAllToShadow: "${normalizedPath}" failed:`, err);
+      }
+    }
+
+    onProgress?.(encFiles.length, encFiles.length, "");
+    console.debug(`[ShadowVault] Bulk decrypt done: ${decrypted.length} ok, ${failed.length} failed`);
+    return { decrypted, failed };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Bulk encrypt-back: при shutdown переносим изменения из shadow в оригинал
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Сравнивает shadow и оригинал, шифрует и переносит в оригинал все файлы,
+   * которые изменились в shadow относительно расшифрованной версии оригинала.
+   *
+   * Гарантии надёжности:
+   *   - Шифрование идёт через atomic write (.enc.new → rename .enc).
+   *   - Старый .enc сохраняется до успешной записи нового → нет окна потери данных.
+   *   - После записи нового .enc — верифицируем decrypt-back и сравниваем с shadow.
+   *     Если сходится → удаляем backup. Если нет → откатываемся к старому .enc.
+   *   - Сравнение «изменился ли файл» — побайтовое (filesEqual), не по mtime.
+   *     mtime ненадёжен при копировании/sync.
+   */
+  async encryptShadowChangesToOriginal(
+    onProgress?: (done: number, total: number, current: string) => void
+  ): Promise<{ encrypted: string[]; failed: Array<{ path: string; error: string }> }> {
+    const encrypted: string[] = [];
+    const failed: Array<{ path: string; error: string }> = [];
+
+    const shadowFiles = await this.scanShadowFilesForSync();
+    console.debug(`[ShadowVault] encrypt-back: проверяем ${shadowFiles.length} файлов в shadow`);
+
+    for (let i = 0; i < shadowFiles.length; i++) {
+      const normalizedPath = shadowFiles[i];
+      onProgress?.(i, shadowFiles.length, normalizedPath);
+
+      try {
+        const changed = await this.shadowFileChanged(normalizedPath);
+        if (!changed) continue;
+
+        await this.encryptShadowToOriginalVerified(normalizedPath);
+        encrypted.push(normalizedPath);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        failed.push({ path: normalizedPath, error: msg });
+        console.error(`[ShadowVault] encrypt-back: "${normalizedPath}" failed:`, err);
+      }
+    }
+
+    onProgress?.(shadowFiles.length, shadowFiles.length, "");
+    console.debug(`[ShadowVault] encrypt-back done: ${encrypted.length} encrypted, ${failed.length} failed`);
+    return { encrypted, failed };
+  }
+
+  /**
+   * Шифрует shadow→оригинал с верификацией: после записи нового .enc
+   * расшифровываем его и сравниваем побайтово с исходным shadow-файлом.
+   * Только если совпало — атомарно заменяем старый .enc.
+   *
+   * Старый .enc хранится как .enc.bak до успеха, чтобы при любой ошибке
+   * откатиться без потери данных.
+   */
+  private async encryptShadowToOriginalVerified(normalizedPath: string): Promise<void> {
+    const shadowAbsPath = this.shadowAbs(normalizedPath);
+    const encAbsPath = this.originalEncAbs(normalizedPath);
+    const encNewPath = encAbsPath + ".new";
+    const encBakPath = encAbsPath + ".bak";
+    const verifyTmpPath = shadowAbsPath + ".verify";
+
+    await fsp.mkdir(nodePath.dirname(encAbsPath), { recursive: true });
+
+    // 1. Шифруем shadow → .enc.new
+    const stat = await fsp.stat(shadowAbsPath);
+    if (stat.size === 0) {
+      await fsp.writeFile(encNewPath, Buffer.alloc(0));
+    } else if (stat.size > 4 * 1024 * 1024) {
+      await this.engine.encryptStream(shadowAbsPath, encNewPath);
+    } else {
+      const plain = await fsp.readFile(shadowAbsPath);
+      const enc = this.engine.encryptBuffer(plain);
+      await fsp.writeFile(encNewPath, enc);
+    }
+
+    // 2. Верификация: decrypt(.enc.new) === shadow?
+    try {
+      if (stat.size === 0) {
+        const verifyStat = await fsp.stat(encNewPath);
+        if (verifyStat.size !== 0) {
+          throw new Error("Размер .enc.new для пустого файла не равен 0");
+        }
+      } else {
+        await this.engine.decryptStream(encNewPath, verifyTmpPath);
+        const ok = await filesEqual(shadowAbsPath, verifyTmpPath);
+        if (!ok) {
+          throw new Error("Verify failed: decrypt(.enc.new) != shadow");
+        }
+      }
+    } catch (err) {
+      // Откат: убираем .enc.new и .verify
+      await fsp.unlink(encNewPath).catch(() => undefined);
+      await fsp.unlink(verifyTmpPath).catch(() => undefined);
+      throw err;
+    } finally {
+      await fsp.unlink(verifyTmpPath).catch(() => undefined);
+    }
+
+    // 3. Атомарная замена .enc → .enc.bak → .enc.new → .enc
+    if (await fileExists(encAbsPath)) {
+      await fsp.rename(encAbsPath, encBakPath);
+    }
+    try {
+      await fsp.rename(encNewPath, encAbsPath);
+    } catch (err) {
+      // Не получилось — восстанавливаем backup
+      if (await fileExists(encBakPath)) {
+        await fsp.rename(encBakPath, encAbsPath).catch(() => undefined);
+      }
+      throw err;
+    }
+
+    // 4. Backup больше не нужен — новая версия верифицирована
+    await fsp.unlink(encBakPath).catch(() => undefined);
+  }
+
+  /**
+   * true если содержимое shadow-файла отличается от расшифрованного оригинала.
+   * Сравнение побайтовое — не зависит от mtime. Если оригинал не существует — считаем изменённым.
+   */
+  private async shadowFileChanged(normalizedPath: string): Promise<boolean> {
+    const shadowAbsPath = this.shadowAbs(normalizedPath);
+    const encAbsPath = this.originalEncAbs(normalizedPath);
+
+    if (!(await fileExists(encAbsPath))) {
+      // Файл создан в shadow и ещё не зашифрован — точно изменён
+      return true;
+    }
+
+    // Расшифровываем оригинал во временный файл и сравниваем
+    const verifyPath = shadowAbsPath + ".cmp";
+    try {
+      const encStat = await fsp.stat(encAbsPath);
+      if (encStat.size === 0) {
+        const shadowStat = await fsp.stat(shadowAbsPath);
+        return shadowStat.size !== 0;
+      }
+      await this.engine.decryptStream(encAbsPath, verifyPath);
+      const equal = await filesEqual(shadowAbsPath, verifyPath);
+      return !equal;
+    } finally {
+      await fsp.unlink(verifyPath).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Рекурсивно собирает все обычные файлы в shadow для encrypt-back.
+   * Пропускает .obsidian (symlink → оригинал, не шифруется),
+   * скрытые файлы и временные .tmp/.shadowtmp.
+   */
+  private async scanShadowFilesForSync(relDir = ""): Promise<string[]> {
+    const result: string[] = [];
+    const absDir = relDir
+      ? nodePath.join(this.shadowRoot, ...relDir.split("/"))
+      : this.shadowRoot;
+
+    let entries: fs.Dirent[];
+    try {
+      entries = await fsp.readdir(absDir, { withFileTypes: true });
+    } catch {
+      return result;
+    }
+
+    const prefix = relDir ? relDir + "/" : "";
+    for (const entry of entries) {
+      // .obsidian — symlink на оригинал, его шифровать не надо
+      if (entry.name === this.configDir) continue;
+      // Скрытые/служебные
+      if (entry.name.startsWith(".")) continue;
+      // Временные файлы атомарных операций
+      if (isTempFile(entry.name)) continue;
+
+      const rel = prefix + entry.name;
+      if (entry.isDirectory()) {
+        result.push(...await this.scanShadowFilesForSync(rel));
+      } else if (entry.isFile()) {
+        result.push(rel);
+      }
+    }
+    return result;
   }
 
   // ═══════════════════════════════════════════════════════════════════════
