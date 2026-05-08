@@ -8,3 +8,6 @@ obsidian-releases
 # Внутренняя проектная документация — не публикуется в репозитории
 .docs/
 ARCHITECTURE.md
+
+# Каталог сборки для копирования в Obsidian — генерируется npm run build:plugin
+build/

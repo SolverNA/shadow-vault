@@ -585,3 +585,325 @@ describe("ShadowVaultManager — encryptAllExisting() (миграция)", () =>
     } finally { env.cleanup(); }
   });
 });
+
+// ─────────────────────────────────────────────
+// mount / unmount
+// ─────────────────────────────────────────────
+
+describe("ShadowVaultManager — mount / unmount", () => {
+  it("mount() подменяет basePath адаптера на shadowRoot", async () => {
+    const env = await makeEnv();
+    try {
+      const before = (env.adapter as unknown as { basePath: string }).basePath;
+      expect(before).toBe(env.origRoot);
+
+      env.manager.mount(env.adapter);
+      const after = (env.adapter as unknown as { basePath: string }).basePath;
+      expect(after).toBe(env.shadowRoot);
+
+      // getBasePath тоже возвращает shadow
+      expect(env.adapter.getBasePath()).toBe(env.shadowRoot);
+    } finally { env.cleanup(); }
+  });
+
+  it("getResourcePath после mount указывает на shadow (а не на оригинал)", async () => {
+    const env = await makeEnv();
+    try {
+      env.manager.mount(env.adapter);
+      const url = env.adapter.getResourcePath("img.png");
+      expect(url).toContain(env.shadowRoot);
+      expect(url).not.toContain(env.origRoot);
+    } finally { env.cleanup(); }
+  });
+
+  it("unmount() возвращает basePath к исходному значению", async () => {
+    const env = await makeEnv();
+    try {
+      env.manager.mount(env.adapter);
+      env.manager.unmount(env.adapter);
+      expect((env.adapter as unknown as { basePath: string }).basePath).toBe(env.origRoot);
+      expect(env.adapter.getBasePath()).toBe(env.origRoot);
+    } finally { env.cleanup(); }
+  });
+
+  it("mount() идемпотентен — повторный вызов не ломает состояние", async () => {
+    const env = await makeEnv();
+    try {
+      env.manager.mount(env.adapter);
+      env.manager.mount(env.adapter);
+      expect((env.adapter as unknown as { basePath: string }).basePath).toBe(env.shadowRoot);
+
+      env.manager.unmount(env.adapter);
+      expect((env.adapter as unknown as { basePath: string }).basePath).toBe(env.origRoot);
+    } finally { env.cleanup(); }
+  });
+
+  it("unmount без предыдущего mount: no-op", async () => {
+    const env = await makeEnv();
+    try {
+      const before = (env.adapter as unknown as { basePath: string }).basePath;
+      env.manager.unmount(env.adapter);
+      expect((env.adapter as unknown as { basePath: string }).basePath).toBe(before);
+    } finally { env.cleanup(); }
+  });
+});
+
+// ─────────────────────────────────────────────
+// setupObsidianSymlink
+// ─────────────────────────────────────────────
+
+describe("ShadowVaultManager — setupObsidianSymlink", () => {
+  it("создаёт symlink shadow/.obsidian → original/.obsidian", async () => {
+    const env = await makeEnv();
+    try {
+      // .obsidian должен существовать в оригинале до setupObsidianSymlink
+      const origConfig = nodePath.join(env.origRoot, ".obsidian");
+      fs.mkdirSync(origConfig);
+      fs.writeFileSync(nodePath.join(origConfig, "appearance.json"), "{}");
+
+      await env.manager.setupObsidianSymlink();
+
+      const shadowConfig = nodePath.join(env.shadowRoot, ".obsidian");
+      const lst = fs.lstatSync(shadowConfig);
+      expect(lst.isSymbolicLink()).toBe(true);
+
+      // Через симлинк виден контент оригинала
+      expect(fs.readFileSync(nodePath.join(shadowConfig, "appearance.json"), "utf8")).toBe("{}");
+    } finally { env.cleanup(); }
+  });
+
+  it("если в shadow была обычная папка .obsidian — заменяет на symlink", async () => {
+    const env = await makeEnv();
+    try {
+      const shadowConfig = nodePath.join(env.shadowRoot, ".obsidian");
+      fs.mkdirSync(shadowConfig);
+      fs.writeFileSync(nodePath.join(shadowConfig, "stale.json"), "old");
+
+      await env.manager.setupObsidianSymlink();
+
+      const lst = fs.lstatSync(shadowConfig);
+      expect(lst.isSymbolicLink()).toBe(true);
+    } finally { env.cleanup(); }
+  });
+
+  it("teardownObsidianSymlink снимает симлинк, не удаляет данные оригинала", async () => {
+    const env = await makeEnv();
+    try {
+      const origConfig = nodePath.join(env.origRoot, ".obsidian");
+      fs.mkdirSync(origConfig);
+      fs.writeFileSync(nodePath.join(origConfig, "data.json"), "x");
+
+      await env.manager.setupObsidianSymlink();
+      await env.manager.teardownObsidianSymlink();
+
+      expect(fs.existsSync(nodePath.join(env.shadowRoot, ".obsidian"))).toBe(false);
+      // Оригинал не тронут
+      expect(fs.readFileSync(nodePath.join(origConfig, "data.json"), "utf8")).toBe("x");
+    } finally { env.cleanup(); }
+  });
+});
+
+// ─────────────────────────────────────────────
+// decryptAllToShadow
+// ─────────────────────────────────────────────
+
+describe("ShadowVaultManager — decryptAllToShadow", () => {
+  it("расшифровывает все .enc файлы в shadow с правильным контентом", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "a.md", "alpha");
+      await writeEncrypted(env, "b.md", "beta");
+      await writeEncrypted(env, "folder/c.md", "gamma");
+
+      const result = await env.manager.decryptAllToShadow();
+
+      expect(result.failed).toHaveLength(0);
+      expect(result.decrypted.sort()).toEqual(["a.md", "b.md", "folder/c.md"]);
+
+      // Контент в shadow корректный
+      expect(fs.readFileSync(nodePath.join(env.shadowRoot, "a.md"), "utf8")).toBe("alpha");
+      expect(fs.readFileSync(nodePath.join(env.shadowRoot, "b.md"), "utf8")).toBe("beta");
+      expect(fs.readFileSync(nodePath.join(env.shadowRoot, "folder/c.md"), "utf8")).toBe("gamma");
+    } finally { env.cleanup(); }
+  });
+
+  it("прогресс-колбэк вызывается с (done, total, current)", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "a.md", "1");
+      await writeEncrypted(env, "b.md", "2");
+      await writeEncrypted(env, "c.md", "3");
+
+      const calls: Array<{ done: number; total: number }> = [];
+      const result = await env.manager.decryptAllToShadow((done, total) => {
+        calls.push({ done, total });
+      });
+
+      expect(result.decrypted.length).toBe(3);
+      // Финальный колбэк всегда (total, total)
+      const last = calls[calls.length - 1];
+      expect(last.done).toBe(3);
+      expect(last.total).toBe(3);
+    } finally { env.cleanup(); }
+  });
+
+  it("файл с битым шифрованием попадает в failed, остальные продолжают", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "good.md", "ok");
+      // Битый .enc — заменяем на мусор после шифрования
+      await writeEncrypted(env, "bad.md", "x");
+      const badPath = nodePath.join(env.origRoot, "bad.md.enc");
+      fs.writeFileSync(badPath, Buffer.from([0x00, 0x01, 0x02])); // меньше IV+AuthTag
+
+      const result = await env.manager.decryptAllToShadow();
+
+      expect(result.decrypted).toContain("good.md");
+      expect(result.failed.map(f => f.path)).toContain("bad.md");
+    } finally { env.cleanup(); }
+  });
+
+  it("пустое хранилище: возвращает пустые списки без ошибок", async () => {
+    const env = await makeEnv();
+    try {
+      const result = await env.manager.decryptAllToShadow();
+      expect(result.decrypted).toHaveLength(0);
+      expect(result.failed).toHaveLength(0);
+    } finally { env.cleanup(); }
+  });
+
+  it("идемпотентно: повторный вызов не ломает уже расшифрованные файлы", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "note.md", "content");
+
+      await env.manager.decryptAllToShadow();
+      const firstStat = fs.statSync(nodePath.join(env.shadowRoot, "note.md"));
+
+      await new Promise(r => setTimeout(r, 50));
+      await env.manager.decryptAllToShadow();
+      const secondStat = fs.statSync(nodePath.join(env.shadowRoot, "note.md"));
+
+      // mtime не должен измениться (cache hit в ensureDecrypted)
+      expect(secondStat.mtimeMs).toBe(firstStat.mtimeMs);
+    } finally { env.cleanup(); }
+  });
+});
+
+// ─────────────────────────────────────────────
+// encryptShadowChangesToOriginal (verify-back)
+// ─────────────────────────────────────────────
+
+describe("ShadowVaultManager — encryptShadowChangesToOriginal", () => {
+  it("шифрует только изменённые в shadow файлы (побайтовое сравнение)", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "unchanged.md", "same");
+      await writeEncrypted(env, "changed.md", "old");
+      await env.manager.decryptAllToShadow();
+
+      // Меняем только один файл в shadow
+      fs.writeFileSync(nodePath.join(env.shadowRoot, "changed.md"), "NEW");
+
+      const result = await env.manager.encryptShadowChangesToOriginal();
+
+      expect(result.encrypted).toEqual(["changed.md"]);
+      expect(result.failed).toHaveLength(0);
+
+      // Проверяем что .enc оригинала действительно содержит новый контент
+      const encBuf = fs.readFileSync(nodePath.join(env.origRoot, "changed.md.enc"));
+      const plain = env.engine.decryptBuffer(encBuf);
+      expect(plain.toString("utf8")).toBe("NEW");
+
+      // Unchanged.md.enc не перешифровался — старый mtime
+      const unchEnc = fs.readFileSync(nodePath.join(env.origRoot, "unchanged.md.enc"));
+      const unchPlain = env.engine.decryptBuffer(unchEnc);
+      expect(unchPlain.toString("utf8")).toBe("same");
+    } finally { env.cleanup(); }
+  });
+
+  it("новый файл в shadow (без оригинала): шифрует и кладёт в оригинал", async () => {
+    const env = await makeEnv();
+    try {
+      // Имитируем что плагин создал файл — есть только в shadow
+      fs.mkdirSync(env.shadowRoot, { recursive: true });
+      fs.writeFileSync(nodePath.join(env.shadowRoot, "fresh.md"), "brand new");
+
+      const result = await env.manager.encryptShadowChangesToOriginal();
+      expect(result.encrypted).toEqual(["fresh.md"]);
+
+      const encBuf = fs.readFileSync(nodePath.join(env.origRoot, "fresh.md.enc"));
+      expect(env.engine.decryptBuffer(encBuf).toString("utf8")).toBe("brand new");
+    } finally { env.cleanup(); }
+  });
+
+  it("не оставляет .enc.bak / .enc.new после успешной записи", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "doc.md", "original");
+      await env.manager.decryptAllToShadow();
+      fs.writeFileSync(nodePath.join(env.shadowRoot, "doc.md"), "edited");
+
+      await env.manager.encryptShadowChangesToOriginal();
+
+      expect(fs.existsSync(nodePath.join(env.origRoot, "doc.md.enc.bak"))).toBe(false);
+      expect(fs.existsSync(nodePath.join(env.origRoot, "doc.md.enc.new"))).toBe(false);
+    } finally { env.cleanup(); }
+  });
+
+  it("verify-back: запись с симметричным decrypt-обратно должна совпасть с shadow", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "v.md", "old");
+      await env.manager.decryptAllToShadow();
+      fs.writeFileSync(nodePath.join(env.shadowRoot, "v.md"), "verified content");
+
+      const result = await env.manager.encryptShadowChangesToOriginal();
+      expect(result.failed).toHaveLength(0);
+
+      // Decrypt оригинала и сравним посимвольно с shadow
+      const encBuf = fs.readFileSync(nodePath.join(env.origRoot, "v.md.enc"));
+      const decrypted = env.engine.decryptBuffer(encBuf).toString("utf8");
+      const shadowContent = fs.readFileSync(nodePath.join(env.shadowRoot, "v.md"), "utf8");
+      expect(decrypted).toBe(shadowContent);
+    } finally { env.cleanup(); }
+  });
+
+  it("файл с одинаковым содержимым в shadow и оригинале: НЕ перешифровывается", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "same.md", "identical");
+      await env.manager.decryptAllToShadow();
+      // Не трогаем shadow — содержимое идентично
+
+      const origEncStatBefore = fs.statSync(nodePath.join(env.origRoot, "same.md.enc"));
+      await new Promise(r => setTimeout(r, 50));
+
+      const result = await env.manager.encryptShadowChangesToOriginal();
+      expect(result.encrypted).toHaveLength(0);
+
+      const origEncStatAfter = fs.statSync(nodePath.join(env.origRoot, "same.md.enc"));
+      // .enc не пересоздавался
+      expect(origEncStatAfter.mtimeMs).toBe(origEncStatBefore.mtimeMs);
+    } finally { env.cleanup(); }
+  });
+
+  it("игнорирует .obsidian как symlink (в shadow его нет в обычном смысле)", async () => {
+    const env = await makeEnv();
+    try {
+      // .obsidian-симлинк не должен попасть в encrypt-back
+      const origConfig = nodePath.join(env.origRoot, ".obsidian");
+      fs.mkdirSync(origConfig);
+      fs.writeFileSync(nodePath.join(origConfig, "settings.json"), "{}");
+
+      await env.manager.setupObsidianSymlink();
+
+      const result = await env.manager.encryptShadowChangesToOriginal();
+      // Никаких .obsidian-файлов не должно попасть в encrypted/failed
+      const all = [...result.encrypted, ...result.failed.map(f => f.path)];
+      for (const p of all) {
+        expect(p).not.toMatch(/^\.obsidian/);
+      }
+    } finally { env.cleanup(); }
+  });
+});

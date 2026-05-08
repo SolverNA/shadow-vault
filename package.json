@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "tsc --noEmit --skipLibCheck && node esbuild.config.mjs production",
+    "build:plugin": "npm run build && node scripts/package-plugin.mjs",
     "test": "jest"
   },
   "keywords": [
