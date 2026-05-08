@@ -352,6 +352,13 @@ export class ShadowVaultManager {
   async decryptAllToShadow(
     onProgress?: (done: number, total: number, current: string) => void
   ): Promise<{ decrypted: string[]; failed: Array<{ path: string; error: string }> }> {
+    // Сначала зеркалим всю структуру папок (включая пустые) из оригинала в shadow.
+    // Иначе при попытке создать заметку в пустой папке Obsidian native fs.writeFile
+    // получит ENOENT — папки в shadow нет, хотя в дереве она отображается
+    // (vault.fileMap её знает по первичному скану через patchListEarly).
+    const folders = await this.replicateFolderStructure();
+    console.info(`[ShadowVault] Зеркало папок: ${folders} директорий из original → shadow`);
+
     const encFiles = await this.scanEncryptedFiles();
     const decrypted: string[] = [];
     const failed: Array<{ path: string; error: string }> = [];
@@ -810,6 +817,42 @@ export class ShadowVaultManager {
     }
 
     console.debug(`[ShadowVault] Пере-шифровка завершена: ${total} файлов.`);
+  }
+
+  /**
+   * Зеркалит структуру папок original → shadow рекурсивно.
+   * Включая пустые папки — иначе пользователь не сможет создать в них
+   * новую заметку (Obsidian упадёт с ENOENT при native writeFile).
+   *
+   * Пропускает: dotfiles (включая configDir — для него отдельный symlink).
+   * Возвращает количество созданных директорий (для прогресс-логов).
+   */
+  private async replicateFolderStructure(relDir = ""): Promise<number> {
+    let count = 0;
+    const absDir = relDir
+      ? nodePath.join(this.originalRoot, ...relDir.split("/"))
+      : this.originalRoot;
+
+    let entries: fs.Dirent[];
+    try {
+      entries = await fsp.readdir(absDir, { withFileTypes: true });
+    } catch {
+      return 0;
+    }
+
+    for (const entry of entries) {
+      if (entry.name.startsWith(".")) continue;
+      if (!entry.isDirectory()) continue;
+
+      const rel = relDir ? relDir + "/" + entry.name : entry.name;
+      const shadowDirAbs = nodePath.join(this.shadowRoot, ...rel.split("/"));
+      await fsp.mkdir(shadowDirAbs, { recursive: true });
+      count++;
+
+      // Рекурсивно — не теряем глубоко вложенные пустые папки
+      count += await this.replicateFolderStructure(rel);
+    }
+    return count;
   }
 
   /**
