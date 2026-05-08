@@ -16,30 +16,32 @@ import { CryptoEngine } from "../src/crypto-engine";
 // ─────────────────────────────────────────────
 
 interface TestEnv {
-  engine:      CryptoEngine;
-  session:     SessionManager;
+  engine:       CryptoEngine;
+  session:      SessionManager;
   originalRoot: string;
-  shadowRoot:  string;
-  cleanup:     () => void;
+  shadowRoot:   string;
+  pluginDir:    string;
+  cleanup:      () => void;
 }
 
 async function makeEnv(): Promise<TestEnv> {
   const base = fs.mkdtempSync(nodePath.join(os.tmpdir(), "sv-session-"));
   const originalRoot = nodePath.join(base, "original");
   const shadowRoot   = nodePath.join(base, "shadow");
+  const pluginDir    = nodePath.join(base, "plugin");
   fs.mkdirSync(originalRoot, { recursive: true });
   fs.mkdirSync(shadowRoot,   { recursive: true });
+  fs.mkdirSync(pluginDir,    { recursive: true });
 
   const engine = new CryptoEngine();
   await engine.deriveKey("session-test-password");
 
-  const session = new SessionManager(engine, originalRoot, shadowRoot);
+  const session = new SessionManager(engine, originalRoot, shadowRoot, pluginDir);
 
   return {
-    engine, session, originalRoot, shadowRoot,
+    engine, session, originalRoot, shadowRoot, pluginDir,
     cleanup: () => {
-      // engine может быть уже уничтожен в endSession — это нормально
-      try { engine.destroy(); } catch { /* ignore */ }
+      try { engine.destroy(); } catch { /* engine может быть уже уничтожен */ }
       fs.rmSync(base, { recursive: true, force: true });
     },
   };
@@ -79,7 +81,7 @@ async function origEncMtime(env: TestEnv, relPath: string): Promise<number> {
 // ─────────────────────────────────────────────
 
 describe("SessionManager — startSession()", () => {
-  it("первый старт: нет краша, создаёт .session_active", async () => {
+  it("первый старт: нет краша, создаёт session.lock", async () => {
     const env = await makeEnv();
     try {
       const result = await env.session.startSession();
@@ -87,17 +89,17 @@ describe("SessionManager — startSession()", () => {
       expect(result.hadCrash).toBe(false);
       expect(result.recovery).toBeUndefined();
 
-      const sessionFile = nodePath.join(env.originalRoot, ".session_active");
+      const sessionFile = nodePath.join(env.pluginDir, "session.lock");
       expect(fs.existsSync(sessionFile)).toBe(true);
     } finally { env.cleanup(); }
   });
 
-  it(".session_active содержит корректный JSON с startedAt и shadowRoot", async () => {
+  it("session.lock содержит корректный JSON с startedAt и shadowRoot", async () => {
     const env = await makeEnv();
     try {
       await env.session.startSession();
 
-      const sessionFile = nodePath.join(env.originalRoot, ".session_active");
+      const sessionFile = nodePath.join(env.pluginDir, "session.lock");
       const raw = fs.readFileSync(sessionFile, "utf8");
       const data = JSON.parse(raw);
 
@@ -107,11 +109,11 @@ describe("SessionManager — startSession()", () => {
     } finally { env.cleanup(); }
   });
 
-  it("повторный старт (есть .session_active): hadCrash=true", async () => {
+  it("повторный старт (есть session.lock): hadCrash=true", async () => {
     const env = await makeEnv();
     try {
       // Имитируем незавершённую предыдущую сессию
-      const sessionFile = nodePath.join(env.originalRoot, ".session_active");
+      const sessionFile = nodePath.join(env.pluginDir, "session.lock");
       fs.writeFileSync(sessionFile, JSON.stringify({ startedAt: new Date().toISOString(), shadowRoot: env.shadowRoot }));
 
       const result = await env.session.startSession();
@@ -121,11 +123,11 @@ describe("SessionManager — startSession()", () => {
     } finally { env.cleanup(); }
   });
 
-  it("после краша создаётся новый .session_active для текущей сессии", async () => {
+  it("после краша создаётся новый session.lock для текущей сессии", async () => {
     const env = await makeEnv();
     try {
-      // Добавляем старый .session_active
-      const sessionFile = nodePath.join(env.originalRoot, ".session_active");
+      // Добавляем старый session.lock
+      const sessionFile = nodePath.join(env.pluginDir, "session.lock");
       const oldTime = new Date(Date.now() - 60_000).toISOString();
       fs.writeFileSync(sessionFile, JSON.stringify({ startedAt: oldTime, shadowRoot: env.shadowRoot }));
 
@@ -145,13 +147,13 @@ describe("SessionManager — startSession()", () => {
 // ─────────────────────────────────────────────
 
 describe("SessionManager — endSession()", () => {
-  it("удаляет .session_active", async () => {
+  it("удаляет session.lock", async () => {
     const env = await makeEnv();
     try {
       await env.session.startSession();
       await env.session.endSession();
 
-      const sessionFile = nodePath.join(env.originalRoot, ".session_active");
+      const sessionFile = nodePath.join(env.pluginDir, "session.lock");
       expect(fs.existsSync(sessionFile)).toBe(false);
     } finally { env.cleanup(); }
   });
@@ -410,7 +412,7 @@ describe("SessionManager — сквозной сценарий краша", () =
       await writePlaintextShadow(env, "diary.md", "Tuesday: power cut during save!");
 
       // ── Шаг 3: НЕ вызываем endSession() — симулируем краш ────────────
-      // .session_active остаётся на диске
+      // session.lock остаётся на диске
 
       // ── Шаг 4: Вторая сессия — обнаруживает краш ──────────────────────
       const second = await env.session.startSession();
@@ -426,7 +428,7 @@ describe("SessionManager — сквозной сценарий краша", () =
       await env.session.endSession();
 
       expect(fs.existsSync(env.shadowRoot)).toBe(false);
-      expect(fs.existsSync(nodePath.join(env.originalRoot, ".session_active"))).toBe(false);
+      expect(fs.existsSync(nodePath.join(env.pluginDir, "session.lock"))).toBe(false);
       expect(env.engine.isUnlocked()).toBe(false);
     } finally { env.cleanup(); }
   });
