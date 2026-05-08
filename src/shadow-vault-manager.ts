@@ -28,12 +28,13 @@ import * as nodePath from "path";
 import * as crypto from "crypto";
 import { CryptoEngine } from "./crypto-engine";
 import { IDataAdapter, AdapterStat, DataWriteOptions, ListedFiles } from "./adapter-types";
-
-/** Суффикс зашифрованных файлов в оригинальном хранилище */
-const ENCRYPTED_EXT = ".enc";
-
-/** Размер криптографического заголовка: IV (12 б) + AuthTag (16 б) */
-const CRYPTO_HEADER_SIZE = 28;
+import {
+  CRYPTO_HEADER_SIZE,
+  ENCRYPTED_EXT,
+  atomicWrite,
+  fileExists,
+  isTempFile,
+} from "./fs-utils";
 
 export class ShadowVaultManager {
   private readonly engine: CryptoEngine;
@@ -44,10 +45,12 @@ export class ShadowVaultManager {
 
   private patched = false;
   private originalMethods: Partial<IDataAdapter> = {};
+  private readonly configDir: string;
 
-  constructor(engine: CryptoEngine, originalRoot: string, shadowRoot?: string) {
+  constructor(engine: CryptoEngine, originalRoot: string, shadowRoot?: string, configDir = ".obsidian") {
     this.engine = engine;
     this.originalRoot = nodePath.normalize(originalRoot);
+    this.configDir = configDir;
 
     if (shadowRoot) {
       this.shadowRoot = nodePath.normalize(shadowRoot);
@@ -163,8 +166,8 @@ export class ShadowVaultManager {
   isBypassPath(normalizedPath: string): boolean {
     return (
       normalizedPath === "" ||
-      normalizedPath === ".obsidian" ||
-      normalizedPath.startsWith(".obsidian/")
+      normalizedPath === this.configDir ||
+      normalizedPath.startsWith(this.configDir + "/")
     );
   }
 
@@ -192,7 +195,7 @@ export class ShadowVaultManager {
     const plainFiles = await this.scanPlaintextFiles();
     let done = 0;
 
-    console.info(`[ShadowVault] Миграция: обнаружено ${plainFiles.length} незашифрованных файлов.`);
+    console.debug(`[ShadowVault] Миграция: обнаружено ${plainFiles.length} незашифрованных файлов.`);
 
     for (const normalizedPath of plainFiles) {
       const origPath   = this.originalAbs(normalizedPath);
@@ -219,14 +222,14 @@ export class ShadowVaultManager {
         await fsp.unlink(origPath);
         done++;
         onProgress?.(done, plainFiles.length);
-        console.info(`[ShadowVault] Зашифрован: "${normalizedPath}"`);
+        console.debug(`[ShadowVault] Зашифрован: "${normalizedPath}"`);
       } catch (err) {
         console.error(`[ShadowVault] Ошибка шифрования "${normalizedPath}":`, err);
         // Продолжаем с остальными файлами
       }
     }
 
-    console.info(`[ShadowVault] Миграция завершена: ${done}/${plainFiles.length}`);
+    console.debug(`[ShadowVault] Миграция завершена: ${done}/${plainFiles.length}`);
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -251,7 +254,7 @@ export class ShadowVaultManager {
     const encFiles = await this.scanEncryptedFiles();
     const total = encFiles.length;
 
-    console.info(`[ShadowVault] Пере-шифровка: ${total} файлов.`);
+    console.debug(`[ShadowVault] Пере-шифровка: ${total} файлов.`);
 
     // ── Фаза 1: создаём .enc.new ──────────────────────────────────────────
     const LARGE = 4 * 1024 * 1024; // 4 МБ
@@ -298,7 +301,7 @@ export class ShadowVaultManager {
       onProgress?.(total + i + 1, total * 2);
     }
 
-    console.info(`[ShadowVault] Пере-шифровка завершена: ${total} файлов.`);
+    console.debug(`[ShadowVault] Пере-шифровка завершена: ${total} файлов.`);
   }
 
   /**
@@ -550,13 +553,9 @@ export class ShadowVaultManager {
     const prefix = normalizedPath ? normalizedPath + "/" : "";
     for (const entry of entries) {
       // Скрытые файлы (.session_active и т.п.) — не показываем Obsidian
-      if (entry.name.startsWith(".") && entry.name !== ".obsidian") continue;
+      if (entry.name.startsWith(".") && entry.name !== this.configDir) continue;
       // Временные файлы атомарных операций
-      if (
-        entry.name.endsWith(".tmp")       ||
-        entry.name.endsWith(".shadowtmp") ||
-        entry.name.endsWith(".sessiontmp")
-      ) continue;
+      if (isTempFile(entry.name)) continue;
 
       if (entry.isDirectory()) {
         folders.push(prefix + entry.name);
@@ -687,12 +686,7 @@ export class ShadowVaultManager {
     for (const entry of entries) {
       if (entry.name.startsWith(".")) continue;
       // Пропускаем уже зашифрованные и временные файлы
-      if (
-        entry.name.endsWith(ENCRYPTED_EXT)  ||
-        entry.name.endsWith(".tmp")          ||
-        entry.name.endsWith(".shadowtmp")    ||
-        entry.name.endsWith(".sessiontmp")
-      ) continue;
+      if (entry.name.endsWith(ENCRYPTED_EXT) || isTempFile(entry.name)) continue;
 
       const rel = prefix + entry.name;
       if (entry.isDirectory()) {
@@ -707,26 +701,3 @@ export class ShadowVaultManager {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Модульные утилиты
-// ═══════════════════════════════════════════════════════════════════════
-
-async function fileExists(absPath: string): Promise<boolean> {
-  try {
-    await fsp.access(absPath);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function atomicWrite(absPath: string, data: Buffer): Promise<void> {
-  const tmpPath = absPath + ".shadowtmp";
-  try {
-    await fsp.writeFile(tmpPath, data);
-    await fsp.rename(tmpPath, absPath);
-  } catch (err) {
-    await fsp.unlink(tmpPath).catch(() => undefined);
-    throw err;
-  }
-}

@@ -16,7 +16,6 @@
 
 import * as crypto from "crypto";
 import * as fs from "fs";
-import * as path from "path";
 
 /** Параметры алгоритма шифрования — менять только осознанно */
 const ALGORITHM = "aes-256-gcm" as const;
@@ -219,7 +218,7 @@ export class CryptoEngine {
             const authTag = headerBuf.subarray(IV_LENGTH, IV_LENGTH + AUTH_TAG_LENGTH);
             const rest = headerBuf.subarray(IV_LENGTH + AUTH_TAG_LENGTH);
 
-            decipher = crypto.createDecipheriv(ALGORITHM, this.keyBuffer!, iv) as crypto.DecipherGCM;
+            decipher = crypto.createDecipheriv(ALGORITHM, this.keyBuffer!, iv);
             decipher.setAuthTag(authTag);
             decipher.pipe(writeStream);
             decipher.on("error", (err) => {

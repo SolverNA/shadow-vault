@@ -12,7 +12,7 @@
  * Здесь только "провода" между QueueManager и Obsidian API.
  */
 
-import { App, Notice, Plugin, TFile } from "obsidian";
+import { App, Events, Notice, Plugin, TFile } from "obsidian";
 import { QueueManager, QueueProgress } from "./queue-manager";
 import { ShadowVaultManager } from "./shadow-vault-manager";
 
@@ -47,7 +47,7 @@ export class QueueIntegration {
     this.unsubscribeProgress = this.queue.onProgress((p) => this.updateStatusBar(p));
     this.unsubscribeComplete = this.queue.onComplete(() => {
       this.updateStatusBar(this.queue.getProgress());
-      new Notice("🔐 ShadowVault: хранилище полностью расшифровано. Поиск доступен.");
+      new Notice("🔐 Shadow Vault: хранилище полностью расшифровано, поиск доступен.");
     });
 
     // ── Хук file-open: приоритизация открываемых файлов ────────────────
@@ -68,11 +68,11 @@ export class QueueIntegration {
     // ── Предупреждение при поиске пока идёт расшифровка ─────────────────
     // Перехватываем команду глобального поиска Obsidian
     this.plugin.registerEvent(
-      this.app.workspace.on("search:open" as any, () => {
+      (this.app.workspace as unknown as Events).on("search:open", () => {
         if (!this.queue.getProgress().isComplete) {
           const p = this.queue.getProgress();
           new Notice(
-            `⚠️ ShadowVault: результаты поиска могут быть неполными.\n` +
+            `⚠️ Shadow Vault: результаты поиска могут быть неполными.\n` +
             `Расшифровано ${p.completed} из ${p.total} файлов (${p.percentage}%).`,
             6000
           );
@@ -139,13 +139,13 @@ export class QueueIntegration {
     if (!this.statusBarEl) return;
 
     if (p.total === 0) {
-      this.statusBarEl.setText("🔐 ShadowVault");
+      this.statusBarEl.setText("🔐 Shadow Vault");
       return;
     }
 
     if (p.isComplete) {
       this.statusBarEl.setText(`🔐 ${p.completed}/${p.total}`);
-      this.statusBarEl.setAttr("title", "ShadowVault: хранилище расшифровано");
+      this.statusBarEl.setAttr("title", "Shadow Vault: хранилище расшифровано");
       return;
     }
 

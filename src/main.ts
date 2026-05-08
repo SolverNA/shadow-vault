@@ -25,9 +25,9 @@
 import * as fs from "fs";
 import * as fsp from "fs/promises";
 import * as nodePath from "path";
-import { App, Notice, Plugin, TFile } from "obsidian";
+import { Notice, Plugin } from "obsidian";
 import { CryptoEngine } from "./crypto-engine";
-import { AuthResult } from "./auth-service";
+import { AuthResult, AuthService } from "./auth-service";
 import { InitModal } from "./init-modal";
 import { ShadowVaultManager } from "./shadow-vault-manager";
 import { SessionManager } from "./session-manager";
@@ -36,7 +36,12 @@ import { QueueIntegration } from "./queue-integration";
 import { ShadowVaultSettingTab } from "./settings-tab";
 import { DEFAULT_SETTINGS, PluginSettings, VERIFICATION_PLAINTEXT } from "./types";
 import { IDataAdapter, ListedFiles } from "./adapter-types";
-import { AuthService, PasswordError } from "./auth-service";
+import { CRYPTO_HEADER_SIZE, ENCRYPTED_EXT, isTempFile } from "./fs-utils";
+
+interface AdapterWithInternals extends IDataAdapter {
+  files?: Record<string, { type: string; realpath: string; ctime?: number; mtime?: number; size?: number }>;
+  trigger(event: string, ...args: unknown[]): void;
+}
 
 export default class ShadowVaultPlugin extends Plugin {
   /** Настройки плагина — читаются из data.json, записываются через saveSettings() */
@@ -78,7 +83,7 @@ export default class ShadowVaultPlugin extends Plugin {
       name: "Заблокировать хранилище",
       checkCallback: (checking: boolean) => {
         if (!this.sessionActive) return false;
-        if (!checking) this.lockVault();
+        if (!checking) void this.lockVault();
         return true;
       },
     });
@@ -88,15 +93,15 @@ export default class ShadowVaultPlugin extends Plugin {
       this.openInitModal();
     });
 
-    console.info("[ShadowVault] Плагин загружен, ожидаем пароль.");
+    console.debug("[ShadowVault] Плагин загружен, ожидаем пароль.");
   }
 
-  async onunload(): Promise<void> {
+  onunload(): void {
     // onunload может быть вызван синхронно при закрытии Obsidian.
     // Мы инициируем shutdown, но не можем гарантировать его завершение
     // если Obsidian закрывается агрессивно. .session_active останется на диске
     // и запустит recovery при следующем запуске — это корректное поведение.
-    this.shutdown().catch((err) => {
+    void this.shutdown().catch((err) => {
       console.error("[ShadowVault] Ошибка при завершении сессии:", err);
     });
   }
@@ -137,20 +142,7 @@ export default class ShadowVaultPlugin extends Plugin {
 
     // 1. Верифицируем старый пароль независимо от активной сессии —
     //    защита от смены пароля на разблокированном чужом устройстве
-    const checkEngine = new CryptoEngine();
-    try {
-      await checkEngine.deriveKey(oldPassword, this.settings.saltHex!);
-      const decrypted = checkEngine.decryptBuffer(
-        Buffer.from(this.settings.verificationBlob!, "hex")
-      );
-      if (decrypted.toString("utf8") !== VERIFICATION_PLAINTEXT) {
-        throw new PasswordError("Неверный текущий пароль.");
-      }
-    } catch (err) {
-      checkEngine.destroy();
-      if (err instanceof PasswordError) throw err;
-      throw new PasswordError("Неверный текущий пароль.");
-    }
+    const checkEngine = await AuthService.verifyPassword(oldPassword, this.settings);
     checkEngine.destroy();
 
     // 2. Создаём движок с новым паролем
@@ -199,7 +191,7 @@ export default class ShadowVaultPlugin extends Plugin {
       this.app,
       this.settings,
       (s) => this.saveSettings(s),
-      (result) => this.onUnlock(result)
+      (result) => { void this.onUnlock(result); }
     ).open();
   }
 
@@ -213,113 +205,117 @@ export default class ShadowVaultPlugin extends Plugin {
   private async onUnlock(result: AuthResult): Promise<void> {
     const { engine, isFirstRun } = result;
 
+    const basePath = this.getVaultBasePath();
+    if (!basePath) {
+      new Notice(
+        "❌ Shadow Vault: getBasePath() недоступен, плагин работает только на десктопе.",
+        10000
+      );
+      engine.destroy();
+      return;
+    }
+
     try {
-      const basePath = this.getVaultBasePath();
-      if (!basePath) {
-        new Notice(
-          "❌ ShadowVault: getBasePath() недоступен. Плагин работает только на десктопе.",
-          10000
-        );
-        engine.destroy();
-        return;
-      }
-
-      // ── Шаг 3: VFS-менеджер ─────────────────────────────────────────
-      this.shadowManager = new ShadowVaultManager(
-        engine,
-        basePath,
-        this.settings.shadowVaultPath || undefined
-      );
-      await this.shadowManager.initialize();
-
-      // Миграция: если в оригинальном хранилище есть незашифрованные файлы
-      // (первая установка плагина на существующий vault) — шифруем их.
-      // Это КРИТИЧНО: без шифрования оригиналов пользователь видит заметки без пароля.
-      if (await this.shadowManager.hasPendingMigration()) {
-        new Notice("⏳ ShadowVault: шифруем существующие файлы хранилища...", 5000);
-        await this.shadowManager.encryptAllExisting();
-        new Notice("✅ ShadowVault: все файлы зашифрованы.", 4000);
-      }
-
-      // Перед полным патчингом восстанавливаем оригинальный list(),
-      // иначе shadowManager.patch() сохранит раннюю подмену и unpatch()
-      // при блокировке вернёт её, показывая файлы без пароля.
-      const adapterForPatch = this.app.vault.adapter as unknown as IDataAdapter;
-      if (this.earlyListOriginal) {
-        adapterForPatch.list = this.earlyListOriginal;
-      }
-
-      // Патчим адаптер ДО startSession — чтобы операции recovery шли
-      // через правильные пути (bypass для .obsidian и т.д.)
-      this.shadowManager.patch(adapterForPatch);
-
-      // ── Шаг 5: Управление сессией и crash recovery ──────────────────
-      this.sessionManager = new SessionManager(
-        engine,
-        basePath,
-        this.shadowManager.shadowRoot
-      );
-      const sessionResult = await this.sessionManager.startSession();
-
-      if (sessionResult.hadCrash) {
-        this.notifyCrashRecovery(sessionResult.recovery!);
-      }
-
-      // ── Шаг 4: Фоновая расшифровка с приоритетами ───────────────────
-      const queueManager = new QueueManager(
-        (normalizedPath: string) => this.shadowManager!.ensureDecrypted(normalizedPath),
-        { concurrency: 3 }
-      );
-      this.queueIntegration = new QueueIntegration(
-        this.app,
-        this,
-        queueManager,
-        this.shadowManager
-      );
-      await this.queueIntegration.setup();
-
-      // ── Переиндексация файлового индекса Obsidian ────────────────────
-      // Obsidian строит индекс TFile-объектов ДО того, как наш патч активен.
-      // После патча adapter.list() уже возвращает правильные .md пути,
-      // но индекс устарел. Отправляем "raw" событие для каждого файла —
-      // Obsidian проверит stat() и создаст недостающие TFile-записи.
+      await this.setupShadow(engine, basePath);
+      await this.setupSession(engine, basePath);
+      await this.setupQueue();
       await this.reconcileVaultIndex();
 
-      // ── Хук beforeunload (дополнительно к onunload) ─────────────────
       // Electron не всегда вызывает plugin.onunload() при закрытии окна
       this.registerDomEvent(window as Window, "beforeunload", () => {
-        this.shutdown();
+        void this.shutdown();
       });
 
       this.sessionActive = true;
 
-      // ── Уведомление пользователя ────────────────────────────────────
       if (isFirstRun) {
-        new Notice("🔐 ShadowVault: хранилище создано! Пароль сохранён.", 5000);
+        new Notice("🔐 Shadow Vault: хранилище создано, пароль сохранён.", 5000);
       } else {
-        new Notice("🔓 ShadowVault: хранилище разблокировано.", 2500);
+        new Notice("🔓 Shadow Vault: хранилище разблокировано.", 2500);
       }
 
-      console.info(
-        `[ShadowVault] Сессия запущена. Shadow: ${this.shadowManager.shadowRoot}`
+      console.debug(
+        `[ShadowVault] Сессия запущена. Shadow: ${this.shadowManager!.shadowRoot}`
       );
     } catch (err) {
       console.error("[ShadowVault] Ошибка инициализации:", err);
       new Notice(
-        `❌ ShadowVault: ошибка при запуске.\n${err instanceof Error ? err.message : String(err)}`,
+        `❌ Shadow Vault: ошибка при запуске.\n${err instanceof Error ? err.message : String(err)}`,
         10000
       );
-      // Если что-то пошло не так, убираем частично созданное состояние
-      engine.destroy();
-      if (this.shadowManager) {
-        this.shadowManager.unpatch(
-          this.app.vault.adapter as unknown as IDataAdapter
-        );
-        this.shadowManager = null;
-      }
-      this.sessionManager = null;
-      this.queueIntegration = null;
+      this.rollbackInitialization(engine);
     }
+  }
+
+  /** Создаёт ShadowVaultManager, проводит миграцию (если нужна) и патчит адаптер. */
+  private async setupShadow(engine: CryptoEngine, basePath: string): Promise<void> {
+    this.shadowManager = new ShadowVaultManager(
+      engine,
+      basePath,
+      this.settings.shadowVaultPath || undefined,
+      this.app.vault.configDir
+    );
+    await this.shadowManager.initialize();
+
+    // Миграция первичной установки: шифруем plaintext-файлы существующего vault.
+    // Без этого пользователь увидит заметки без пароля.
+    if (await this.shadowManager.hasPendingMigration()) {
+      new Notice("⏳ Shadow Vault: шифруем существующие файлы хранилища...", 5000);
+      await this.shadowManager.encryptAllExisting();
+      new Notice("✅ Shadow Vault: все файлы зашифрованы.", 4000);
+    }
+
+    // Перед полным патчингом восстанавливаем оригинальный list(), иначе unpatch()
+    // при блокировке вернёт раннюю подмену вместо нетронутого метода.
+    const adapter = this.app.vault.adapter as unknown as IDataAdapter;
+    if (this.earlyListOriginal) {
+      adapter.list = this.earlyListOriginal;
+    }
+
+    // Патчим ДО startSession — чтобы операции recovery шли через bypass для configDir
+    this.shadowManager.patch(adapter);
+  }
+
+  /** Запускает SessionManager и обрабатывает crash recovery. */
+  private async setupSession(engine: CryptoEngine, basePath: string): Promise<void> {
+    this.sessionManager = new SessionManager(
+      engine,
+      basePath,
+      this.shadowManager!.shadowRoot
+    );
+    const sessionResult = await this.sessionManager.startSession();
+
+    if (sessionResult.hadCrash) {
+      this.notifyCrashRecovery(sessionResult.recovery!);
+    }
+  }
+
+  /** Запускает фоновую расшифровку с приоритетами. */
+  private async setupQueue(): Promise<void> {
+    const queueManager = new QueueManager(
+      (normalizedPath: string) => this.shadowManager!.ensureDecrypted(normalizedPath),
+      { concurrency: 3 }
+    );
+    this.queueIntegration = new QueueIntegration(
+      this.app,
+      this,
+      queueManager,
+      this.shadowManager!
+    );
+    await this.queueIntegration.setup();
+  }
+
+  /** Освобождает частично созданное состояние при ошибке инициализации. */
+  private rollbackInitialization(engine: CryptoEngine): void {
+    engine.destroy();
+    if (this.shadowManager) {
+      this.shadowManager.unpatch(
+        this.app.vault.adapter as unknown as IDataAdapter
+      );
+      this.shadowManager = null;
+    }
+    this.sessionManager = null;
+    this.queueIntegration = null;
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -340,7 +336,7 @@ export default class ShadowVaultPlugin extends Plugin {
     if (!this.sessionActive) return;
     this.sessionActive = false;
 
-    console.info("[ShadowVault] Завершение сессии...");
+    console.debug("[ShadowVault] Завершение сессии...");
 
     // 1. Останавливаем очередь и снимаем хуки UI
     try {
@@ -373,7 +369,7 @@ export default class ShadowVaultPlugin extends Plugin {
       this.sessionManager = null;
     }
 
-    console.info("[ShadowVault] Сессия завершена.");
+    console.debug("[ShadowVault] Сессия завершена.");
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -429,12 +425,13 @@ export default class ShadowVaultPlugin extends Plugin {
     const originalList = adapter.list.bind(adapter);
     this.earlyListOriginal = originalList;
 
-    console.info("[ShadowVault:early] patchListEarly установлен, root:", originalRoot);
+    const configDir = this.app.vault.configDir;
+    console.debug("[ShadowVault:early] patchListEarly установлен, root:", originalRoot);
 
     adapter.list = async (normalizedPath: string): Promise<ListedFiles> => {
       if (normalizedPath !== "" && (
-        normalizedPath === ".obsidian" ||
-        normalizedPath.startsWith(".obsidian/")
+        normalizedPath === configDir ||
+        normalizedPath.startsWith(configDir + "/")
       )) {
         return originalList(normalizedPath);
       }
@@ -455,17 +452,13 @@ export default class ShadowVaultPlugin extends Plugin {
 
       const prefix = normalizedPath ? normalizedPath + "/" : "";
       for (const entry of entries) {
-        if (entry.name.startsWith(".") && entry.name !== ".obsidian") continue;
-        if (
-          entry.name.endsWith(".tmp")       ||
-          entry.name.endsWith(".shadowtmp") ||
-          entry.name.endsWith(".sessiontmp")
-        ) continue;
+        if (entry.name.startsWith(".") && entry.name !== configDir) continue;
+        if (isTempFile(entry.name)) continue;
 
         if (entry.isDirectory()) {
           folders.push(prefix + entry.name);
-        } else if (entry.isFile() && entry.name.endsWith(".enc")) {
-          const baseName = entry.name.slice(0, -".enc".length);
+        } else if (entry.isFile() && entry.name.endsWith(ENCRYPTED_EXT)) {
+          const baseName = entry.name.slice(0, -ENCRYPTED_EXT.length);
           files.push(prefix + baseName);
         }
       }
@@ -487,7 +480,7 @@ export default class ShadowVaultPlugin extends Plugin {
    *   без проверки нативного FS.
    */
   private async reconcileVaultIndex(): Promise<void> {
-    const adapter = this.app.vault.adapter as any;
+    const adapter = this.app.vault.adapter as unknown as AdapterWithInternals;
     if (typeof adapter.trigger !== "function") return;
     try {
       await this.notifyFilesCreated("", adapter);
@@ -496,7 +489,7 @@ export default class ShadowVaultPlugin extends Plugin {
     }
   }
 
-  private async notifyFilesCreated(dir: string, adapter: any): Promise<void> {
+  private async notifyFilesCreated(dir: string, adapter: AdapterWithInternals): Promise<void> {
     const listed = await this.app.vault.adapter.list(dir);
 
     // Сначала папки — чтобы vault.getDirectParent() нашёл родителя для файлов
@@ -521,7 +514,7 @@ export default class ShadowVaultPlugin extends Plugin {
         statObj = {
           ctime: Math.round(s.birthtimeMs ?? s.ctimeMs),
           mtime: Math.round(s.mtimeMs),
-          size:  Math.max(0, s.size - 28), // минус заголовок IV+AuthTag
+          size:  Math.max(0, s.size - CRYPTO_HEADER_SIZE),
         };
       } catch { /* enc файл не найден — используем заглушку */ }
 

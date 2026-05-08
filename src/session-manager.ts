@@ -23,6 +23,7 @@ import * as fsp from "fs/promises";
 import * as fs from "fs";
 import * as nodePath from "path";
 import { CryptoEngine } from "./crypto-engine";
+import { atomicWrite, fileExists } from "./fs-utils";
 
 /** Имя файла-индикатора активной сессии */
 const SESSION_FILE = ".session_active";
@@ -81,7 +82,7 @@ export class SessionManager {
       hadCrash = true;
       console.warn("[SessionManager] Обнаружен краш предыдущей сессии. Запускаем Crash Recovery...");
       recovery = await this.recoverFromCrash();
-      console.info(
+      console.debug(
         `[SessionManager] Recovery завершён: ${recovery.recoveredFiles.length} файлов восстановлено, ` +
         `${recovery.failedFiles.length} ошибок.`
       );
@@ -179,10 +180,10 @@ export class SessionManager {
         // Шифруем shadow → tmp → оригинал.enc (атомарно)
         const plaintext = await fsp.readFile(shadowAbs);
         const encrypted = this.engine.encryptBuffer(plaintext);
-        await atomicWrite(originalEncAbs, encrypted);
+        await atomicWrite(originalEncAbs, encrypted, ".sessiontmp");
 
         recoveredFiles.push(normalizedPath);
-        console.info(`[SessionManager] Восстановлен: "${normalizedPath}" → original.enc`);
+        console.debug(`[SessionManager] Восстановлен: "${normalizedPath}" → original.enc`);
       } catch (err) {
         failedFiles.push(normalizedPath);
         console.error(`[SessionManager] Ошибка recovery для "${normalizedPath}":`, err);
@@ -204,7 +205,8 @@ export class SessionManager {
     // Атомарная запись: не хотим частично записанного .session_active
     await atomicWrite(
       this.sessionFilePath,
-      Buffer.from(JSON.stringify(content, null, 2), "utf8")
+      Buffer.from(JSON.stringify(content, null, 2), "utf8"),
+      ".sessiontmp"
     );
   }
 
@@ -262,28 +264,3 @@ export class SessionManager {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Модульные утилиты
-// ═══════════════════════════════════════════════════════════════════════
-
-async function fileExists(absPath: string): Promise<boolean> {
-  try {
-    await fsp.access(absPath);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/** Атомарная запись через tmp + rename — та же гарантия что в ShadowVaultManager */
-async function atomicWrite(absPath: string, data: Buffer): Promise<void> {
-  await fsp.mkdir(nodePath.dirname(absPath), { recursive: true });
-  const tmpPath = absPath + ".sessiontmp";
-  try {
-    await fsp.writeFile(tmpPath, data);
-    await fsp.rename(tmpPath, absPath);
-  } catch (err) {
-    await fsp.unlink(tmpPath).catch(() => undefined);
-    throw err;
-  }
-}

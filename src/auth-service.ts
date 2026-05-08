@@ -73,15 +73,38 @@ export class AuthService {
     }
 
     // ── Повторный запуск: проверяем пароль ────────────────────────────────
-    await engine.deriveKey(password, settings.saltHex!);
+    const verifiedEngine = await AuthService.verifyPassword(password, settings);
+    // Освобождаем "пустой" engine — используем тот, что вернула verifyPassword
+    engine.destroy();
+    return { engine: verifiedEngine, isFirstRun: false };
+  }
 
+  /**
+   * Деривирует ключ и проверяет его корректность через verificationBlob.
+   *
+   * Используется и в обычной аутентификации, и в смене пароля
+   * (чтобы независимо от активной сессии убедиться, что старый пароль верен).
+   *
+   * @returns CryptoEngine с загруженным ключом (вызывающий обязан destroy())
+   * @throws  PasswordError если пароль неверный
+   * @throws  SettingsCorruptedError если verificationBlob отсутствует
+   */
+  static async verifyPassword(
+    password: string,
+    settings: PluginSettings
+  ): Promise<CryptoEngine> {
+    if (settings.saltHex === null) {
+      throw new SettingsCorruptedError("Соль отсутствует — хранилище не инициализировано.");
+    }
     if (!settings.verificationBlob) {
-      // Настройки повреждены — соль есть, а блоб потерян
       throw new SettingsCorruptedError(
         "Файл настроек повреждён: verificationBlob отсутствует. " +
         "Восстановите data.json из резервной копии."
       );
     }
+
+    const engine = new CryptoEngine();
+    await engine.deriveKey(password, settings.saltHex);
 
     try {
       const decrypted = engine.decryptBuffer(
@@ -99,7 +122,7 @@ export class AuthService {
       throw new PasswordError("Неверный пароль.");
     }
 
-    return { engine, isFirstRun: false };
+    return engine;
   }
 }
 

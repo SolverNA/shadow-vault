@@ -10,6 +10,7 @@
 import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type ShadowVaultPlugin from "./main";
 import { ChangePasswordModal } from "./change-password-modal";
+import { ConfirmModal } from "./confirm-modal";
 
 export class ShadowVaultSettingTab extends PluginSettingTab {
   constructor(app: App, private readonly plugin: ShadowVaultPlugin) {
@@ -20,11 +21,11 @@ export class ShadowVaultSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    containerEl.createEl("h2", { text: "ShadowVault — Настройки" });
+    new Setting(containerEl).setName("Shadow Vault").setHeading();
 
     // ── Путь к теневому хранилищу ──────────────────────────────────────
     new Setting(containerEl)
-      .setName("Путь к Теневому хранилищу")
+      .setName("Путь к теневому хранилищу")
       .setDesc(
         "Директория для временных расшифрованных файлов. " +
         "Оставьте пустым для автоматического выбора во временной папке ОС. " +
@@ -54,7 +55,7 @@ export class ShadowVaultSettingTab extends PluginSettingTab {
       });
 
     // ── Опасная зона ───────────────────────────────────────────────────
-    containerEl.createEl("h3", { text: "⚠️ Опасная зона" });
+    new Setting(containerEl).setName("Опасная зона").setHeading();
 
     new Setting(containerEl)
       .setName("Сменить пароль")
@@ -85,14 +86,21 @@ export class ShadowVaultSettingTab extends PluginSettingTab {
         btn
           .setButtonText("Сбросить")
           .setWarning()
-          .onClick(async () => {
-            if (confirm("Вы уверены? Это действие необратимо.")) {
-              this.plugin.settings.saltHex = null;
-              this.plugin.settings.verificationBlob = null;
-              await this.plugin.saveSettings();
-              new Notice("🔑 Конфигурация сброшена. Перезапустите Obsidian.", 5000);
-            }
+          .onClick(() => {
+            new ConfirmModal(
+              this.app,
+              "Вы уверены? Это действие необратимо.",
+              (confirmed) => {
+                if (!confirmed) return;
+                this.plugin.settings.saltHex = null;
+                this.plugin.settings.verificationBlob = null;
+                void this.plugin.saveSettings().then(() => {
+                  new Notice("🔑 Конфигурация сброшена. Перезапустите Obsidian.", 5000);
+                });
+              }
+            ).open();
           });
       });
   }
 }
+
