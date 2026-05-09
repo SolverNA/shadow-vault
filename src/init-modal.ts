@@ -28,6 +28,9 @@ export class InitModal extends Modal {
   // DOM-элементы, сохраняем ссылки для управления состоянием
   private inputPassword!: HTMLInputElement;
   private inputConfirm!: HTMLInputElement | null;
+  private inputSalt: HTMLInputElement | null = null;
+  private saltCheckbox: HTMLInputElement | null = null;
+  private saltContainer: HTMLElement | null = null;
   private btnSubmit!: HTMLButtonElement;
   private errorEl!: HTMLElement;
   private loadingEl!: HTMLElement;
@@ -40,6 +43,8 @@ export class InitModal extends Modal {
    * Без оригинального saltHex расшифровать данные невозможно.
    */
   private orphanEncryptedVault: boolean;
+  /** Абсолютный путь к любому .enc файлу из оригинала — для верификации соли */
+  private verifyEncFileAbs?: string;
   /** Разрешить закрытие только после успешного ввода пароля */
   private allowClose = false;
 
@@ -48,7 +53,8 @@ export class InitModal extends Modal {
     settings: PluginSettings,
     saveFn: SaveSettingsFn,
     onUnlock: UnlockCallback,
-    orphanEncryptedVault = false
+    orphanEncryptedVault = false,
+    verifyEncFileAbs?: string
   ) {
     super(app);
     this.settings = settings;
@@ -57,6 +63,7 @@ export class InitModal extends Modal {
     this.authService = new AuthService();
     this.isFirstRun = settings.saltHex === null;
     this.orphanEncryptedVault = orphanEncryptedVault;
+    this.verifyEncFileAbs = verifyEncFileAbs;
   }
 
   onOpen(): void {
@@ -123,6 +130,43 @@ export class InitModal extends Modal {
       this.inputConfirm = null;
     }
 
+    // ── Опциональный ввод соли (восстановление / orphan vault) ──────────
+    // Показывается если: orphan-vault обнаружен ИЛИ settings.allowSaltInput=true.
+    // На первом запуске не показывается — соль ещё генерируется автоматически.
+    const showSaltOption =
+      !this.isFirstRun && (this.orphanEncryptedVault || this.settings.allowSaltInput);
+    if (showSaltOption) {
+      const saltGroup = form.createEl("div", { cls: "shadow-vault-salt-group" });
+      const checkboxLabel = saltGroup.createEl("label", { cls: "shadow-vault-checkbox-label" });
+      this.saltCheckbox = checkboxLabel.createEl("input", { type: "checkbox" });
+      // Для orphan-vault сразу включаем — без соли разблокировка невозможна
+      if (this.orphanEncryptedVault) this.saltCheckbox.checked = true;
+      checkboxLabel.createEl("span", { text: " Ввести соль вручную" });
+
+      this.saltContainer = saltGroup.createEl("div", { cls: "shadow-vault-salt-container" });
+      this.saltContainer.createEl("label", {
+        cls: "shadow-vault-salt-hint",
+        text: "Hex-строка из data.json (поле saltHex). Без правильной соли восстановление невозможно.",
+      });
+      this.inputSalt = this.saltContainer.createEl("input", {
+        cls: "shadow-vault-salt-input",
+        type: "text",
+        placeholder: "abcdef0123456789…",
+      });
+      this.inputSalt.spellcheck = false;
+      this.inputSalt.autocapitalize = "off";
+
+      const updateVisibility = () => {
+        if (this.saltCheckbox?.checked) {
+          this.saltContainer?.removeClass("sv-hidden");
+        } else {
+          this.saltContainer?.addClass("sv-hidden");
+        }
+      };
+      this.saltCheckbox.addEventListener("change", updateVisibility);
+      updateVisibility();
+    }
+
     // Блок ошибки (скрыт по умолчанию)
     this.errorEl = form.createEl("div", { cls: "shadow-vault-error sv-hidden" });
 
@@ -187,18 +231,38 @@ export class InitModal extends Modal {
       }
     }
 
+    // Опциональный ручной ввод соли (восстановление)
+    let manualSaltHex: string | undefined;
+    if (this.saltCheckbox?.checked) {
+      manualSaltHex = (this.inputSalt?.value ?? "").trim();
+      if (!manualSaltHex) {
+        this.showError("Соль не может быть пустой при включённой опции.");
+        this.inputSalt?.focus();
+        return;
+      }
+    } else if (this.orphanEncryptedVault) {
+      // Orphan vault без введённой соли — нечего расшифровать
+      this.showError(
+        "Хранилище зашифровано, нужно ввести соль из бэкапа. " +
+        "Включите опцию «Ввести соль вручную» внизу формы."
+      );
+      return;
+    }
+
     this.setLoading(true);
 
     try {
       const result = await this.authService.authenticate(
         password,
         this.settings,
-        this.saveFn
+        this.saveFn,
+        { manualSaltHex, verifyEncFileAbs: this.verifyEncFileAbs }
       );
 
       // Очищаем поля из памяти DOM как можно раньше
       this.inputPassword.value = "";
       if (this.inputConfirm) this.inputConfirm.value = "";
+      if (this.inputSalt) this.inputSalt.value = "";
 
       this.allowClose = true;
       this.close();

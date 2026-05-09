@@ -25,12 +25,23 @@ export interface PluginSettings {
    * Теневое хранилище НЕ находится внутри оригинального vault — это отдельная директория рядом.
    */
   shadowVaultPath: string;
+
+  /**
+   * Разрешить ввод соли вручную при разблокировке.
+   * Если false — InitModal показывает только поле пароля (стандартный flow).
+   * Если true — внизу появляется чекбокс "Ввести соль" с полем ввода;
+   *   полезно для проверки сохранённой соли и для восстановления хранилища
+   *   на новой машине, где data.json утерян (в этом случае поле появляется
+   *   автоматически, независимо от настройки).
+   */
+  allowSaltInput: boolean;
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
   saltHex: null,
   verificationBlob: null,
   shadowVaultPath: "",
+  allowSaltInput: false,
 };
 
 /**

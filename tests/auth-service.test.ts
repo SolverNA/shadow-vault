@@ -189,3 +189,116 @@ describe("AuthService — сквозные сценарии", () => {
     expect(dec.toString("utf8")).toBe("Секретная заметка");
   });
 });
+
+// ─────────────────────────────────────────────
+// Восстановление по ручной соли (orphan vault)
+// ─────────────────────────────────────────────
+
+describe("AuthService — восстановление по ручной соли", () => {
+  it("успешно восстанавливает orphan vault при правильной соли + пароле", async () => {
+    // ── Шаг 1: создаём хранилище и шифруем тестовый файл ─────────────
+    const svc = new AuthService();
+    const { fn, lastSaved } = makeSaveFn();
+    const { engine } = await svc.authenticate("test-pwd", DEFAULT_SETTINGS, fn);
+    const realSalt = lastSaved()!.saltHex!;
+    const enc = engine.encryptBuffer(Buffer.from("data"));
+    engine.destroy();
+
+    // Сохраняем .enc на диск для верификации
+    const fs = require("fs");
+    const os = require("os");
+    const nodePath = require("path");
+    const tmpDir = fs.mkdtempSync(nodePath.join(os.tmpdir(), "sv-auth-"));
+    const encPath = nodePath.join(tmpDir, "verify.enc");
+    fs.writeFileSync(encPath, enc);
+
+    try {
+      // ── Шаг 2: симулируем потерю data.json — orphan settings ─────────
+      const orphanSettings: PluginSettings = { ...DEFAULT_SETTINGS };
+      const { fn: saveFn2, lastSaved: ls2 } = makeSaveFn();
+
+      // ── Шаг 3: восстановление с ручной солью ─────────────────────────
+      const result = await svc.authenticate("test-pwd", orphanSettings, saveFn2, {
+        manualSaltHex: realSalt,
+        verifyEncFileAbs: encPath,
+      });
+
+      expect(result.engine.isUnlocked()).toBe(true);
+      expect(result.isFirstRun).toBe(false);
+
+      // settings обновились — соль и verificationBlob сохранены
+      const saved = ls2()!;
+      expect(saved.saltHex).toBe(realSalt);
+      expect(saved.verificationBlob).toBeTruthy();
+
+      // Восстановленный engine может расшифровать оригинальный .enc
+      const dec = result.engine.decryptBuffer(enc);
+      expect(dec.toString("utf8")).toBe("data");
+      result.engine.destroy();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("отклоняет неверную соль с PasswordError", async () => {
+    const svc = new AuthService();
+    const fakeOrphan: PluginSettings = { ...DEFAULT_SETTINGS };
+    const fakeEnc = Buffer.from("a".repeat(60), "hex"); // не валидный .enc
+
+    const fs = require("fs");
+    const os = require("os");
+    const nodePath = require("path");
+    const tmpDir = fs.mkdtempSync(nodePath.join(os.tmpdir(), "sv-auth-"));
+    const encPath = nodePath.join(tmpDir, "fake.enc");
+    fs.writeFileSync(encPath, fakeEnc);
+
+    try {
+      const wrongSalt = "00".repeat(32);
+      await expect(
+        svc.authenticate("any-pwd", fakeOrphan, async () => {}, {
+          manualSaltHex: wrongSalt,
+          verifyEncFileAbs: encPath,
+        })
+      ).rejects.toThrow(PasswordError);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("отклоняет невалидный hex (не цифры/a-f, нечётная длина)", async () => {
+    const svc = new AuthService();
+    const settings: PluginSettings = { ...DEFAULT_SETTINGS };
+
+    await expect(
+      svc.authenticate("pwd", settings, async () => {}, { manualSaltHex: "xyz123" })
+    ).rejects.toThrow(/hex-строкой/);
+
+    await expect(
+      svc.authenticate("pwd", settings, async () => {}, { manualSaltHex: "abc" })
+    ).rejects.toThrow(/hex-строкой/);
+  });
+
+  it("в обычном flow с verificationBlob сверяет ручную соль через blob", async () => {
+    // Создаём настоящие settings с verificationBlob
+    const svc = new AuthService();
+    const { fn, lastSaved } = makeSaveFn();
+    const { engine } = await svc.authenticate("real-pwd", DEFAULT_SETTINGS, fn);
+    engine.destroy();
+
+    const settings = lastSaved()!;
+    const realSalt = settings.saltHex!;
+
+    // Восстановление с ручной солью + правильным паролем — должно пройти через verificationBlob
+    const { fn: fn2 } = makeSaveFn();
+    const result = await svc.authenticate("real-pwd", settings, fn2, {
+      manualSaltHex: realSalt,
+    });
+    expect(result.engine.isUnlocked()).toBe(true);
+    result.engine.destroy();
+
+    // Неверный пароль с правильной солью — отклоняется
+    await expect(
+      svc.authenticate("wrong-pwd", settings, async () => {}, { manualSaltHex: realSalt })
+    ).rejects.toThrow(PasswordError);
+  });
+});

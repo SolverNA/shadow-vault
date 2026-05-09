@@ -195,13 +195,44 @@ export default class ShadowVaultPlugin extends Plugin {
     if (orphan) {
       console.warn("[ShadowVault] orphan encrypted vault detected: .enc файлы есть, saltHex отсутствует");
     }
+
+    // Любой существующий .enc файл — для верификации соли при ручном вводе.
+    // Берём первый попавшийся, без полного скана (BFS глубиной 3).
+    const verifyEnc = this.findAnyEncFile();
+
     new InitModal(
       this.app,
       this.settings,
       (s) => this.saveSettings(s),
       (result) => { void this.onUnlock(result); },
-      orphan
+      orphan,
+      verifyEnc
     ).open();
+  }
+
+  /** Возвращает абсолютный путь к любому .enc файлу из корня vault, либо undefined */
+  private findAnyEncFile(): string | undefined {
+    const basePath = this.getVaultBasePath();
+    if (!basePath) return undefined;
+    return this.findEncInDir(basePath, 3);
+  }
+
+  private findEncInDir(absDir: string, depth: number): string | undefined {
+    if (depth < 0) return undefined;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(absDir, { withFileTypes: true });
+    } catch { return undefined; }
+    for (const e of entries) {
+      if (e.name.startsWith(".")) continue;
+      const sub = nodePath.join(absDir, e.name);
+      if (e.isFile() && e.name.endsWith(ENCRYPTED_EXT)) return sub;
+      if (e.isDirectory()) {
+        const found = this.findEncInDir(sub, depth - 1);
+        if (found) return found;
+      }
+    }
+    return undefined;
   }
 
   /**

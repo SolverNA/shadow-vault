@@ -23,6 +23,63 @@ export class ShadowVaultSettingTab extends PluginSettingTab {
 
     new Setting(containerEl).setName("Shadow Vault").setHeading();
 
+    // ── Разрешить ввод соли при разблокировке ─────────────────────────
+    new Setting(containerEl)
+      .setName("Разрешить ввод соли при разблокировке")
+      .setDesc(
+        "В модалке пароля появится чекбокс «Ввести соль вручную» с полем для соли. " +
+        "Полезно для проверки сохранённой соли и для восстановления хранилища " +
+        "на новой машине, где data.json утерян."
+      )
+      .addToggle((toggle) => {
+        toggle
+          .setValue(this.plugin.settings.allowSaltInput)
+          .onChange(async (value) => {
+            this.plugin.settings.allowSaltInput = value;
+            await this.plugin.saveSettings();
+          });
+      });
+
+    // ── Соль (показать / копировать) ──────────────────────────────────
+    if (this.plugin.settings.saltHex) {
+      const saltSetting = new Setting(containerEl)
+        .setName("Соль шифрования (saltHex)")
+        .setDesc(
+          "Сохраните в надёжном месте — потребуется для восстановления, " +
+          "если data.json будет утерян. Без этой соли расшифровать ваше " +
+          "хранилище НЕВОЗМОЖНО даже с правильным паролем."
+        );
+
+      const saltContainer = saltSetting.controlEl.createEl("div", {
+        cls: "shadow-vault-salt-control",
+      });
+      saltContainer.style.display = "flex";
+      saltContainer.style.gap = "6px";
+      saltContainer.style.alignItems = "center";
+      saltContainer.style.width = "100%";
+
+      const saltDisplay = saltContainer.createEl("code", {
+        cls: "shadow-vault-salt-display sv-blurred",
+        text: this.plugin.settings.saltHex,
+      });
+
+      let revealed = false;
+      const eyeBtn = saltContainer.createEl("button", { text: "👁️" });
+      eyeBtn.setAttribute("aria-label", "Показать/скрыть");
+      eyeBtn.addEventListener("click", () => {
+        revealed = !revealed;
+        if (revealed) saltDisplay.removeClass("sv-blurred");
+        else saltDisplay.addClass("sv-blurred");
+      });
+
+      const copyBtn = saltContainer.createEl("button", { text: "📋" });
+      copyBtn.setAttribute("aria-label", "Скопировать");
+      copyBtn.addEventListener("click", () => {
+        void navigator.clipboard.writeText(this.plugin.settings.saltHex ?? "");
+        new Notice("Соль скопирована в буфер обмена.", 2500);
+      });
+    }
+
     // ── Путь к теневому хранилищу ──────────────────────────────────────
     new Setting(containerEl)
       .setName("Путь к теневому хранилищу")
