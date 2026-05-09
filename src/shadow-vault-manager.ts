@@ -760,7 +760,7 @@ export class ShadowVaultManager {
    *   Фаза 2 — переименовываем .enc.new → .enc (атомарно, по одному).
    *            После успешного переименования всех файлов оригинал заменён новым.
    *
-   * Настройки (saltHex, verificationBlob) обновляются снаружи ПОСЛЕ успеха.
+   * Настройки (verificationBlob) обновляются снаружи ПОСЛЕ успеха.
    */
   async reEncryptAll(
     newEngine: CryptoEngine,

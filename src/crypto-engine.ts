@@ -12,6 +12,12 @@
  * ВАЖНО: IV генерируется случайно для каждой операции записи.
  * Повторное использование IV с одним ключом в GCM-режиме катастрофически
  * нарушает конфиденциальность — это не допускается нигде в коде.
+ *
+ * Соли НЕТ: ключ деривируется только из пароля + фиксированной доменной
+ * константы. Это означает: одинаковый пароль всегда даёт одинаковый ключ.
+ * Доменная константа защищает от переиспользования ключа в других приложениях,
+ * использующих PBKDF2 от того же пароля. Восстановление возможно только по паролю,
+ * никаких бэкапов соли не нужно.
  */
 
 import * as crypto from "crypto";
@@ -26,14 +32,17 @@ const KEY_LENGTH = 32;        // байт = 256 бит
 /** Параметры PBKDF2 — итерации выбраны для баланса безопасность/скорость (≈300 мс на типичном CPU) */
 const PBKDF2_ITERATIONS = 310_000;
 const PBKDF2_DIGEST = "sha512";
-const SALT_LENGTH = 32;       // байт
 
-export interface DerivedKey {
-  /** CryptoKey в виде буфера — хранить только в закрытом поле класса, не экспортировать в window */
-  keyBuffer: Buffer;
-  /** Соль хранится открыто в data.json хранилища */
-  salt: Buffer;
-}
+/**
+ * Фиксированная доменная константа для PBKDF2.
+ * Не секрет, не уникальна на vault — служит только для отделения ключей
+ * ShadowVault от любых других приложений, которые могли бы дерировать
+ * ключ из того же пароля.
+ *
+ * НЕ МЕНЯТЬ без миграции — изменение константы сделает все существующие
+ * .enc файлы нерасшифровываемыми.
+ */
+const PBKDF2_DOMAIN = Buffer.from("shadow-vault:v1", "utf8");
 
 export class CryptoEngine {
   /** Приватный буфер ключа — обнуляется при вызове destroy() */
@@ -44,23 +53,18 @@ export class CryptoEngine {
   // ─────────────────────────────────────────────
 
   /**
-   * Деривирует ключ AES-256 из пароля и соли через PBKDF2.
-   * Если соль не передана — генерируется новая (первый запуск хранилища).
+   * Деривирует ключ AES-256 из пароля через PBKDF2.
+   * Соль не используется: вход PBKDF2 — только пароль и фиксированная
+   * доменная константа PBKDF2_DOMAIN.
    *
-   * @param password  Пароль пользователя в открытом виде
-   * @param saltHex   Соль в hex-формате из data.json (undefined при первом запуске)
-   * @returns         Hex-строка соли для сохранения в data.json
+   * @param password Пароль пользователя в открытом виде
    */
-  async deriveKey(password: string, saltHex?: string): Promise<string> {
-    const salt = saltHex
-      ? Buffer.from(saltHex, "hex")
-      : crypto.randomBytes(SALT_LENGTH);
-
+  async deriveKey(password: string): Promise<void> {
     // PBKDF2 запускается асинхронно, чтобы не блокировать UI-поток Obsidian
     const keyBuffer = await new Promise<Buffer>((resolve, reject) => {
       crypto.pbkdf2(
         password,
-        salt,
+        PBKDF2_DOMAIN,
         PBKDF2_ITERATIONS,
         KEY_LENGTH,
         PBKDF2_DIGEST,
@@ -72,7 +76,6 @@ export class CryptoEngine {
     });
 
     this.keyBuffer = keyBuffer;
-    return salt.toString("hex");
   }
 
   /**
@@ -259,14 +262,6 @@ export class CryptoEngine {
       await new Promise<void>((res) => fs.unlink(tmpPath, () => res()));
       throw err;
     }
-  }
-
-  /**
-   * Генерирует случайную соль для нового хранилища.
-   * Вызывается один раз при первой инициализации — результат сохраняется в data.json.
-   */
-  static generateSalt(): string {
-    return crypto.randomBytes(SALT_LENGTH).toString("hex");
   }
 
   /**

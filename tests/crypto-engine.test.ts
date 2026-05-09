@@ -2,12 +2,16 @@
  * Юнит-тесты для CryptoEngine.
  * Покрывают: деривацию ключа, шифрование/расшифровку буферов,
  * потоковое шифрование/расшифровку, обнуление ключа, граничные случаи.
+ *
+ * Соль не используется: ключ деривируется только из пароля и фиксированной
+ * доменной константы внутри CryptoEngine.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "@jest/globals";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import * as nodeCrypto from "crypto";
 import { CryptoEngine } from "../src/crypto-engine";
 
 // ─────────────────────────────────────────────
@@ -38,28 +42,17 @@ describe("CryptoEngine — deriveKey()", () => {
     engine.destroy();
   });
 
-  it("должен возвращать hex-строку соли", async () => {
-    const engine = new CryptoEngine();
-    const saltHex = await engine.deriveKey("my-password");
-
-    // Соль 32 байта = 64 hex-символа
-    expect(typeof saltHex).toBe("string");
-    expect(saltHex).toHaveLength(64);
-    expect(/^[0-9a-f]+$/.test(saltHex)).toBe(true);
-
-    engine.destroy();
-  });
-
-  it("одинаковый пароль + одна соль = одинаковый ключ (детерминированность)", async () => {
+  it("одинаковый пароль → одинаковый ключ (детерминированность без соли)", async () => {
     const engine1 = new CryptoEngine();
-    const saltHex = await engine1.deriveKey("same-password");
+    await engine1.deriveKey("same-password");
     const plaintext = Buffer.from("hello world");
     const enc1 = engine1.encryptBuffer(plaintext);
     engine1.destroy();
 
-    // Второй движок с той же солью должен расшифровать данные первого
+    // Второй движок с тем же паролем должен расшифровать данные первого —
+    // соль не нужна, ключ детерминирован
     const engine2 = new CryptoEngine();
-    await engine2.deriveKey("same-password", saltHex);
+    await engine2.deriveKey("same-password");
     const dec = engine2.decryptBuffer(enc1);
     expect(dec.toString()).toBe("hello world");
     engine2.destroy();
@@ -67,12 +60,12 @@ describe("CryptoEngine — deriveKey()", () => {
 
   it("разные пароли → невозможность расшифровки (неверный ключ)", async () => {
     const engine1 = new CryptoEngine();
-    const saltHex = await engine1.deriveKey("password-A");
+    await engine1.deriveKey("password-A");
     const enc = engine1.encryptBuffer(Buffer.from("secret data"));
     engine1.destroy();
 
     const engine2 = new CryptoEngine();
-    await engine2.deriveKey("password-B", saltHex);
+    await engine2.deriveKey("password-B");
     expect(() => engine2.decryptBuffer(enc)).toThrow(
       /Расшифровка не удалась/
     );
@@ -270,6 +263,3 @@ describe("CryptoEngine — destroy()", () => {
     expect(() => engine.destroy()).not.toThrow();
   });
 });
-
-// Node.js crypto для генерации случайных данных в тестах (без лимита 65 КБ)
-import * as nodeCrypto from "crypto";

@@ -148,7 +148,7 @@ export default class ShadowVaultPlugin extends Plugin {
 
     // 2. Создаём движок с новым паролем
     const newEngine = new CryptoEngine();
-    const newSaltHex = await newEngine.deriveKey(newPassword);
+    await newEngine.deriveKey(newPassword);
 
     // 3. Пере-шифруем все файлы (двухфазно, атомарно)
     try {
@@ -164,7 +164,6 @@ export default class ShadowVaultPlugin extends Plugin {
     );
     await this.saveSettings({
       ...this.settings,
-      saltHex: newSaltHex,
       verificationBlob: newVerificationBuf.toString("hex"),
     });
 
@@ -188,83 +187,12 @@ export default class ShadowVaultPlugin extends Plugin {
   // ═══════════════════════════════════════════════════════════════════════
 
   private openInitModal(): void {
-    // Детекция: settings.saltHex пустой (первый запуск с точки зрения плагина),
-    // но в оригинале уже есть .enc файлы — значит data.json утерян и расшифровать
-    // существующее не получится. Сразу предупреждаем пользователя.
-    const orphan = this.settings.saltHex === null && this.detectOrphanEncryptedVault();
-    if (orphan) {
-      console.warn("[ShadowVault] orphan encrypted vault detected: .enc файлы есть, saltHex отсутствует");
-    }
-
-    // Любой существующий .enc файл — для верификации соли при ручном вводе.
-    // Берём первый попавшийся, без полного скана (BFS глубиной 3).
-    const verifyEnc = this.findAnyEncFile();
-
     new InitModal(
       this.app,
       this.settings,
       (s) => this.saveSettings(s),
-      (result) => { void this.onUnlock(result); },
-      orphan,
-      verifyEnc
+      (result) => { void this.onUnlock(result); }
     ).open();
-  }
-
-  /** Возвращает абсолютный путь к любому .enc файлу из корня vault, либо undefined */
-  private findAnyEncFile(): string | undefined {
-    const basePath = this.getVaultBasePath();
-    if (!basePath) return undefined;
-    return this.findEncInDir(basePath, 3);
-  }
-
-  private findEncInDir(absDir: string, depth: number): string | undefined {
-    if (depth < 0) return undefined;
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(absDir, { withFileTypes: true });
-    } catch { return undefined; }
-    for (const e of entries) {
-      if (e.name.startsWith(".")) continue;
-      const sub = nodePath.join(absDir, e.name);
-      if (e.isFile() && e.name.endsWith(ENCRYPTED_EXT)) return sub;
-      if (e.isDirectory()) {
-        const found = this.findEncInDir(sub, depth - 1);
-        if (found) return found;
-      }
-    }
-    return undefined;
-  }
-
-  /**
-   * Синхронно сканирует корень оригинального vault на наличие .enc файлов.
-   * Используется для детекции "orphan encrypted vault" — когда .enc на диске
-   * есть, но data.json с saltHex отсутствует (например, скопировали vault
-   * между машинами без папки плагина).
-   */
-  private detectOrphanEncryptedVault(): boolean {
-    const basePath = this.getVaultBasePath();
-    if (!basePath) return false;
-    try {
-      return this.scanDirForEnc(basePath, 3); // глубина 3 уровня — для скорости
-    } catch {
-      return false;
-    }
-  }
-
-  private scanDirForEnc(absDir: string, depth: number): boolean {
-    if (depth < 0) return false;
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(absDir, { withFileTypes: true });
-    } catch { return false; }
-    for (const e of entries) {
-      if (e.name.startsWith(".")) continue;
-      if (e.isFile() && e.name.endsWith(ENCRYPTED_EXT)) return true;
-      if (e.isDirectory() && this.scanDirForEnc(nodePath.join(absDir, e.name), depth - 1)) {
-        return true;
-      }
-    }
-    return false;
   }
 
   /**

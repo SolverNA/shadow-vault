@@ -1,6 +1,9 @@
 /**
  * Юнит-тесты для AuthService.
  * Obsidian API не нужен — тестируем чистую логику аутентификации.
+ *
+ * Соль не используется: ключ деривируется только из пароля.
+ * Признак инициализированности хранилища — наличие verificationBlob.
  */
 
 import { describe, it, expect, jest } from "@jest/globals";
@@ -27,10 +30,10 @@ function makeSaveFn(): {
 // Первый запуск
 // ─────────────────────────────────────────────
 
-describe("AuthService — первый запуск (saltHex === null)", () => {
+describe("AuthService — первый запуск (verificationBlob === null)", () => {
   it("успешно инициализирует хранилище и возвращает разблокированный engine", async () => {
     const svc = new AuthService();
-    const { fn, lastSaved } = makeSaveFn();
+    const { fn } = makeSaveFn();
 
     const result = await svc.authenticate("my-secure-password", DEFAULT_SETTINGS, fn);
 
@@ -39,7 +42,7 @@ describe("AuthService — первый запуск (saltHex === null)", () => {
     result.engine.destroy();
   });
 
-  it("сохраняет saltHex и verificationBlob в settings", async () => {
+  it("сохраняет verificationBlob в settings", async () => {
     const svc = new AuthService();
     const { fn, lastSaved } = makeSaveFn();
 
@@ -47,12 +50,13 @@ describe("AuthService — первый запуск (saltHex === null)", () => {
 
     expect(fn).toHaveBeenCalledTimes(1);
     const saved = lastSaved()!;
-    expect(saved.saltHex).toBeTruthy();
-    expect(saved.saltHex).toHaveLength(64); // 32 байта → 64 hex
     expect(saved.verificationBlob).toBeTruthy();
+    // verificationBlob — hex-строка зашифрованного маркера длиной минимум 56 символов
+    // (12 байт IV + 16 байт authTag + ≥0 байт ciphertext, всё в hex = ×2)
+    expect(saved.verificationBlob!.length).toBeGreaterThanOrEqual(56);
   });
 
-  it("разные запуски с одним паролем → разные соли (случайная соль)", async () => {
+  it("разные запуски с одним паролем → разные verificationBlob (случайный IV)", async () => {
     const svc = new AuthService();
     const { fn: fn1, lastSaved: ls1 } = makeSaveFn();
     const { fn: fn2, lastSaved: ls2 } = makeSaveFn();
@@ -60,7 +64,26 @@ describe("AuthService — первый запуск (saltHex === null)", () => {
     await svc.authenticate("password", DEFAULT_SETTINGS, fn1);
     await svc.authenticate("password", DEFAULT_SETTINGS, fn2);
 
-    expect(ls1()!.saltHex).not.toBe(ls2()!.saltHex);
+    // Ключ одинаковый (соли нет), но IV случайный — blob'ы должны различаться
+    expect(ls1()!.verificationBlob).not.toBe(ls2()!.verificationBlob);
+  });
+
+  it("одинаковый пароль → одинаковый ключ (детерминированность без соли)", async () => {
+    const svc = new AuthService();
+    const { fn: fn1, lastSaved: ls1 } = makeSaveFn();
+
+    // Первый запуск создаёт хранилище
+    const r1 = await svc.authenticate("same-password", DEFAULT_SETTINGS, fn1);
+    const enc = r1.engine.encryptBuffer(Buffer.from("test data"));
+    r1.engine.destroy();
+
+    // Второй "первый запуск" с тем же паролем — engine с тем же ключом
+    // должен расшифровать данные первого
+    const { fn: fn2 } = makeSaveFn();
+    const r2 = await svc.authenticate("same-password", DEFAULT_SETTINGS, fn2);
+    const dec = r2.engine.decryptBuffer(enc);
+    expect(dec.toString("utf8")).toBe("test data");
+    r2.engine.destroy();
   });
 
   it("бросает PasswordError при пустом пароле", async () => {
@@ -136,15 +159,13 @@ describe("AuthService — повторный вход", () => {
     result.engine.destroy();
   });
 
-  it("бросает SettingsCorruptedError если verificationBlob отсутствует", async () => {
-    const savedSettings = await initVault("password");
-    const corruptedSettings: PluginSettings = { ...savedSettings, verificationBlob: null };
-
-    const svc = new AuthService();
-    const { fn } = makeSaveFn();
+  it("бросает SettingsCorruptedError если verificationBlob отсутствует но это не первый запуск", async () => {
+    // Симулируем повреждённые настройки: блоб null, но мы вызываем verifyPassword напрямую
+    // (это путь ChangePassword — не должен молча создавать новое хранилище)
+    const corruptedSettings: PluginSettings = { ...DEFAULT_SETTINGS, verificationBlob: null };
 
     await expect(
-      svc.authenticate("password", corruptedSettings, fn)
+      AuthService.verifyPassword("password", corruptedSettings)
     ).rejects.toThrow(SettingsCorruptedError);
   });
 
@@ -166,7 +187,7 @@ describe("AuthService — повторный вход", () => {
 });
 
 // ─────────────────────────────────────────────
-// Сквозной сценарий: создание → повторный вход → смена пароля
+// Сквозной сценарий: создание → повторный вход
 // ─────────────────────────────────────────────
 
 describe("AuthService — сквозные сценарии", () => {
@@ -188,117 +209,31 @@ describe("AuthService — сквозные сценарии", () => {
 
     expect(dec.toString("utf8")).toBe("Секретная заметка");
   });
-});
 
-// ─────────────────────────────────────────────
-// Восстановление по ручной соли (orphan vault)
-// ─────────────────────────────────────────────
+  it("recovery без data.json: тот же пароль на чистых настройках восстанавливает доступ к старым .enc", async () => {
+    // Создаём vault, шифруем данные
+    const svc1 = new AuthService();
+    const { fn: fn1, lastSaved: ls1 } = makeSaveFn();
+    const { engine: engine1 } = await svc1.authenticate("user-password", DEFAULT_SETTINGS, fn1);
+    const enc = engine1.encryptBuffer(Buffer.from("data from old vault"));
+    engine1.destroy();
 
-describe("AuthService — восстановление по ручной соли", () => {
-  it("успешно восстанавливает orphan vault при правильной соли + пароле", async () => {
-    // ── Шаг 1: создаём хранилище и шифруем тестовый файл ─────────────
-    const svc = new AuthService();
-    const { fn, lastSaved } = makeSaveFn();
-    const { engine } = await svc.authenticate("test-pwd", DEFAULT_SETTINGS, fn);
-    const realSalt = lastSaved()!.saltHex!;
-    const enc = engine.encryptBuffer(Buffer.from("data"));
-    engine.destroy();
+    // Сохранённые настройки — храним их рядом для подтверждения, что blob изменился
+    const oldBlob = ls1()!.verificationBlob;
 
-    // Сохраняем .enc на диск для верификации
-    const fs = require("fs");
-    const os = require("os");
-    const nodePath = require("path");
-    const tmpDir = fs.mkdtempSync(nodePath.join(os.tmpdir(), "sv-auth-"));
-    const encPath = nodePath.join(tmpDir, "verify.enc");
-    fs.writeFileSync(encPath, enc);
+    // Симулируем потерю data.json: запускаем "первый запуск" заново
+    const svc2 = new AuthService();
+    const { fn: fn2, lastSaved: ls2 } = makeSaveFn();
+    const { engine: engine2, isFirstRun } = await svc2.authenticate(
+      "user-password", DEFAULT_SETTINGS, fn2
+    );
 
-    try {
-      // ── Шаг 2: симулируем потерю data.json — orphan settings ─────────
-      const orphanSettings: PluginSettings = { ...DEFAULT_SETTINGS };
-      const { fn: saveFn2, lastSaved: ls2 } = makeSaveFn();
+    expect(isFirstRun).toBe(true);
+    // Новый blob — другой (случайный IV), но ключ тот же → старые .enc расшифровываются
+    expect(ls2()!.verificationBlob).not.toBe(oldBlob);
 
-      // ── Шаг 3: восстановление с ручной солью ─────────────────────────
-      const result = await svc.authenticate("test-pwd", orphanSettings, saveFn2, {
-        manualSaltHex: realSalt,
-        verifyEncFileAbs: encPath,
-      });
-
-      expect(result.engine.isUnlocked()).toBe(true);
-      expect(result.isFirstRun).toBe(false);
-
-      // settings обновились — соль и verificationBlob сохранены
-      const saved = ls2()!;
-      expect(saved.saltHex).toBe(realSalt);
-      expect(saved.verificationBlob).toBeTruthy();
-
-      // Восстановленный engine может расшифровать оригинальный .enc
-      const dec = result.engine.decryptBuffer(enc);
-      expect(dec.toString("utf8")).toBe("data");
-      result.engine.destroy();
-    } finally {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-    }
-  });
-
-  it("отклоняет неверную соль с PasswordError", async () => {
-    const svc = new AuthService();
-    const fakeOrphan: PluginSettings = { ...DEFAULT_SETTINGS };
-    const fakeEnc = Buffer.from("a".repeat(60), "hex"); // не валидный .enc
-
-    const fs = require("fs");
-    const os = require("os");
-    const nodePath = require("path");
-    const tmpDir = fs.mkdtempSync(nodePath.join(os.tmpdir(), "sv-auth-"));
-    const encPath = nodePath.join(tmpDir, "fake.enc");
-    fs.writeFileSync(encPath, fakeEnc);
-
-    try {
-      const wrongSalt = "00".repeat(32);
-      await expect(
-        svc.authenticate("any-pwd", fakeOrphan, async () => {}, {
-          manualSaltHex: wrongSalt,
-          verifyEncFileAbs: encPath,
-        })
-      ).rejects.toThrow(PasswordError);
-    } finally {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-    }
-  });
-
-  it("отклоняет невалидный hex (не цифры/a-f, нечётная длина)", async () => {
-    const svc = new AuthService();
-    const settings: PluginSettings = { ...DEFAULT_SETTINGS };
-
-    await expect(
-      svc.authenticate("pwd", settings, async () => {}, { manualSaltHex: "xyz123" })
-    ).rejects.toThrow(/hex-строкой/);
-
-    await expect(
-      svc.authenticate("pwd", settings, async () => {}, { manualSaltHex: "abc" })
-    ).rejects.toThrow(/hex-строкой/);
-  });
-
-  it("в обычном flow с verificationBlob сверяет ручную соль через blob", async () => {
-    // Создаём настоящие settings с verificationBlob
-    const svc = new AuthService();
-    const { fn, lastSaved } = makeSaveFn();
-    const { engine } = await svc.authenticate("real-pwd", DEFAULT_SETTINGS, fn);
-    engine.destroy();
-
-    const settings = lastSaved()!;
-    const realSalt = settings.saltHex!;
-
-    // Восстановление с ручной солью + правильным паролем — должно пройти через verificationBlob
-    const { fn: fn2 } = makeSaveFn();
-    const result = await svc.authenticate("real-pwd", settings, fn2, {
-      manualSaltHex: realSalt,
-    });
-    expect(result.engine.isUnlocked()).toBe(true);
-    result.engine.destroy();
-
-    // Неверный пароль с правильной солью — отклоняется
-    await expect(
-      svc.authenticate("wrong-pwd", settings, async () => {}, { manualSaltHex: realSalt })
-    ).rejects.toThrow(PasswordError);
+    const dec = engine2.decryptBuffer(enc);
+    expect(dec.toString("utf8")).toBe("data from old vault");
+    engine2.destroy();
   });
 });

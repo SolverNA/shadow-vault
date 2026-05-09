@@ -27,7 +27,7 @@ On disk (original vault):          Obsidian sees (shadow vault):
 [ IV (12 bytes) ][ Auth Tag (16 bytes) ][ Ciphertext ]
 ```
 
-Key derivation: PBKDF2-SHA512, 310 000 iterations, 256-bit key, random 32-byte salt stored in `data.json`.
+Key derivation: PBKDF2-SHA512, 310 000 iterations, 256-bit key. The PBKDF2 input is a fixed application-domain constant (`shadow-vault:v1`) — no per-vault salt is stored. This makes vaults recoverable from the password alone, with no `data.json` backup required.
 
 ---
 
