@@ -196,3 +196,37 @@
   color: var(--text-normal);
 }
 
+/* ── Экран выбора (orphan vault) ───────────────────────────────────── */
+
+.shadow-vault-choice {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.sv-btn-secondary {
+  background: var(--background-modifier-form-field);
+  color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border);
+}
+
+.sv-btn-secondary:hover {
+  background: var(--background-modifier-hover);
+}
+
+.sv-btn-back {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 0.85em;
+  cursor: pointer;
+  text-align: left;
+  padding: 4px 0;
+  margin-top: -4px;
+  width: auto;
+}
+
+.sv-btn-back:hover {
+  color: var(--text-normal);
+}
+

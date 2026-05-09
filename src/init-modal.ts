@@ -4,12 +4,16 @@
  * Блокирует загрузку рабочей области Obsidian до успешного ввода пароля.
  * Закрыть окно без ввода пароля нельзя: клик вне окна и Escape перехватываются.
  *
- * UI-поведение:
- *   - Первый запуск: заголовок "Создать хранилище", поле "Подтвердить пароль"
- *   - Повторный вход: заголовок "Разблокировать хранилище"
- *   - Индикатор загрузки во время ~300 мс деривации ключа
- *   - Кнопка показа/скрытия пароля
- *   - Отображение ошибки без закрытия окна
+ * Экраны:
+ *   - first-run     : обычный первый запуск (пароль + подтверждение)
+ *   - unlock        : обычный повторный вход (только пароль)
+ *   - orphan-choice : .enc найдены, data.json утерян — выбор: восстановить / создать заново
+ *   - orphan-restore: восстановление паролем (одно поле, без подтверждения)
+ *   - orphan-create : создать заново после orphan (стандартная форма с подтверждением)
+ *
+ * Соль не используется. С точки зрения AuthService orphan-restore и orphan-create
+ * идентичны (первый запуск, генерация verificationBlob) — разница только в UX:
+ * восстановление принимает короткий пароль без подтверждения.
  */
 
 import { App, Modal } from "obsidian";
@@ -19,20 +23,25 @@ import { createPasswordField } from "./password-field";
 
 export type UnlockCallback = (result: AuthResult) => void;
 
+type OrphanScreen = "choice" | "restore" | "create";
+
 export class InitModal extends Modal {
   private settings: PluginSettings;
   private saveFn: SaveSettingsFn;
   private onUnlock: UnlockCallback;
   private authService: AuthService;
 
-  // DOM-элементы, сохраняем ссылки для управления состоянием
-  private inputPassword!: HTMLInputElement;
-  private inputConfirm!: HTMLInputElement | null;
-  private btnSubmit!: HTMLButtonElement;
-  private errorEl!: HTMLElement;
-  private loadingEl!: HTMLElement;
+  private orphanVault: boolean;
+  /** Текущий экран (только для orphan-режима) */
+  private orphanScreen: OrphanScreen = "choice";
 
-  private isFirstRun: boolean;
+  // DOM-элементы — устанавливаются в render()
+  private inputPassword: HTMLInputElement | null = null;
+  private inputConfirm: HTMLInputElement | null = null;
+  private btnSubmit: HTMLButtonElement | null = null;
+  private errorEl: HTMLElement | null = null;
+  private loadingEl: HTMLElement | null = null;
+
   /** Разрешить закрытие только после успешного ввода пароля */
   private allowClose = false;
 
@@ -40,101 +49,32 @@ export class InitModal extends Modal {
     app: App,
     settings: PluginSettings,
     saveFn: SaveSettingsFn,
-    onUnlock: UnlockCallback
+    onUnlock: UnlockCallback,
+    orphanVault = false
   ) {
     super(app);
     this.settings = settings;
     this.saveFn = saveFn;
     this.onUnlock = onUnlock;
     this.authService = new AuthService();
-    this.isFirstRun = settings.verificationBlob === null;
+    this.orphanVault = orphanVault;
   }
 
   onOpen(): void {
-    const { contentEl, modalEl } = this;
+    const { modalEl } = this;
 
-    // Запрещаем закрытие по Escape и клику вне окна —
-    // без пароля плагин не может начать работу
     this.scope.register([], "Escape", () => {
       this.showError("Введите пароль для продолжения.");
       return false;
     });
 
     modalEl.addClass("shadow-vault-modal");
-    contentEl.empty();
-
-    // Убираем нативный крестик закрытия — без пароля закрыть нельзя
     modalEl.querySelectorAll(".modal-close-button").forEach((el) => el.remove());
 
-    // ── Шапка ────────────────────────────────────────────────────────────
-    contentEl.createEl("div", { cls: "shadow-vault-header" }, (header) => {
-      header.createEl("div", { cls: "shadow-vault-icon", text: "🔐" });
-      header.createEl("h2", {
-        cls: "shadow-vault-title",
-        text: this.isFirstRun
-          ? "Создать зашифрованное хранилище"
-          : "Разблокировать хранилище",
-      });
-      header.createEl("p", {
-        cls: "shadow-vault-subtitle",
-        text: this.isFirstRun
-          ? "Придумайте надёжный пароль. Восстановить его будет невозможно."
-          : "Введите пароль для расшифровки хранилища.",
-      });
-    });
-
-    // ── Форма ─────────────────────────────────────────────────────────────
-    const form = contentEl.createEl("div", { cls: "shadow-vault-form" });
-
-    // Поле пароля
-    this.inputPassword = createPasswordField({
-      parent: form,
-      label: "Пароль",
-      placeholder: "Введите пароль…",
-      id: "sv-password",
-    });
-
-    // Поле подтверждения — только при первом запуске
-    if (this.isFirstRun) {
-      this.inputConfirm = createPasswordField({
-        parent: form,
-        label: "Подтвердить пароль",
-        placeholder: "Повторите пароль…",
-        id: "sv-confirm",
-      });
-    } else {
-      this.inputConfirm = null;
-    }
-
-    // Блок ошибки (скрыт по умолчанию)
-    this.errorEl = form.createEl("div", { cls: "shadow-vault-error sv-hidden" });
-
-    // Индикатор загрузки (скрыт по умолчанию)
-    this.loadingEl = form.createEl("div", { cls: "shadow-vault-loading sv-hidden" }, (el) => {
-      el.createEl("span", { cls: "sv-spinner" });
-      el.createEl("span", { text: " Деривация ключа…" });
-    });
-
-    // Кнопка подтверждения
-    this.btnSubmit = form.createEl("button", {
-      cls: "shadow-vault-btn mod-cta",
-      text: this.isFirstRun ? "Создать хранилище" : "Разблокировать",
-    });
-    this.btnSubmit.addEventListener("click", () => { void this.handleSubmit(); });
-
-    // Enter в любом поле → submit
-    this.inputPassword.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") void this.handleSubmit();
-    });
-    this.inputConfirm?.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") void this.handleSubmit();
-    });
-
-    // Фокус на первом поле после открытия
-    setTimeout(() => this.inputPassword.focus(), 50);
+    this.render();
   }
 
-  /** Запрещаем любое закрытие (фон, Esc, внешний вызов) пока пароль не принят */
+  /** Запрещаем любое закрытие пока пароль не принят */
   close(): void {
     if (this.allowClose) super.close();
   }
@@ -144,19 +84,219 @@ export class InitModal extends Modal {
   }
 
   // ─────────────────────────────────────────────
-  // Приватные методы
+  // Rendering
   // ─────────────────────────────────────────────
 
-  /**
-   * Обработчик отправки формы.
-   * Валидирует поля, запускает AuthService, обрабатывает ошибки.
-   */
+  private render(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+
+    // Сброс DOM-refs
+    this.inputPassword = null;
+    this.inputConfirm = null;
+    this.btnSubmit = null;
+    this.errorEl = null;
+    this.loadingEl = null;
+
+    if (this.orphanVault) {
+      if (this.orphanScreen === "choice") {
+        this.renderOrphanChoice(contentEl);
+        return;
+      }
+      if (this.orphanScreen === "restore") {
+        this.renderHeader(contentEl, "🔑", "Восстановить хранилище",
+          "Введите пароль, которым было создано хранилище. Если он верный — старые файлы расшифруются автоматически.");
+        this.renderRestoreForm(contentEl);
+        return;
+      }
+      // orphan-create
+      this.renderHeader(contentEl, "🔐", "Создать новое хранилище",
+        "Существующие .enc файлы останутся на диске, но станут НЕДОСТУПНЫ без старого пароля.");
+      this.renderCreateForm(contentEl);
+      return;
+    }
+
+    if (this.settings.verificationBlob === null) {
+      this.renderHeader(contentEl, "🔐", "Создать зашифрованное хранилище",
+        "Придумайте надёжный пароль. Восстановить его будет невозможно.");
+      this.renderCreateForm(contentEl);
+    } else {
+      this.renderHeader(contentEl, "🔐", "Разблокировать хранилище",
+        "Введите пароль для расшифровки хранилища.");
+      this.renderUnlockForm(contentEl);
+    }
+  }
+
+  private renderHeader(parent: HTMLElement, icon: string, title: string, subtitle: string): void {
+    parent.createEl("div", { cls: "shadow-vault-header" }, (header) => {
+      header.createEl("div", { cls: "shadow-vault-icon", text: icon });
+      header.createEl("h2", { cls: "shadow-vault-title", text: title });
+      header.createEl("p", { cls: "shadow-vault-subtitle", text: subtitle });
+    });
+  }
+
+  /** Дисклеймер с двумя кнопками — orphan vault detected */
+  private renderOrphanChoice(parent: HTMLElement): void {
+    parent.createEl("div", { cls: "shadow-vault-header" }, (header) => {
+      header.createEl("div", { cls: "shadow-vault-icon", text: "⚠️" });
+      header.createEl("h2", {
+        cls: "shadow-vault-title",
+        text: "Хранилище зашифровано, но настройки утеряны",
+      });
+      header.createEl("p", {
+        cls: "shadow-vault-subtitle",
+        text:
+          "В хранилище найдены зашифрованные файлы (.enc), но файл настроек " +
+          "(data.json) отсутствует. Если вы помните пароль — выберите «Восстановить». " +
+          "Если пароль утерян — создайте новое хранилище (старые файлы станут недоступны).",
+      });
+    });
+
+    const choiceEl = parent.createEl("div", { cls: "shadow-vault-choice" });
+
+    const btnRestore = choiceEl.createEl("button", {
+      cls: "shadow-vault-btn mod-cta",
+      text: "Восстановить хранилище",
+    });
+    btnRestore.addEventListener("click", () => {
+      this.orphanScreen = "restore";
+      this.render();
+    });
+
+    const btnCreate = choiceEl.createEl("button", {
+      cls: "shadow-vault-btn sv-btn-secondary",
+      text: "Создать хранилище заново",
+    });
+    btnCreate.addEventListener("click", () => {
+      this.orphanScreen = "create";
+      this.render();
+    });
+  }
+
+  /** Форма восстановления: одно поле пароля, без подтверждения */
+  private renderRestoreForm(parent: HTMLElement): void {
+    const form = parent.createEl("div", { cls: "shadow-vault-form" });
+
+    this.inputPassword = createPasswordField({
+      parent: form,
+      label: "Пароль",
+      placeholder: "Введите пароль хранилища…",
+      id: "sv-password",
+    });
+
+    this.renderSharedControls(form);
+    this.btnSubmit!.textContent = "Восстановить";
+
+    this.inputPassword.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") void this.handleSubmit();
+    });
+
+    const backBtn = form.createEl("button", {
+      cls: "shadow-vault-btn sv-btn-back",
+      text: "← Назад",
+    });
+    backBtn.addEventListener("click", () => {
+      this.orphanScreen = "choice";
+      this.render();
+    });
+
+    setTimeout(() => this.inputPassword?.focus(), 50);
+  }
+
+  /** Форма создания хранилища: пароль + подтверждение */
+  private renderCreateForm(parent: HTMLElement): void {
+    const form = parent.createEl("div", { cls: "shadow-vault-form" });
+
+    this.inputPassword = createPasswordField({
+      parent: form,
+      label: "Пароль",
+      placeholder: "Придумайте надёжный пароль…",
+      id: "sv-password",
+    });
+    this.inputConfirm = createPasswordField({
+      parent: form,
+      label: "Подтвердить пароль",
+      placeholder: "Повторите пароль…",
+      id: "sv-confirm",
+    });
+
+    this.renderSharedControls(form);
+    this.btnSubmit!.textContent = "Создать хранилище";
+
+    this.inputPassword.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") void this.handleSubmit();
+    });
+    this.inputConfirm.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") void this.handleSubmit();
+    });
+
+    // В orphan-create показываем ссылку «Назад»
+    if (this.orphanVault) {
+      const backBtn = form.createEl("button", {
+        cls: "shadow-vault-btn sv-btn-back",
+        text: "← Назад",
+      });
+      backBtn.addEventListener("click", () => {
+        this.orphanScreen = "choice";
+        this.render();
+      });
+    }
+
+    setTimeout(() => this.inputPassword?.focus(), 50);
+  }
+
+  /** Форма разблокировки: только пароль */
+  private renderUnlockForm(parent: HTMLElement): void {
+    const form = parent.createEl("div", { cls: "shadow-vault-form" });
+
+    this.inputPassword = createPasswordField({
+      parent: form,
+      label: "Пароль",
+      placeholder: "Введите пароль…",
+      id: "sv-password",
+    });
+
+    this.renderSharedControls(form);
+    this.btnSubmit!.textContent = "Разблокировать";
+
+    this.inputPassword.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") void this.handleSubmit();
+    });
+
+    setTimeout(() => this.inputPassword?.focus(), 50);
+  }
+
+  /** Общие элементы всех форм: ошибка, загрузка, кнопка submit */
+  private renderSharedControls(form: HTMLElement): void {
+    this.errorEl = form.createEl("div", { cls: "shadow-vault-error sv-hidden" });
+
+    this.loadingEl = form.createEl("div", { cls: "shadow-vault-loading sv-hidden" }, (el) => {
+      el.createEl("span", { cls: "sv-spinner" });
+      el.createEl("span", { text: " Деривация ключа…" });
+    });
+
+    this.btnSubmit = form.createEl("button", {
+      cls: "shadow-vault-btn mod-cta",
+      text: "OK",
+    });
+    this.btnSubmit.addEventListener("click", () => { void this.handleSubmit(); });
+  }
+
+  // ─────────────────────────────────────────────
+  // Обработка отправки
+  // ─────────────────────────────────────────────
+
   private async handleSubmit(): Promise<void> {
+    if (!this.inputPassword || !this.btnSubmit || !this.errorEl) return;
     this.hideError();
     const password = this.inputPassword.value;
 
-    // Валидация при первом запуске: пароли должны совпасть
-    if (this.isFirstRun) {
+    const isCreateMode =
+      (!this.orphanVault && this.settings.verificationBlob === null) ||
+      (this.orphanVault && this.orphanScreen === "create");
+
+    // В create-режиме: пароли должны совпасть, минимум 8 символов
+    if (isCreateMode) {
       const confirm = this.inputConfirm?.value ?? "";
       if (password !== confirm) {
         this.showError("Пароли не совпадают. Проверьте ввод.");
@@ -179,7 +319,6 @@ export class InitModal extends Modal {
         this.saveFn
       );
 
-      // Очищаем поля из памяти DOM как можно раньше
       this.inputPassword.value = "";
       if (this.inputConfirm) this.inputConfirm.value = "";
 
@@ -203,6 +342,7 @@ export class InitModal extends Modal {
   }
 
   private setLoading(active: boolean): void {
+    if (!this.btnSubmit || !this.loadingEl || !this.inputPassword) return;
     this.btnSubmit.disabled = active;
     this.inputPassword.disabled = active;
     if (this.inputConfirm) this.inputConfirm.disabled = active;
@@ -215,11 +355,13 @@ export class InitModal extends Modal {
   }
 
   private showError(message: string): void {
+    if (!this.errorEl) return;
     this.errorEl.setText(message);
     this.errorEl.removeClass("sv-hidden");
   }
 
   private hideError(): void {
+    if (!this.errorEl) return;
     this.errorEl.setText("");
     this.errorEl.addClass("sv-hidden");
   }

@@ -187,12 +187,56 @@ export default class ShadowVaultPlugin extends Plugin {
   // ═══════════════════════════════════════════════════════════════════════
 
   private openInitModal(): void {
+    // Детекция: verificationBlob отсутствует (плагин считает что это первый
+    // запуск), но в оригинале уже лежат .enc файлы. Значит data.json утерян —
+    // нужно предупредить и предложить выбор: восстановить старым паролем или
+    // создать новое хранилище (старые .enc станут недоступны).
+    const orphanVault =
+      this.settings.verificationBlob === null && this.detectEncryptedFiles();
+    if (orphanVault) {
+      console.warn(
+        "[ShadowVault] orphan vault: .enc найдены, verificationBlob отсутствует"
+      );
+    }
+
     new InitModal(
       this.app,
       this.settings,
       (s) => this.saveSettings(s),
-      (result) => { void this.onUnlock(result); }
+      (result) => { void this.onUnlock(result); },
+      orphanVault
     ).open();
+  }
+
+  /**
+   * Синхронно сканирует корень оригинального vault на наличие .enc файлов.
+   * Используется для детекции orphan-vault — когда verificationBlob отсутствует
+   * (плагин думает что это первый запуск), но .enc на диске уже есть.
+   */
+  private detectEncryptedFiles(): boolean {
+    const basePath = this.getVaultBasePath();
+    if (!basePath) return false;
+    try {
+      return this.scanDirForEnc(basePath, 3); // глубина 3 уровня — для скорости
+    } catch {
+      return false;
+    }
+  }
+
+  private scanDirForEnc(absDir: string, depth: number): boolean {
+    if (depth < 0) return false;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(absDir, { withFileTypes: true });
+    } catch { return false; }
+    for (const e of entries) {
+      if (e.name.startsWith(".")) continue;
+      if (e.isFile() && e.name.endsWith(ENCRYPTED_EXT)) return true;
+      if (e.isDirectory() && this.scanDirForEnc(nodePath.join(absDir, e.name), depth - 1)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
