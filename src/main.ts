@@ -70,13 +70,20 @@ export default class ShadowVaultPlugin extends Plugin {
   async onload(): Promise<void> {
     await this.loadSettings();
 
+    // Вкладка настроек появляется всегда, в т.ч. в спящем режиме
+    this.addSettingTab(new ShadowVaultSettingTab(this.app, this));
+
+    // Спящий режим: пользователь отключил шифрование. Плагин не вмешивается
+    // в работу Obsidian — файлы в оригинале plaintext, теневое не монтируем.
+    if (this.settings.encryptionDisabled) {
+      console.info("[ShadowVault] encryption disabled — спящий режим");
+      return;
+    }
+
     // Подменяем adapter.list() ДО того как Obsidian построит индекс файлов.
     // Без этого при первом запуске Obsidian видит только .enc файлы и создаёт пустой индекс.
     // Ранняя подмена только транслирует имена (.enc → .md), ключ шифрования не нужен.
     this.patchListEarly();
-
-    // Вкладка настроек появляется всегда, независимо от состояния блокировки
-    this.addSettingTab(new ShadowVaultSettingTab(this.app, this));
 
     // Команда ручной блокировки — доступна только когда сессия активна
     this.addCommand({
@@ -171,6 +178,72 @@ export default class ShadowVaultPlugin extends Plugin {
 
     // 5. Блокируем — при следующем входе используется новый пароль
     await this.lockVault();
+  }
+
+  /**
+   * Отключает шифрование: все файлы из shadow экспортируются как plaintext
+   * в оригинал, .enc удаляются, плагин переходит в спящий режим.
+   * Требует активной сессии (vault разблокирован).
+   *
+   * После успеха пользователю нужно перезапустить Obsidian (мы делаем
+   * полный shutdown — текущий процесс продолжать с распатченным адаптером
+   * без активного плагина не имеет смысла, проще попросить рестарт).
+   */
+  async disableEncryption(
+    onProgress?: (done: number, total: number, current: string) => void
+  ): Promise<void> {
+    if (!this.sessionActive || !this.shadowManager) {
+      throw new Error("Хранилище не разблокировано.");
+    }
+
+    console.info("[ShadowVault] disableEncryption: старт");
+
+    // 1. Экспорт plaintext в оригинал, удаление .enc
+    const result = await this.shadowManager.exportShadowToOriginal(onProgress);
+    if (result.failed.length > 0) {
+      throw new Error(
+        `Не удалось экспортировать ${result.failed.length} файл(ов). ` +
+        `См. консоль для деталей. Шифрование не отключено.`
+      );
+    }
+
+    // 2. Сохраняем настройки до cleanup адаптера —
+    //    если что-то упадёт ниже, флаг encryptionDisabled уже стоит
+    this.settings.verificationBlob = null;
+    this.settings.encryptionDisabled = true;
+    await this.saveSettings();
+
+    // 3. Снимаем mount/patch адаптера и удаляем shadow
+    this.sessionActive = false;
+    try {
+      const adapter = this.app.vault.adapter as unknown as IDataAdapter;
+      this.shadowManager.unpatch(adapter);
+      this.shadowManager.unmount(adapter);
+      await this.shadowManager.teardownObsidianSymlink();
+    } catch (err) {
+      console.error("[ShadowVault] disableEncryption: cleanup адаптера:", err);
+    } finally {
+      this.shadowManager = null;
+    }
+
+    try {
+      await this.sessionManager?.endSession();
+    } catch (err) {
+      console.error("[ShadowVault] disableEncryption: endSession:", err);
+    } finally {
+      this.sessionManager = null;
+    }
+
+    console.info("[ShadowVault] disableEncryption: готово");
+  }
+
+  /**
+   * Снимает флаг encryptionDisabled и просит перезапустить Obsidian.
+   * Шифрование запустится заново при следующем onload (стандартный first-run).
+   */
+  async enableEncryption(): Promise<void> {
+    this.settings.encryptionDisabled = false;
+    await this.saveSettings();
   }
 
   async loadSettings(): Promise<void> {

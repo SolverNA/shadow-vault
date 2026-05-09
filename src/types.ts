@@ -22,11 +22,20 @@ export interface PluginSettings {
    * Теневое хранилище НЕ находится внутри оригинального vault — это отдельная директория рядом.
    */
   shadowVaultPath: string;
+
+  /**
+   * true — шифрование отключено пользователем через настройки.
+   * Плагин в спящем режиме: пароль не запрашивается, теневое хранилище не
+   * монтируется, файлы остаются открытым текстом в оригинале. Снять флаг
+   * можно через кнопку «Зашифровать хранилище» (потребуется перезапуск).
+   */
+  encryptionDisabled: boolean;
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
   verificationBlob: null,
   shadowVaultPath: "",
+  encryptionDisabled: false,
 };
 
 /**

@@ -457,6 +457,66 @@ export class ShadowVaultManager {
   }
 
   /**
+   * Экспорт plaintext из shadow в оригинал и удаление всех .enc файлов.
+   * Используется при отключении шифрования — после этого vault содержит
+   * открытые файлы, плагин переходит в спящий режим.
+   *
+   * Порядок:
+   *   1. Копируем каждый файл из shadow в оригинал по тому же пути (без .enc).
+   *   2. Удаляем .enc-варианты в оригинале.
+   *   3. Структура папок уже зеркалирована в оригинале — пустые папки трогать
+   *      не нужно (они там и так есть).
+   */
+  async exportShadowToOriginal(
+    onProgress?: (done: number, total: number, current: string) => void
+  ): Promise<{ exported: string[]; failed: Array<{ path: string; error: string }> }> {
+    const exported: string[] = [];
+    const failed: Array<{ path: string; error: string }> = [];
+
+    const shadowFiles = await this.scanShadowFilesForSync();
+    const total = shadowFiles.length;
+    console.info(`[ShadowVault] export shadow→original: ${total} файлов`);
+
+    for (let i = 0; i < total; i++) {
+      const rel = shadowFiles[i];
+      try {
+        const src = this.shadowAbs(rel);
+        const dst = this.originalAbs(rel);
+        await fsp.mkdir(nodePath.dirname(dst), { recursive: true });
+        await fsp.copyFile(src, dst);
+
+        // Удаляем .enc после успешной копии (если есть)
+        await fsp.unlink(this.originalEncAbs(rel)).catch((err) => {
+          const code = (err as NodeJS.ErrnoException).code;
+          if (code !== "ENOENT") throw err;
+        });
+
+        exported.push(rel);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[ShadowVault] export "${rel}":`, err);
+        failed.push({ path: rel, error: msg });
+      }
+      onProgress?.(i + 1, total, rel);
+    }
+
+    // Подчищаем оставшиеся .enc файлы (если в shadow их не оказалось,
+    // но в оригинале они есть — например, после неудачного decrypt)
+    const orphanEnc = await this.scanEncryptedFiles();
+    for (const rel of orphanEnc) {
+      try {
+        await fsp.unlink(this.originalEncAbs(rel));
+        console.warn(`[ShadowVault] export: удалён orphan .enc "${rel}" (не было в shadow)`);
+      } catch (err) {
+        console.error(`[ShadowVault] export: не удалось удалить orphan .enc "${rel}":`, err);
+      }
+    }
+
+    console.info(`[ShadowVault] export done: ${exported.length} файлов, ${failed.length} ошибок`);
+    return { exported, failed };
+  }
+
+  /**
    * Шифрует shadow→оригинал с верификацией: после записи нового .enc
    * расшифровываем его и сравниваем побайтово с исходным shadow-файлом.
    * Только если совпало — атомарно заменяем старый .enc.

@@ -23,6 +23,47 @@ export class ShadowVaultSettingTab extends PluginSettingTab {
 
     new Setting(containerEl).setName("Shadow Vault").setHeading();
 
+    const isDormant = this.plugin.settings.encryptionDisabled;
+
+    if (isDormant) {
+      // ── Спящий режим: только переключатель «Зашифровать заново» ─────
+      new Setting(containerEl)
+        .setName("Состояние")
+        .setDesc(
+          "Шифрование отключено. Файлы хранятся в открытом виде. " +
+          "Чтобы снова защитить хранилище паролем — нажмите кнопку ниже " +
+          "и перезапустите Obsidian."
+        );
+
+      new Setting(containerEl)
+        .setName("Зашифровать хранилище")
+        .setDesc(
+          "Включить шифрование заново. После перезапуска Obsidian плагин " +
+          "запросит пароль и зашифрует все файлы хранилища."
+        )
+        .addButton((btn) => {
+          btn
+            .setButtonText("Зашифровать")
+            .setCta()
+            .onClick(() => {
+              new ConfirmModal(
+                this.app,
+                "После перезапуска Obsidian плагин запросит новый пароль и зашифрует все файлы. Продолжить?",
+                (confirmed) => {
+                  if (!confirmed) return;
+                  void this.plugin.enableEncryption().then(() => {
+                    new Notice(
+                      "🔐 Шифрование включено. Перезапустите Obsidian для применения.",
+                      8000
+                    );
+                  });
+                }
+              ).open();
+            });
+        });
+      return;
+    }
+
     // ── Путь к теневому хранилищу ──────────────────────────────────────
     new Setting(containerEl)
       .setName("Путь к теневому хранилищу")
@@ -76,26 +117,47 @@ export class ShadowVaultSettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
-      .setName("Сбросить конфигурацию шифрования")
+      .setName("Расшифровать хранилище")
       .setDesc(
-        "Удалить верификационный блоб из настроек. " +
-        "При следующем запуске потребуется создать новое хранилище. " +
-        "Зашифрованные файлы СТАНУТ НЕДОСТУПНЫ без старого пароля."
+        "Превратить все .enc файлы обратно в открытые и отключить шифрование. " +
+        "Пароль будет удалён, плагин перейдёт в спящий режим: Obsidian " +
+        "будет работать с файлами напрямую без шифрования. " +
+        "Требует разблокированного хранилища."
       )
       .addButton((btn) => {
         btn
-          .setButtonText("Сбросить")
+          .setButtonText("Расшифровать")
           .setWarning()
           .onClick(() => {
+            if (!this.plugin.isUnlocked()) {
+              new Notice("🔒 Сначала разблокируйте хранилище.", 4000);
+              return;
+            }
             new ConfirmModal(
               this.app,
-              "Вы уверены? Это действие необратимо.",
+              "Все файлы станут открытым текстом, пароль будет удалён. Шифрование отключится. Продолжить?",
               (confirmed) => {
                 if (!confirmed) return;
-                this.plugin.settings.verificationBlob = null;
-                void this.plugin.saveSettings().then(() => {
-                  new Notice("🔑 Конфигурация сброшена. Перезапустите Obsidian.", 5000);
-                });
+                const progress = new Notice("⏳ Расшифровка хранилища...", 0);
+                void this.plugin
+                  .disableEncryption((done, total, current) => {
+                    const percent = total > 0 ? Math.round((done / total) * 100) : 0;
+                    progress.setMessage(
+                      `⏳ Расшифровка: ${done}/${total} (${percent}%)\n${current.slice(-60)}`
+                    );
+                  })
+                  .then(() => {
+                    progress.hide();
+                    new Notice(
+                      "✅ Шифрование отключено. Перезапустите Obsidian для применения.",
+                      8000
+                    );
+                  })
+                  .catch((err) => {
+                    progress.hide();
+                    console.error("[ShadowVault] disableEncryption failed:", err);
+                    new Notice(`❌ Ошибка: ${err instanceof Error ? err.message : String(err)}`, 10000);
+                  });
               }
             ).open();
           });
