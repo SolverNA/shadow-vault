@@ -2,13 +2,22 @@
 
 **Transparent AES-256-GCM encryption for Obsidian.** Your vault files stay encrypted on disk at all times. Obsidian sees and works with plaintext — search, graph view, Dataview, all plugins work as usual. No workflow changes required.
 
-> ⚠️ **Desktop only** — uses Node.js `fs` and `crypto` modules not available on mobile.
+> ✅ **Cross-platform** — works on desktop (Windows, macOS, Linux) and mobile (iOS, Android).
+
+---
+
+## Supported Platforms
+
+- **Desktop** (v1.0.0+): Windows, macOS, Linux — uses Node.js `fs` and `crypto` modules, shadow vault on disk
+- **Mobile** (v2.0.0+): iOS, Android — uses Web Crypto API, virtual shadow in memory
 
 ---
 
 ## How it works
 
 Shadow Vault patches Obsidian's file adapter (`app.vault.adapter`) to transparently redirect all file operations:
+
+### Desktop Architecture (v1.0.0)
 
 ```
 On disk (original vault):          Obsidian sees (shadow vault):
@@ -20,6 +29,19 @@ On disk (original vault):          Obsidian sees (shadow vault):
 - **Shadow vault** — sibling directory created at session start, deleted on lock
 - **Write-through** — every save encrypts back to the original vault immediately and atomically
 - **Lazy decryption** — files are decrypted on demand; opened notes get highest priority
+
+### Mobile Architecture (v2.0.0)
+
+```
+On disk (vault):               Obsidian sees (virtual shadow):
+  note.md.enc  ──decrypt──►  In-memory cache → note.md
+  photo.png.enc              In-memory cache → photo.png
+```
+
+- **Original vault** — stores only `.enc` files (AES-256-GCM, binary)
+- **Virtual shadow** — in-memory cache (Map<path, ArrayBuffer>), cleared on lock
+- **Write-through** — every save encrypts back to `.enc` immediately
+- **On-demand decryption** — files are decrypted when accessed, cached in memory
 
 ### Encryption format
 
