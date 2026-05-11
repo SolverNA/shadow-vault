@@ -29,7 +29,7 @@
 import * as fs from "fs";
 import * as fsp from "fs/promises";
 import * as nodePath from "path";
-import { Notice, Platform, Plugin, TAbstractFile, TFile, TFolder } from "obsidian";
+import { DataAdapter, Notice, Platform, Plugin, TAbstractFile, TFile, TFolder } from "obsidian";
 import { CryptoEngine } from "./crypto-engine";
 import { WebCryptoEngine } from "./web-crypto-engine";
 import { DesktopAdapter, MobileAdapter, PlatformAdapter } from "./platform-adapter";
@@ -510,15 +510,15 @@ export default class ShadowVaultPlugin extends Plugin {
       );
 
       // ── Phase 5: патчим адаптер ───────────────────────────────────────
-      const adapter = this.app.vault.adapter as unknown as IDataAdapter;
+      const adapter = this.app.vault.adapter as DataAdapter;
 
       // Восстанавливаем оригинальный list() если был ранний патч
       if (this.earlyListOriginal) {
-        adapter.list = this.earlyListOriginal;
+        (adapter as any).list = this.earlyListOriginal;
         this.earlyListOriginal = null;
       }
 
-      this.adapterPatcher.patch(adapter);
+      this.adapterPatcher.patch(adapter as any);
 
       // ── Phase 6: reconcile fileMap ────────────────────────────────────
       await this.reconcileVaultIndex();
@@ -750,8 +750,8 @@ export default class ShadowVaultPlugin extends Plugin {
     // 1. Снимаем патч с адаптера
     try {
       if (this.adapterPatcher) {
-        const adapter = this.app.vault.adapter as unknown as IDataAdapter;
-        this.adapterPatcher.unpatch(adapter);
+        const adapter = this.app.vault.adapter as DataAdapter;
+        this.adapterPatcher.unpatch(adapter as any);
       }
     } catch (err) {
       console.error("[ShadowVault] unpatch адаптера:", err);

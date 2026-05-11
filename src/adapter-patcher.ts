@@ -178,7 +178,7 @@ export class AdapterPatcher {
 
   private async patchedStat(
     normalizedPath: string
-  ): Promise<{ ctime: number; mtime: number; size: number } | null> {
+  ): Promise<{ ctime: number; mtime: number; size: number; type: "file" | "folder" } | null> {
     if (this.isBypassPath(normalizedPath)) {
       return this.originalMethods.stat!(normalizedPath);
     }
@@ -190,6 +190,7 @@ export class AdapterPatcher {
       ctime: stat.mtime, // используем mtime для ctime
       mtime: stat.mtime,
       size: stat.size,
+      type: "file", // все зашифрованные объекты — файлы
     };
   }
 
