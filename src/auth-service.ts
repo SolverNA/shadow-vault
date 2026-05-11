@@ -21,6 +21,8 @@ export type SaveSettingsFn = (settings: PluginSettings) => Promise<void>;
 
 export interface AuthResult {
   engine: CryptoEngine;
+  /** Пароль для инициализации WebCryptoEngine на мобильных */
+  password: string;
   /** true если это был первый запуск и настройки уже сохранены */
   isFirstRun: boolean;
 }
@@ -69,12 +71,12 @@ export class AuthService {
       };
 
       await saveFn(updatedSettings);
-      return { engine, isFirstRun: true };
+      return { engine, password, isFirstRun: true };
     }
 
     // ── Повторный запуск: проверяем пароль ────────────────────────────────
     const verifiedEngine = await AuthService.verifyPassword(password, settings);
-    return { engine: verifiedEngine, isFirstRun: false };
+    return { engine: verifiedEngine, password, isFirstRun: false };
   }
 
   /**
