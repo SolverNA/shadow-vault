@@ -29,8 +29,12 @@
 import * as fs from "fs";
 import * as fsp from "fs/promises";
 import * as nodePath from "path";
-import { Notice, Plugin, TAbstractFile, TFile, TFolder } from "obsidian";
+import { DataAdapter, Notice, Platform, Plugin, TAbstractFile, TFile, TFolder } from "obsidian";
 import { CryptoEngine } from "./crypto-engine";
+import { WebCryptoEngine } from "./web-crypto-engine";
+import { DesktopAdapter, MobileAdapter, PlatformAdapter } from "./platform-adapter";
+import { VirtualShadowManager } from "./virtual-shadow-manager";
+import { AdapterPatcher } from "./adapter-patcher";
 import { AuthResult, AuthService } from "./auth-service";
 import { InitModal } from "./init-modal";
 import { ShadowVaultManager } from "./shadow-vault-manager";
@@ -53,6 +57,15 @@ export default class ShadowVaultPlugin extends Plugin {
   private shadowManager:    ShadowVaultManager | null = null;
   private sessionManager:   SessionManager     | null = null;
 
+  // Кросс-платформенные модули (v2.0.0+)
+  private virtualShadowManager: VirtualShadowManager | null = null;
+  private adapterPatcher: AdapterPatcher | null = null;
+  private platformAdapter: PlatformAdapter | null = null;
+  private cryptoEngine: CryptoEngine | WebCryptoEngine | null = null;
+
+  /** Флаг платформы: true = десктоп (Node.js), false = мобильные (Web APIs) */
+  private isDesktop = false;
+
   /** true только пока сессия активна (между onUnlock и shutdown) */
   private sessionActive = false;
 
@@ -69,6 +82,12 @@ export default class ShadowVaultPlugin extends Plugin {
 
   async onload(): Promise<void> {
     await this.loadSettings();
+
+    // Детекция платформы
+    this.isDesktop = Platform.isDesktopApp;
+    const isMobile = Platform.isMobile;
+
+    console.info(`[ShadowVault] Platform: desktop=${this.isDesktop}, mobile=${isMobile}`);
 
     // Вкладка настроек появляется всегда, в т.ч. в спящем режиме
     this.addSettingTab(new ShadowVaultSettingTab(this.app, this));
@@ -320,8 +339,22 @@ export default class ShadowVaultPlugin extends Plugin {
    * должна уничтожить engine и показать понятное сообщение.
    */
   private async onUnlock(result: AuthResult): Promise<void> {
-    const { engine, isFirstRun } = result;
+    const { engine, password, isFirstRun } = result;
 
+    // Десктопная архитектура (старая, Node.js)
+    if (this.isDesktop) {
+      await this.onUnlockDesktop(engine, isFirstRun);
+      return;
+    }
+
+    // Мобильная архитектура (новая, Web APIs)
+    await this.onUnlockMobile(engine, password, isFirstRun);
+  }
+
+  /**
+   * Десктопная инициализация (Node.js, shadow vault на диске)
+   */
+  private async onUnlockDesktop(engine: CryptoEngine, isFirstRun: boolean): Promise<void> {
     const basePath = this.getVaultBasePath();
     if (!basePath) {
       new Notice(
@@ -333,7 +366,7 @@ export default class ShadowVaultPlugin extends Plugin {
     }
 
     try {
-      console.info("[ShadowVault] onUnlock: старт, basePath =", basePath);
+      console.info("[ShadowVault] onUnlockDesktop: старт, basePath =", basePath);
 
       // ── Phase 1: создаём shadow manager и initialize ──────────────────
       this.shadowManager = new ShadowVaultManager(
@@ -438,6 +471,80 @@ export default class ShadowVaultPlugin extends Plugin {
       );
     } catch (err) {
       console.error("[ShadowVault] Ошибка инициализации:", err);
+      new Notice(
+        `❌ Shadow Vault: ошибка при запуске.\n${err instanceof Error ? err.message : String(err)}`,
+        10000
+      );
+      this.rollbackInitialization(engine);
+    }
+  }
+
+  /**
+   * Мобильная инициализация (Web APIs, виртуальный shadow в памяти)
+   */
+  private async onUnlockMobile(engine: CryptoEngine, password: string, isFirstRun: boolean): Promise<void> {
+    try {
+      console.info("[ShadowVault] onUnlockMobile: старт");
+
+      // ── Phase 1: создаём Web Crypto engine ────────────────────────────
+      const webEngine = new WebCryptoEngine();
+      await webEngine.deriveKey(password);
+      this.cryptoEngine = webEngine;
+
+      // Уничтожаем десктопный engine, он больше не нужен
+      engine.destroy();
+
+      // ── Phase 2: создаём platform adapter ─────────────────────────────
+      this.platformAdapter = new MobileAdapter(this.app.vault);
+
+      // ── Phase 3: создаём virtual shadow manager ───────────────────────
+      this.virtualShadowManager = new VirtualShadowManager(
+        webEngine,
+        this.platformAdapter
+      );
+
+      // ── Phase 4: создаём adapter patcher ──────────────────────────────
+      this.adapterPatcher = new AdapterPatcher(
+        this.virtualShadowManager,
+        this.app.vault.configDir
+      );
+
+      // ── Phase 5: патчим адаптер ───────────────────────────────────────
+      const adapter = this.app.vault.adapter as DataAdapter;
+
+      // Восстанавливаем оригинальный list() если был ранний патч
+      if (this.earlyListOriginal) {
+        (adapter as any).list = this.earlyListOriginal;
+        this.earlyListOriginal = null;
+      }
+
+      this.adapterPatcher.patch(adapter as any);
+
+      // ── Phase 6: reconcile fileMap ────────────────────────────────────
+      await this.reconcileVaultIndex();
+
+      // ── Phase 7: подписки на vault events ─────────────────────────────
+      this.setupVaultEventHandlers();
+
+      // ── Phase 8: lifecycle hooks ──────────────────────────────────────
+      this.registerDomEvent(window as Window, "beforeunload", () => {
+        if (this.sessionActive) {
+          console.info("[ShadowVault] beforeunload: mobile cleanup");
+          this.syncCleanupMobile();
+        }
+      });
+
+      this.sessionActive = true;
+
+      if (isFirstRun) {
+        new Notice("🔐 Shadow Vault: хранилище создано, пароль сохранён.", 5000);
+      } else {
+        new Notice("🔓 Shadow Vault: хранилище разблокировано.", 2500);
+      }
+
+      console.info("[ShadowVault] Мобильная сессия запущена");
+    } catch (err) {
+      console.error("[ShadowVault] Ошибка мобильной инициализации:", err);
       new Notice(
         `❌ Shadow Vault: ошибка при запуске.\n${err instanceof Error ? err.message : String(err)}`,
         10000
@@ -630,6 +737,53 @@ export default class ShadowVaultPlugin extends Plugin {
     }
 
     console.debug("[ShadowVault] Сессия завершена.");
+  }
+
+  /**
+   * Синхронная очистка мобильной сессии (вызывается из beforeunload)
+   */
+  private syncCleanupMobile(): void {
+    console.info("[ShadowVault] syncCleanupMobile: старт");
+
+    this.sessionActive = false;
+
+    // 1. Снимаем патч с адаптера
+    try {
+      if (this.adapterPatcher) {
+        const adapter = this.app.vault.adapter as DataAdapter;
+        this.adapterPatcher.unpatch(adapter as any);
+      }
+    } catch (err) {
+      console.error("[ShadowVault] unpatch адаптера:", err);
+    } finally {
+      this.adapterPatcher = null;
+    }
+
+    // 2. Очищаем кэш виртуального shadow
+    try {
+      if (this.virtualShadowManager) {
+        this.virtualShadowManager.clearCache();
+      }
+    } catch (err) {
+      console.error("[ShadowVault] clearCache:", err);
+    } finally {
+      this.virtualShadowManager = null;
+    }
+
+    // 3. Уничтожаем ключ
+    try {
+      if (this.cryptoEngine) {
+        this.cryptoEngine.destroy();
+      }
+    } catch (err) {
+      console.error("[ShadowVault] destroy engine:", err);
+    } finally {
+      this.cryptoEngine = null;
+    }
+
+    this.platformAdapter = null;
+
+    console.debug("[ShadowVault] Мобильная сессия завершена.");
   }
 
   // ═══════════════════════════════════════════════════════════════════════
