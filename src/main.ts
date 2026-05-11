@@ -339,7 +339,7 @@ export default class ShadowVaultPlugin extends Plugin {
    * должна уничтожить engine и показать понятное сообщение.
    */
   private async onUnlock(result: AuthResult): Promise<void> {
-    const { engine, isFirstRun } = result;
+    const { engine, password, isFirstRun } = result;
 
     // Десктопная архитектура (старая, Node.js)
     if (this.isDesktop) {
@@ -348,7 +348,7 @@ export default class ShadowVaultPlugin extends Plugin {
     }
 
     // Мобильная архитектура (новая, Web APIs)
-    await this.onUnlockMobile(engine, isFirstRun);
+    await this.onUnlockMobile(engine, password, isFirstRun);
   }
 
   /**
@@ -482,16 +482,17 @@ export default class ShadowVaultPlugin extends Plugin {
   /**
    * Мобильная инициализация (Web APIs, виртуальный shadow в памяти)
    */
-  private async onUnlockMobile(engine: CryptoEngine, isFirstRun: boolean): Promise<void> {
+  private async onUnlockMobile(engine: CryptoEngine, password: string, isFirstRun: boolean): Promise<void> {
     try {
       console.info("[ShadowVault] onUnlockMobile: старт");
 
       // ── Phase 1: создаём Web Crypto engine ────────────────────────────
       const webEngine = new WebCryptoEngine();
-      // Копируем ключ из CryptoEngine (который использовался для верификации)
-      // TODO: нужно передавать пароль напрямую в WebCryptoEngine
-      // Пока используем старый engine для совместимости
-      this.cryptoEngine = engine;
+      await webEngine.deriveKey(password);
+      this.cryptoEngine = webEngine;
+
+      // Уничтожаем десктопный engine, он больше не нужен
+      engine.destroy();
 
       // ── Phase 2: создаём platform adapter ─────────────────────────────
       this.platformAdapter = new MobileAdapter(this.app.vault);
