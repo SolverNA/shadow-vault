@@ -5,8 +5,7 @@
  */
 
 import { Vault, normalizePath } from "obsidian";
-import * as fsp from "fs/promises";
-import * as nodePath from "path";
+import { nfsp, npath } from "./node-fs";
 
 export interface PlatformAdapter {
   readBinary(path: string): Promise<ArrayBuffer>;
@@ -25,21 +24,23 @@ export class DesktopAdapter implements PlatformAdapter {
   constructor(private basePath: string) {}
 
   async readBinary(path: string): Promise<ArrayBuffer> {
-    const fullPath = nodePath.join(this.basePath, path);
-    const buf = await fsp.readFile(fullPath);
+    const fullPath = npath().join(this.basePath, path);
+    const buf = await nfsp().readFile(fullPath);
     return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
   }
 
   async writeBinary(path: string, data: ArrayBuffer): Promise<void> {
+    const nodePath = npath();
+    const fsp = nfsp();
     const fullPath = nodePath.join(this.basePath, path);
     await fsp.mkdir(nodePath.dirname(fullPath), { recursive: true });
     await fsp.writeFile(fullPath, Buffer.from(data));
   }
 
   async exists(path: string): Promise<boolean> {
-    const fullPath = nodePath.join(this.basePath, path);
+    const fullPath = npath().join(this.basePath, path);
     try {
-      await fsp.access(fullPath);
+      await nfsp().access(fullPath);
       return true;
     } catch {
       return false;
@@ -47,7 +48,8 @@ export class DesktopAdapter implements PlatformAdapter {
   }
 
   async remove(path: string): Promise<void> {
-    const fullPath = nodePath.join(this.basePath, path);
+    const fsp = nfsp();
+    const fullPath = npath().join(this.basePath, path);
     try {
       const stat = await fsp.stat(fullPath);
       if (stat.isDirectory()) {
@@ -61,9 +63,10 @@ export class DesktopAdapter implements PlatformAdapter {
   }
 
   async list(path: string): Promise<{ files: string[]; folders: string[] }> {
+    const nodePath = npath();
     const fullPath = nodePath.join(this.basePath, path);
     try {
-      const entries = await fsp.readdir(fullPath, { withFileTypes: true });
+      const entries = await nfsp().readdir(fullPath, { withFileTypes: true });
       const files: string[] = [];
       const folders: string[] = [];
 
@@ -84,14 +87,14 @@ export class DesktopAdapter implements PlatformAdapter {
   }
 
   async mkdir(path: string): Promise<void> {
-    const fullPath = nodePath.join(this.basePath, path);
-    await fsp.mkdir(fullPath, { recursive: true });
+    const fullPath = npath().join(this.basePath, path);
+    await nfsp().mkdir(fullPath, { recursive: true });
   }
 
   async stat(path: string): Promise<{ size: number; mtime: number } | null> {
-    const fullPath = nodePath.join(this.basePath, path);
+    const fullPath = npath().join(this.basePath, path);
     try {
-      const stat = await fsp.stat(fullPath);
+      const stat = await nfsp().stat(fullPath);
       return {
         size: stat.size,
         mtime: stat.mtimeMs,

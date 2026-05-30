@@ -14,7 +14,17 @@
  * Если не прошёл → оставляем оригинал без изменений, сообщаем пользователю.
  */
 
-import * as nodePath from "path";
+/**
+ * Чистое расширение файла (без зависимости от node:path) — модуль mobile-safe.
+ * Возвращает суффикс начиная с последней точки в имени, включая точку (".md").
+ * Поведение совпадает с path.extname для типичных путей хранилища.
+ */
+function extname(p: string): string {
+  const base = p.slice(p.replace(/\\/g, "/").lastIndexOf("/") + 1);
+  const dot = base.lastIndexOf(".");
+  if (dot <= 0) return ""; // нет точки или dotfile без расширения
+  return base.slice(dot);
+}
 
 /** Результат семантической сверки (Этап 1) */
 export type SemanticDiff =
@@ -64,7 +74,7 @@ export function checkFileIntegrity(
   normalizedPath: string,
   buf: Buffer
 ): IntegrityResult {
-  const ext = nodePath.extname(normalizedPath).toLowerCase();
+  const ext = extname(normalizedPath).toLowerCase();
 
   if (buf.length === 0) {
     // Пустой файл — допустимо для текстовых форматов и новых заметок

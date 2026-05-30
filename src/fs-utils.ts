@@ -1,10 +1,14 @@
 /**
  * Общие утилиты файловой системы и константы формата зашифрованных файлов.
  * Единственный источник правды — чтобы избежать копипасты в session/shadow/main.
+ *
+ * MOBILE-SAFE: модуль импортируется и из main.ts (грузится на обеих платформах),
+ * поэтому НЕ имеет top-level node-импортов. Константы и чистые функции
+ * (ENCRYPTED_EXT, isTempFile, parallelMap) работают везде; fs-зависимые функции
+ * берут node-модули лениво через node-fs (вызываются только на desktop).
  */
 
-import * as fsp from "fs/promises";
-import * as nodePath from "path";
+import { nfsp, npath } from "./node-fs";
 
 /**
  * Постоянный размер служебных данных контейнера v2:
@@ -19,7 +23,7 @@ export const ENCRYPTED_EXT = ".enc";
 /** Возвращает true если по абсолютному пути существует файл/папка */
 export async function fileExists(absPath: string): Promise<boolean> {
   try {
-    await fsp.access(absPath);
+    await nfsp().access(absPath);
     return true;
   } catch {
     return false;
@@ -40,7 +44,8 @@ export async function atomicWrite(
   data: Buffer,
   tmpExt = ".shadowtmp"
 ): Promise<void> {
-  await fsp.mkdir(nodePath.dirname(absPath), { recursive: true });
+  const fsp = nfsp();
+  await fsp.mkdir(npath().dirname(absPath), { recursive: true });
   const unique = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const tmpPath = absPath + "." + unique + tmpExt;
   try {
@@ -50,6 +55,101 @@ export async function atomicWrite(
     await fsp.unlink(tmpPath).catch(() => undefined);
     throw err;
   }
+}
+
+/** Запись каталога для visitor'а walkDir: относительный путь (через "/") + тип. */
+export interface WalkEntry {
+  /** Путь относительно корня обхода, разделитель "/" (например "sub/note"). */
+  rel: string;
+  /** Имя самой записи (без префикса каталога). */
+  name: string;
+  isDirectory: boolean;
+  isFile: boolean;
+}
+
+/**
+ * Универсальный рекурсивный обход каталога (desktop, Node fs).
+ * Единый сканер вместо копий в shadow-vault-manager/main — устраняет
+ * дублирование «readdir + правила пропуска + рекурсия».
+ *
+ * @param absRoot  Абсолютный корень обхода.
+ * @param visit    Колбэк на каждую запись. Возвращает:
+ *                   - "recurse"  — зайти внутрь каталога (для файлов игнор.);
+ *                   - "skip"     — не заходить внутрь / не учитывать;
+ *                 Для файлов важен только сам факт вызова visit (внутрь не идём).
+ * @param relDir   Внутренний параметр рекурсии — не передавать снаружи.
+ *
+ * Ошибки readdir (ENOENT/недоступность) трактуются как пустой каталог.
+ */
+export async function walkDir(
+  absRoot: string,
+  visit: (entry: WalkEntry) => "recurse" | "skip",
+  relDir = ""
+): Promise<void> {
+  const nodePath = npath();
+  const absDir = relDir
+    ? nodePath.join(absRoot, ...relDir.split("/"))
+    : absRoot;
+
+  let entries: import("fs").Dirent[];
+  try {
+    entries = await nfsp().readdir(absDir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  const prefix = relDir ? relDir + "/" : "";
+  for (const e of entries) {
+    const rel = prefix + e.name;
+    const isDirectory = e.isDirectory();
+    const decision = visit({ rel, name: e.name, isDirectory, isFile: e.isFile() });
+    if (isDirectory && decision === "recurse") {
+      await walkDir(absRoot, visit, rel);
+    }
+  }
+}
+
+/**
+ * Транслирует один уровень каталога оригинального хранилища в вид, который
+ * ожидает Obsidian: .enc-файлы → имена без суффикса, dot/временные пропускаются.
+ *
+ * Единый источник правды для list-патча — раньше та же логика была скопирована
+ * в main.patchListEarly и ShadowVaultManager.patchedList.
+ *
+ * @param absDir         Абсолютный каталог в оригинальном хранилище.
+ * @param normalizedPath Путь каталога относительно корня vault ("" для корня).
+ * @param configDir      Имя каталога конфигурации (.obsidian) — не скрываем его.
+ */
+export async function listEncryptedDir(
+  absDir: string,
+  normalizedPath: string,
+  configDir: string
+): Promise<{ files: string[]; folders: string[] }> {
+  const files: string[] = [];
+  const folders: string[] = [];
+
+  let entries: import("fs").Dirent[];
+  try {
+    entries = await nfsp().readdir(absDir, { withFileTypes: true });
+  } catch {
+    return { files: [], folders: [] };
+  }
+
+  const prefix = normalizedPath ? normalizedPath + "/" : "";
+  for (const entry of entries) {
+    // Скрытые файлы (.session_active и т.п.) — не показываем, кроме configDir
+    if (entry.name.startsWith(".") && entry.name !== configDir) continue;
+    if (isTempFile(entry.name)) continue;
+
+    if (entry.isDirectory()) {
+      folders.push(prefix + entry.name);
+    } else if (entry.isFile() && entry.name.endsWith(ENCRYPTED_EXT)) {
+      files.push(prefix + entry.name.slice(0, -ENCRYPTED_EXT.length));
+    }
+    // Не-.enc файлы в оригинале не показываем (системные/немигрированные)
+  }
+
+  return { files, folders };
 }
 
 /** true если имя — временный файл атомарной записи (наш или из других модулей) */
@@ -71,6 +171,8 @@ export function isTempFile(name: string): boolean {
  * Если указывает на ДРУГОЕ — бросает ошибку (не перезаписываем чужие линки).
  */
 export async function ensureSymlink(target: string, linkPath: string): Promise<void> {
+  const fsp = nfsp();
+  const nodePath = npath();
   // Уже существует?
   try {
     const existing = await fsp.readlink(linkPath);
@@ -107,6 +209,7 @@ export async function ensureSymlink(target: string, linkPath: string): Promise<v
  * чтобы случайно не стереть рабочую папку.
  */
 export async function removeSymlink(linkPath: string): Promise<void> {
+  const fsp = nfsp();
   try {
     const lst = await fsp.lstat(linkPath);
     if (lst.isSymbolicLink()) {
@@ -166,6 +269,7 @@ export async function parallelMap<T, R>(
  * Используется для верификации что расшифровка дала тот же plaintext, который был зашифрован.
  */
 export async function filesEqual(pathA: string, pathB: string): Promise<boolean> {
+  const fsp = nfsp();
   const [statA, statB] = await Promise.all([
     fsp.stat(pathA).catch(() => null),
     fsp.stat(pathB).catch(() => null),
