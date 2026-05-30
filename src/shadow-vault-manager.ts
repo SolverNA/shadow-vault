@@ -28,6 +28,9 @@ import * as nodePath from "path";
 import * as crypto from "crypto";
 import * as os from "os";
 import { CryptoEngine } from "./crypto-engine";
+import { detectFormat } from "./crypto/format";
+import { migrateBuffer } from "./crypto/migration";
+import type { LegacyVariant } from "./crypto/legacy";
 import { IDataAdapter, AdapterStat, DataWriteOptions, ListedFiles } from "./adapter-types";
 import {
   CRYPTO_HEADER_SIZE,
@@ -721,6 +724,11 @@ export class ShadowVaultManager {
     return nodePath.join(this.originalRoot, ...normalizedPath.split("/")) + ENCRYPTED_EXT;
   }
 
+  /** Возвращает активный v2-движок (для создания verificationBlob после миграции). */
+  getEngine(): CryptoEngine {
+    return this.engine;
+  }
+
   isBypassPath(normalizedPath: string): boolean {
     return (
       normalizedPath === "" ||
@@ -860,6 +868,122 @@ export class ShadowVaultManager {
     }
 
     console.debug(`[ShadowVault] Пере-шифровка завершена: ${total} файлов.`);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // ФАЗА 4: миграция старого формата (legacy) → v2
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Возвращает true, если в оригинальном хранилище есть хотя бы один .enc
+   * НЕ в формате v2 (legacy) → требуется миграция. Детект по MAGIC дешёвый:
+   * читаем только первые байты заголовка каждого файла.
+   */
+  async hasLegacyFiles(): Promise<boolean> {
+    const encFiles = await this.scanEncryptedFiles();
+    for (const p of encFiles) {
+      const head = await this.readEncHead(this.originalEncAbs(p));
+      if (head && detectFormat(head) !== "v2") return true;
+    }
+    return false;
+  }
+
+  /** Читает заголовок .enc (первые HEADER_SIZE байт) для детекта формата. */
+  private async readEncHead(absPath: string): Promise<Uint8Array | null> {
+    try {
+      const fh = await fsp.open(absPath, "r");
+      try {
+        // 33 байта = MAGIC(4)+ver(1)+IV(12)+tag(16) — хватает и для detectFormat,
+        // и для отсечения слишком коротких/пустых файлов.
+        const buf = Buffer.alloc(CRYPTO_HEADER_SIZE);
+        const { bytesRead } = await fh.read(buf, 0, CRYPTO_HEADER_SIZE, 0);
+        return buf.subarray(0, bytesRead);
+      } finally {
+        await fh.close();
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Возвращает первый .enc файл хранилища (для probe пароля при отсутствии
+   * verificationBlob). null если хранилище пустое.
+   */
+  async firstEncBuffer(): Promise<Uint8Array | null> {
+    const encFiles = await this.scanEncryptedFiles();
+    if (encFiles.length === 0) return null;
+    try {
+      return new Uint8Array(await fsp.readFile(this.originalEncAbs(encFiles[0])));
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Мигрирует все legacy .enc файлы в формат v2.
+   *
+   * Атомарность ПОФАЙЛОВО:
+   *   legacy.enc → читаем → migrateBuffer (legacy-decrypt старым ключом,
+   *   re-encrypt новым v2-ключом, round-trip verify в памяти) → atomicWrite
+   *   в .enc.new → rename .new → .enc. Файл никогда не остаётся полу-мигрированным.
+   *
+   * Идемпотентность: уже-v2 файлы пропускаются (migrateBuffer вернёт skipped-v2).
+   * Прерванный прогон корректно домигрирует остаток при повторном запуске.
+   *
+   * Безопасность: если round-trip verify не прошёл или legacy-decrypt упал —
+   * файл помечается failed, оригинал НЕ трогается, миграция продолжается дальше.
+   *
+   * @param password пароль для деривации СТАРОГО legacy-ключа (тот же, что ввёл
+   *                 пользователь; v2-движок this.engine уже несёт новый ключ)
+   */
+  async migrateLegacyToV2(
+    password: string,
+    onProgress?: (done: number, total: number, current: string) => void
+  ): Promise<{ migrated: string[]; skipped: number; failed: Array<{ path: string; error: string }> }> {
+    const encFiles = await this.scanEncryptedFiles();
+    const migrated: string[] = [];
+    const failed: Array<{ path: string; error: string }> = [];
+    let skipped = 0;
+    let done = 0;
+    // hint: первый успешный legacy-вариант обычно общий для всего хранилища.
+    let hint: LegacyVariant | undefined;
+
+    console.info(`[ShadowVault] Миграция legacy → v2: проверяем ${encFiles.length} файлов.`);
+
+    for (const normalizedPath of encFiles) {
+      const encPath    = this.originalEncAbs(normalizedPath);
+      const newEncPath = encPath + ".new";
+      try {
+        const enc = new Uint8Array(await fsp.readFile(encPath));
+        const res = await migrateBuffer(enc, password, this.engine, hint);
+
+        if (res.status === "skipped-v2") {
+          skipped++;
+        } else {
+          hint = res.variant;
+          // Атомарная замена: пишем .new, затем rename поверх legacy.
+          await atomicWrite(newEncPath, Buffer.from(res.v2));
+          await fsp.rename(newEncPath, encPath);
+          migrated.push(normalizedPath);
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[ShadowVault] Миграция "${normalizedPath}" не удалась:`, err);
+        failed.push({ path: normalizedPath, error: msg });
+        // Подчищаем возможный недописанный .new (atomicWrite уже чистит свой tmp,
+        // но rename мог не успеть — удаляем .new если остался).
+        await fsp.unlink(newEncPath).catch(() => undefined);
+      }
+      done++;
+      onProgress?.(done, encFiles.length, normalizedPath);
+    }
+
+    console.info(
+      `[ShadowVault] Миграция legacy → v2 завершена: ${migrated.length} мигрировано, ` +
+      `${skipped} уже v2, ${failed.length} ошибок.`
+    );
+    return { migrated, skipped, failed };
   }
 
   /**

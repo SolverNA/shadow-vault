@@ -907,3 +907,124 @@ describe("ShadowVaultManager — encryptShadowChangesToOriginal", () => {
     } finally { env.cleanup(); }
   });
 });
+
+// ─────────────────────────────────────────────
+// ФАЗА 4: миграция legacy → v2 (интеграция на реальной ФС)
+// ─────────────────────────────────────────────
+
+import * as nodeCrypto from "crypto";
+import { detectFormat as detectFmt } from "../src/crypto/format";
+import {
+  LEGACY_SALT_DOMAIN,
+  LEGACY_PBKDF2_ITERATIONS_NODE,
+  LEGACY_PBKDF2_ITERATIONS_WEB,
+} from "../src/crypto/constants";
+
+const MIG_PASSWORD = "test-password"; // тот же, что в makeEnv
+
+function legacyKeyMig(iters: number): Buffer {
+  return nodeCrypto.pbkdf2Sync(
+    MIG_PASSWORD, Buffer.from(LEGACY_SALT_DOMAIN, "utf8"), iters, 32, "sha512"
+  );
+}
+function makeLegacyNodeBuf(plain: Buffer): Buffer {
+  const iv = nodeCrypto.randomBytes(12);
+  const c = nodeCrypto.createCipheriv("aes-256-gcm", legacyKeyMig(LEGACY_PBKDF2_ITERATIONS_NODE), iv);
+  const enc = Buffer.concat([c.update(plain), c.final()]);
+  return Buffer.concat([iv, c.getAuthTag(), enc]); // tag ПЕРЕД ciphertext
+}
+function makeLegacyWebBuf(plain: Buffer): Buffer {
+  const iv = nodeCrypto.randomBytes(12);
+  const c = nodeCrypto.createCipheriv("aes-256-gcm", legacyKeyMig(LEGACY_PBKDF2_ITERATIONS_WEB), iv);
+  const enc = Buffer.concat([c.update(plain), c.final()]);
+  return Buffer.concat([iv, enc, c.getAuthTag()]); // tag В КОНЦЕ
+}
+async function writeRawEnc(env: TestEnv, relPath: string, buf: Buffer): Promise<void> {
+  const encPath = nodePath.join(env.origRoot, ...relPath.split("/")) + ".enc";
+  await fsp.mkdir(nodePath.dirname(encPath), { recursive: true });
+  await fsp.writeFile(encPath, buf);
+}
+async function readEnc(env: TestEnv, relPath: string): Promise<Buffer> {
+  return fsp.readFile(nodePath.join(env.origRoot, ...relPath.split("/")) + ".enc");
+}
+
+describe("ShadowVaultManager — миграция legacy → v2 (ФАЗА 4)", () => {
+  it("hasLegacyFiles: true при legacy, false когда всё v2", async () => {
+    const env = await makeEnv();
+    try {
+      expect(await env.manager.hasLegacyFiles()).toBe(false);
+      await writeRawEnc(env, "old", makeLegacyNodeBuf(Buffer.from("hi")));
+      expect(await env.manager.hasLegacyFiles()).toBe(true);
+    } finally { env.cleanup(); }
+  });
+
+  it("мигрирует legacy-node и legacy-web в v2, plaintext сохраняется", async () => {
+    const env = await makeEnv();
+    try {
+      await writeRawEnc(env, "node-note", makeLegacyNodeBuf(Buffer.from("узел node")));
+      await writeRawEnc(env, "sub/web-note", makeLegacyWebBuf(Buffer.from("узел web")));
+
+      const res = await env.manager.migrateLegacyToV2(MIG_PASSWORD);
+      expect(res.migrated.sort()).toEqual(["node-note", "sub/web-note"]);
+      expect(res.failed).toHaveLength(0);
+
+      // Оба файла теперь v2 и расшифровываются новым ключом в исходный текст.
+      const a = await readEnc(env, "node-note");
+      const b = await readEnc(env, "sub/web-note");
+      expect(detectFmt(new Uint8Array(a))).toBe("v2");
+      expect(detectFmt(new Uint8Array(b))).toBe("v2");
+      expect(env.engine.decryptBuffer(a).toString("utf8")).toBe("узел node");
+      expect(env.engine.decryptBuffer(b).toString("utf8")).toBe("узел web");
+    } finally { env.cleanup(); }
+  });
+
+  it("идемпотентность: повторный прогон пропускает v2, не портит данные", async () => {
+    const env = await makeEnv();
+    try {
+      await writeRawEnc(env, "n", makeLegacyNodeBuf(Buffer.from("payload")));
+      await env.manager.migrateLegacyToV2(MIG_PASSWORD);
+      const afterFirst = await readEnc(env, "n");
+
+      const res2 = await env.manager.migrateLegacyToV2(MIG_PASSWORD);
+      expect(res2.migrated).toHaveLength(0);
+      expect(res2.skipped).toBe(1);
+      const afterSecond = await readEnc(env, "n");
+      // Байты не изменились — v2 не перешифровывается заново.
+      expect(afterSecond.equals(afterFirst)).toBe(true);
+      expect(env.engine.decryptBuffer(afterSecond).toString("utf8")).toBe("payload");
+    } finally { env.cleanup(); }
+  });
+
+  it("неверный пароль → файлы не тронуты, всё в failed", async () => {
+    const env = await makeEnv();
+    try {
+      const orig = makeLegacyNodeBuf(Buffer.from("secret"));
+      await writeRawEnc(env, "x", orig);
+
+      const res = await env.manager.migrateLegacyToV2("WRONG-password");
+      expect(res.migrated).toHaveLength(0);
+      expect(res.failed).toHaveLength(1);
+
+      // Оригинальный legacy .enc на диске не изменён.
+      const after = await readEnc(env, "x");
+      expect(after.equals(orig)).toBe(true);
+      // .enc.new не остался на диске
+      const newExists = fs.existsSync(nodePath.join(env.origRoot, "x.enc.new"));
+      expect(newExists).toBe(false);
+    } finally { env.cleanup(); }
+  });
+
+  it("частичный legacy: уже-v2 файлы пропускаются, legacy мигрируются", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "already-v2", "уже v2"); // пишет v2-форматом
+      await writeRawEnc(env, "old", makeLegacyWebBuf(Buffer.from("старый")));
+
+      const res = await env.manager.migrateLegacyToV2(MIG_PASSWORD);
+      expect(res.migrated).toEqual(["old"]);
+      expect(res.skipped).toBe(1);
+      expect(env.engine.decryptBuffer(await readEnc(env, "already-v2")).toString("utf8")).toBe("уже v2");
+      expect(env.engine.decryptBuffer(await readEnc(env, "old")).toString("utf8")).toBe("старый");
+    } finally { env.cleanup(); }
+  });
+});
