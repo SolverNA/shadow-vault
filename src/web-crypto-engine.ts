@@ -13,7 +13,12 @@
 import { IV_LENGTH, GCM_TAG_LENGTH, KEY_LENGTH } from "./crypto/constants";
 import { deriveMasterKey } from "./crypto/key-derivation";
 import { getSubtle, randomBytes } from "./crypto/platform";
-import { writeContainer, parseContainer } from "./crypto/format";
+import {
+  writeContainer,
+  parseContainer,
+  detectFormat,
+  parseChunkedContainer,
+} from "./crypto/format";
 
 export class WebCryptoEngine {
   private key: CryptoKey | null = null;
@@ -66,12 +71,22 @@ export class WebCryptoEngine {
     );
   }
 
-  /** Расшифровывает контейнер v2 → ArrayBuffer. */
+  /**
+   * Расшифровывает контейнер → ArrayBuffer. Поддерживает оба под-формата:
+   *   - v2 (0x02): один AES-GCM сегмент;
+   *   - v2-chunked (0x03): последовательность независимых AES-GCM сегментов
+   *     (desktop пишет большие файлы чанково — mobile обязан их прочитать).
+   */
   async decryptBuffer(container: ArrayBuffer | Uint8Array): Promise<ArrayBuffer> {
     if (!this.key) throw new Error("[WebCryptoEngine] Ключ не загружен");
 
     const buf =
       container instanceof Uint8Array ? container : new Uint8Array(container);
+
+    if (detectFormat(buf) === "v2-chunked") {
+      return await this.decryptChunked(buf);
+    }
+
     const { iv, body } = parseContainer(buf);
 
     const subtle = getSubtle();
@@ -80,6 +95,31 @@ export class WebCryptoEngine {
       this.key,
       body
     );
+  }
+
+  /** Посегментная расшифровка чанкового контейнера (0x03) через subtle.decrypt. */
+  private async decryptChunked(buf: Uint8Array): Promise<ArrayBuffer> {
+    const subtle = getSubtle();
+    const { segments } = parseChunkedContainer(buf);
+    const parts: Uint8Array[] = [];
+    let totalLen = 0;
+    for (const seg of segments) {
+      const plain = await subtle.decrypt(
+        { name: "AES-GCM", iv: seg.iv, tagLength: GCM_TAG_LENGTH * 8 },
+        this.key!,
+        seg.body
+      );
+      const u8 = new Uint8Array(plain);
+      parts.push(u8);
+      totalLen += u8.length;
+    }
+    const out = new Uint8Array(totalLen);
+    let off = 0;
+    for (const p of parts) {
+      out.set(p, off);
+      off += p.length;
+    }
+    return out.buffer;
   }
 
   /** Шифрует UTF-8 текст в контейнер v2. */

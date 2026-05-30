@@ -27,10 +27,18 @@ import {
   HEADER_LENGTH,
   MAGIC,
   FORMAT_VERSION,
+  CHUNK_BLOCK_SIZE,
+  CHUNKED_THRESHOLD,
 } from "./crypto/constants";
 import { deriveMasterKey } from "./crypto/key-derivation";
 import { nodeRequire } from "./crypto/platform";
-import { detectFormat } from "./crypto/format";
+import {
+  detectFormat,
+  parseChunkedContainer,
+  writeChunkedHeader,
+  writeSegment,
+  CHUNKED_HEADER_LENGTH,
+} from "./crypto/format";
 
 type NodeCrypto = typeof import("crypto");
 type NodeFs = typeof import("fs");
@@ -108,7 +116,11 @@ export class NodeCryptoEngine {
     this.assertUnlocked();
     const container = Buffer.isBuffer(input) ? input : Buffer.from(input);
 
-    if (detectFormat(container) !== "v2") {
+    const fmt = detectFormat(container);
+    if (fmt === "v2-chunked") {
+      return this.decryptChunkedBuffer(container);
+    }
+    if (fmt !== "v2") {
       throw new Error(
         "[NodeCryptoEngine] Неверный формат: ожидался контейнер v2 (MAGIC SVLT)"
       );
@@ -143,18 +155,30 @@ export class NodeCryptoEngine {
   }
 
   /**
-   * Потоковое шифрование srcPath → dstPath (формат v2).
+   * Потоковое шифрование srcPath → dstPath.
    *
-   * Файл на диске: [header(5)][IV(12)][ciphertext][tag(16)].
-   * Tag в GCM доступен только после cipher.final(), поэтому ciphertext
-   * буферизуется, а tag дописывается в конец (как в encryptBuffer).
+   * Маленькие/средние файлы (< CHUNKED_THRESHOLD) → цельный v2 (0x02):
+   *   layout [header(5)][IV(12)][ciphertext][tag(16)]. Цельный формат сохраняет
+   *   поведение для типичных заметок и байт-совместим с прошлыми версиями.
+   *
+   * Большие файлы (>= CHUNKED_THRESHOLD) → чанковый v2-chunked (0x03) РЕАЛЬНО
+   *   потоково: читаем по blockSize, каждый блок шифруем отдельным AES-GCM
+   *   (свой IV/tag) и сразу пишем сегмент в выходной поток — весь файл НЕ
+   *   буферизуется в RAM. Mobile WebCrypto умеет это прочитать.
+   *
    * Запись через .tmp + rename — атомарность.
    */
   async encryptStream(srcPath: string, dstPath: string): Promise<void> {
     this.assertUnlocked();
     const fs = this.fs;
-    const crypto = this.crypto;
 
+    const size = (await fs.promises.stat(srcPath)).size;
+    if (size >= CHUNKED_THRESHOLD) {
+      await this.encryptStreamChunked(srcPath, dstPath);
+      return;
+    }
+
+    const crypto = this.crypto;
     const iv = crypto.randomBytes(IV_LENGTH);
     const unique = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const tmpPath = `${dstPath}.${unique}.tmp`;
@@ -197,12 +221,113 @@ export class NodeCryptoEngine {
   }
 
   /**
-   * Потоковая расшифровка srcPath → dstPath (формат v2).
-   *
-   * Layout: [header(5)][IV(12)][ciphertext][tag(16)]. tag в конце, поэтому
-   * расшифровку нельзя стримить наивно: последние 16 байт — это tag, а не
-   * данные. Читаем весь файл, разбираем как в decryptBuffer, пишем результат.
-   * (Для типичных вложений это приемлемо; полноценный chunked-GCM — отдельная задача.)
+   * Реально потоковое чанковое шифрование (под-формат 0x03).
+   * Читает src блоками по CHUNK_BLOCK_SIZE, каждый блок шифрует независимым
+   * AES-GCM и дописывает сегмент в выход. Пиковая память ~ один блок.
+   */
+  private async encryptStreamChunked(srcPath: string, dstPath: string): Promise<void> {
+    const fs = this.fs;
+    const crypto = this.crypto;
+    const blockSize = CHUNK_BLOCK_SIZE;
+    const unique = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const tmpPath = `${dstPath}.${unique}.tmp`;
+
+    let writeStream: import("fs").WriteStream | null = null;
+    try {
+      writeStream = fs.createWriteStream(tmpPath);
+      const ws = writeStream;
+      const writeChunk = (data: Uint8Array): Promise<void> =>
+        new Promise((resolve, reject) => {
+          ws.write(Buffer.from(data), (err) => (err ? reject(err) : resolve()));
+        });
+
+      // Заголовок чанкового контейнера
+      await writeChunk(writeChunkedHeader(blockSize));
+
+      // Поблочное чтение src через readStream с highWaterMark = blockSize
+      const readStream = fs.createReadStream(srcPath, { highWaterMark: blockSize });
+      let carry: Buffer = Buffer.alloc(0);
+
+      const encryptAndWriteBlock = async (block: Buffer): Promise<void> => {
+        const iv = crypto.randomBytes(IV_LENGTH);
+        const cipher = crypto.createCipheriv(ALGORITHM_NODE, this.keyBuffer!, iv, {
+          authTagLength: GCM_TAG_LENGTH,
+        });
+        const ct = Buffer.concat([cipher.update(block), cipher.final()]);
+        const tag = cipher.getAuthTag();
+        const body = Buffer.concat([ct, tag]);
+        await writeChunk(writeSegment(iv, body));
+      };
+
+      await new Promise<void>((resolve, reject) => {
+        readStream.on("error", reject);
+        // Сериализуем обработку чанков: пока шифруем блок, поток на паузе.
+        readStream.on("data", (chunk: Buffer) => {
+          readStream.pause();
+          carry = carry.length === 0 ? chunk : Buffer.concat([carry, chunk]);
+          (async () => {
+            // Отдаём блоки ровно по blockSize; хвост остаётся в carry.
+            while (carry.length >= blockSize) {
+              const block = carry.subarray(0, blockSize);
+              carry = carry.subarray(blockSize);
+              await encryptAndWriteBlock(Buffer.from(block));
+            }
+            readStream.resume();
+          })().catch(reject);
+        });
+        readStream.on("end", () => {
+          (async () => {
+            if (carry.length > 0) {
+              await encryptAndWriteBlock(carry);
+              carry = Buffer.alloc(0);
+            }
+            resolve();
+          })().catch(reject);
+        });
+      });
+
+      await new Promise<void>((resolve, reject) => {
+        ws.end((err?: Error | null) => (err ? reject(err) : resolve()));
+      });
+      writeStream = null;
+
+      await fs.promises.rename(tmpPath, dstPath);
+    } catch (err) {
+      if (writeStream) writeStream.destroy();
+      await fs.promises.unlink(tmpPath).catch(() => undefined);
+      throw err;
+    }
+  }
+
+  /** Расшифровывает чанковый контейнер (0x03) целиком в памяти. */
+  private decryptChunkedBuffer(container: Buffer): Buffer {
+    const crypto = this.crypto;
+    const { segments } = parseChunkedContainer(container);
+    const out: Buffer[] = [];
+    for (const seg of segments) {
+      const tagStart = seg.body.length - GCM_TAG_LENGTH;
+      const ct = seg.body.subarray(0, tagStart);
+      const tag = seg.body.subarray(tagStart);
+      const decipher = crypto.createDecipheriv(ALGORITHM_NODE, this.keyBuffer!, seg.iv, {
+        authTagLength: GCM_TAG_LENGTH,
+      });
+      decipher.setAuthTag(Buffer.from(tag));
+      try {
+        out.push(Buffer.concat([decipher.update(ct), decipher.final()]));
+      } catch {
+        throw new Error(
+          "[NodeCryptoEngine] Расшифровка чанкового сегмента не удалась (Auth Tag mismatch)"
+        );
+      }
+    }
+    return Buffer.concat(out);
+  }
+
+  /**
+   * Потоковая расшифровка srcPath → dstPath. Поддерживает оба под-формата:
+   *   - v2 (0x02): tag в конце, наивный стриминг невозможен → читаем целиком.
+   *   - v2-chunked (0x03): сегменты с длинами читаются по одному, каждый
+   *     расшифровывается и пишется в выход — пиковая память ~ один блок.
    */
   async decryptStream(srcPath: string, dstPath: string): Promise<void> {
     this.assertUnlocked();
@@ -211,17 +336,104 @@ export class NodeCryptoEngine {
     const unique = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const tmpPath = `${dstPath}.${unique}.tmp`;
 
+    // Определяем под-формат по первым байтам без чтения всего файла.
+    let isChunked = false;
     try {
-      const container = await fs.promises.readFile(srcPath);
-      const plain = this.decryptBuffer(container);
-      await fs.promises.writeFile(tmpPath, plain);
+      const fd = await fs.promises.open(srcPath, "r");
+      try {
+        const head = Buffer.alloc(HEADER_LENGTH);
+        await fd.read(head, 0, HEADER_LENGTH, 0);
+        isChunked = detectFormat(head) === "v2-chunked";
+      } finally {
+        await fd.close();
+      }
+    } catch {
+      // открыть/прочитать заголовок не вышло — обработаем ниже единым путём
+    }
+
+    try {
+      if (isChunked) {
+        await this.decryptStreamChunked(srcPath, tmpPath);
+      } else {
+        const container = await fs.promises.readFile(srcPath);
+        const plain = this.decryptBuffer(container);
+        await fs.promises.writeFile(tmpPath, plain);
+      }
       await fs.promises.rename(tmpPath, dstPath);
     } catch (err) {
       await new Promise<void>((res) => fs.unlink(tmpPath, () => res()));
-      if (err instanceof Error && /Auth Tag mismatch|формат/.test(err.message)) {
+      if (err instanceof Error && /Auth Tag mismatch|формат|сегмент/.test(err.message)) {
         throw new Error(`[NodeCryptoEngine] Потоковая расшифровка: ${err.message}`);
       }
       throw err;
+    }
+  }
+
+  /**
+   * Потоковая расшифровка чанкового контейнера: читаем заголовок, затем
+   * посегментно по длинам, расшифровываем и пишем plaintext. Память ~ один блок.
+   */
+  private async decryptStreamChunked(srcPath: string, dstPath: string): Promise<void> {
+    const fs = this.fs;
+    const crypto = this.crypto;
+    const fd = await fs.promises.open(srcPath, "r");
+    let ws: import("fs").WriteStream | null = null;
+    try {
+      const header = Buffer.alloc(CHUNKED_HEADER_LENGTH);
+      const hr = await fd.read(header, 0, CHUNKED_HEADER_LENGTH, 0);
+      if (hr.bytesRead < CHUNKED_HEADER_LENGTH || detectFormat(header) !== "v2-chunked") {
+        throw new Error("формат: чанковый заголовок повреждён");
+      }
+
+      ws = fs.createWriteStream(dstPath);
+      const wstream = ws;
+      const writeOut = (data: Buffer): Promise<void> =>
+        new Promise((resolve, reject) => {
+          wstream.write(data, (err) => (err ? reject(err) : resolve()));
+        });
+
+      let pos = CHUNKED_HEADER_LENGTH;
+      const lenBuf = Buffer.alloc(4);
+      // Размер файла, чтобы понять где конец.
+      const total = (await fd.stat()).size;
+
+      while (pos < total) {
+        const lr = await fd.read(lenBuf, 0, 4, pos);
+        if (lr.bytesRead < 4) throw new Error("формат: обрезан префикс сегмента");
+        const segLen =
+          (lenBuf[0] | (lenBuf[1] << 8) | (lenBuf[2] << 16) | (lenBuf[3] << 24)) >>> 0;
+        pos += 4;
+        if (segLen < IV_LENGTH + GCM_TAG_LENGTH || pos + segLen > total) {
+          throw new Error("формат: неверная длина сегмента");
+        }
+        const seg = Buffer.alloc(segLen);
+        await fd.read(seg, 0, segLen, pos);
+        pos += segLen;
+
+        const iv = seg.subarray(0, IV_LENGTH);
+        const tagStart = segLen - GCM_TAG_LENGTH;
+        const ct = seg.subarray(IV_LENGTH, tagStart);
+        const tag = seg.subarray(tagStart);
+        const decipher = crypto.createDecipheriv(ALGORITHM_NODE, this.keyBuffer!, iv, {
+          authTagLength: GCM_TAG_LENGTH,
+        });
+        decipher.setAuthTag(tag);
+        let plain: Buffer;
+        try {
+          plain = Buffer.concat([decipher.update(ct), decipher.final()]);
+        } catch {
+          throw new Error("сегмент: Auth Tag mismatch");
+        }
+        await writeOut(plain);
+      }
+
+      await new Promise<void>((resolve, reject) => {
+        wstream.end((err?: Error | null) => (err ? reject(err) : resolve()));
+      });
+      ws = null;
+    } finally {
+      if (ws) ws.destroy();
+      await fd.close().catch(() => undefined);
     }
   }
 

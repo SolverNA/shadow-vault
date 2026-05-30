@@ -12,9 +12,40 @@
 export const MAGIC = new Uint8Array([0x53, 0x56, 0x4c, 0x54]); // "SVLT"
 export const MAGIC_LENGTH = 4;
 
-/** Версия формата контейнера */
+/** Версия формата контейнера (цельный v2: весь файл — один AES-GCM сегмент) */
 export const FORMAT_VERSION = 0x02;
 export const VERSION_LENGTH = 1;
+
+/**
+ * Версия чанкового под-формата (v2-chunked): файл разбит на независимые
+ * AES-GCM сегменты с собственным IV и tag. Нужен для реально потоковой
+ * обработки больших вложений без буферизации всего файла в RAM.
+ *
+ * Layout (см. crypto/format.ts):
+ *   [MAGIC "SVLT"(4)] [version 0x03(1)] [blockSize u32 LE(4)]
+ *   затем последовательность сегментов, каждый:
+ *     [segLen u32 LE(4)] [IV(12)] [ciphertext‖tag(16 в конце)]
+ *   где segLen = длина (IV + ciphertext + tag) данного сегмента.
+ *
+ * Каждый сегмент шифрует ровно blockSize байт plaintext (последний — остаток).
+ * Mobile и desktop ОБА обязаны уметь ЧИТАТЬ этот формат (writeChunkedHeader
+ * пишет пока только desktop). Это сохраняет кросс-совместимость.
+ */
+export const FORMAT_VERSION_CHUNKED = 0x03;
+
+/**
+ * Размер блока чанкового формата по умолчанию — 4 МБ plaintext на сегмент.
+ * Баланс: достаточно крупный, чтобы overhead заголовков сегментов был мал
+ * (~32 байта на 4 МБ), и достаточно мелкий, чтобы пиковая память была ограничена.
+ */
+export const CHUNK_BLOCK_SIZE = 4 * 1024 * 1024;
+
+/**
+ * Порог «большого файла»: файлы больше этого размера на DESKTOP пишутся в
+ * чанковом под-формате (0x03) потоково. Меньшие — цельным v2 (0x02), чтобы
+ * не менять поведение для типичных заметок.
+ */
+export const CHUNKED_THRESHOLD = 4 * 1024 * 1024;
 
 /** Длина префикса заголовка: MAGIC(4) + version(1) */
 export const HEADER_LENGTH = MAGIC_LENGTH + VERSION_LENGTH;
