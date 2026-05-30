@@ -35,12 +35,14 @@ import { VirtualShadowManager } from "./virtual-shadow-manager";
 import { AdapterPatcher } from "./adapter-patcher";
 import { AuthResult, AuthService } from "./auth-service";
 import { InitModal } from "./init-modal";
+import { PinStore } from "./pin-store";
+import { deriveMasterKey } from "./crypto/key-derivation";
 // Desktop-only модули грузятся ЛЕНИВО (await import) только в desktop-ветке
 // onUnlockDesktop — их top-level node-импорты не должны выполняться на mobile.
 import type { ShadowVaultManager } from "./shadow-vault-manager";
 import type { SessionManager } from "./session-manager";
 import { ShadowVaultSettingTab } from "./settings-tab";
-import { DEFAULT_SETTINGS, PluginSettings, VERIFICATION_PLAINTEXT, STUB_EMAIL } from "./types";
+import { DEFAULT_SETTINGS, PluginSettings, VERIFICATION_PLAINTEXT } from "./types";
 import { IDataAdapter, ListedFiles } from "./adapter-types";
 import { ENCRYPTED_EXT, listEncryptedDir } from "./fs-utils";
 
@@ -174,14 +176,15 @@ export default class ShadowVaultPlugin extends Plugin {
     }
 
     // 1. Верифицируем старый пароль независимо от активной сессии —
-    //    защита от смены пароля на разблокированном чужом устройстве
-    const checkEngine = await AuthService.verifyPassword(oldPassword, this.settings);
+    //    защита от смены пароля на разблокированном чужом устройстве.
+    //    Email берётся из сохранённых настроек (соль = SHA-256(email‖domain)).
+    const email = this.settings.email;
+    const checkEngine = await AuthService.verifyPassword(email, oldPassword, this.settings);
     checkEngine.destroy();
 
-    // 2. Создаём движок с новым паролем
+    // 2. Создаём движок с новым паролем (тот же email → та же соль)
     const newEngine = new CryptoEngine();
-    // TODO(ФАЗА 3): передавать реальный email из формы входа вместо STUB_EMAIL
-    await newEngine.deriveKey(STUB_EMAIL, newPassword);
+    await newEngine.deriveKey(email, newPassword);
 
     // 3. Пере-шифруем все файлы (двухфазно, атомарно)
     try {
@@ -202,8 +205,51 @@ export default class ShadowVaultPlugin extends Plugin {
 
     newEngine.destroy();
 
+    // PIN привязан к старому masterKey → после смены пароля он невалиден.
+    // Стираем PIN-данные, чтобы не оставить нерабочий быстрый вход.
+    new PinStore().clearPin();
+
     // 5. Блокируем — при следующем входе используется новый пароль
     await this.lockVault();
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // PIN — быстрый локальный вход (device-local key-wrapping)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /** true, если на этом устройстве настроен PIN-вход. */
+  isPinEnabled(): boolean {
+    return new PinStore().isPinSet();
+  }
+
+  /**
+   * Задаёт/меняет PIN. Требует подтверждения пароля: из него re-деривируется
+   * masterKey, который оборачивается ключом из PIN и сохраняется ЛОКАЛЬНО
+   * (window.localStorage) — НИКОГДА в data.json/синхронизируемые файлы.
+   *
+   * @throws PasswordError если пароль неверный
+   */
+  async setupPin(password: string, pin: string): Promise<void> {
+    if (!/^\d{4,8}$/.test(pin)) {
+      throw new Error("PIN должен состоять из 4–8 цифр.");
+    }
+    const email = this.settings.email;
+    // Проверяем пароль через verificationBlob (бросит PasswordError при ошибке).
+    const checkEngine = await AuthService.verifyPassword(email, password, this.settings);
+    checkEngine.destroy();
+
+    // Re-деривируем сырой мастер-ключ и оборачиваем его PIN-ключом.
+    const masterKey = await deriveMasterKey(email, password);
+    try {
+      await new PinStore().enablePin(pin, masterKey);
+    } finally {
+      masterKey.fill(0);
+    }
+  }
+
+  /** Удаляет PIN-данные с устройства. */
+  removePin(): void {
+    new PinStore().clearPin();
   }
 
   /**
@@ -238,6 +284,8 @@ export default class ShadowVaultPlugin extends Plugin {
     this.settings.verificationBlob = null;
     this.settings.encryptionDisabled = true;
     await this.saveSettings();
+    // Шифрование отключено → PIN больше не нужен и невалиден.
+    new PinStore().clearPin();
 
     // 3. Снимаем mount/patch адаптера и удаляем shadow
     this.sessionActive = false;
@@ -347,7 +395,7 @@ export default class ShadowVaultPlugin extends Plugin {
    * должна уничтожить engine и показать понятное сообщение.
    */
   private async onUnlock(result: AuthResult): Promise<void> {
-    const { engine, password, isFirstRun } = result;
+    const { engine, password, email, rawKey, isFirstRun } = result;
 
     // Десктопная архитектура (старая, Node.js).
     // На десктопе фабрика гарантированно вернула NodeCryptoEngine (см. AuthService).
@@ -357,8 +405,9 @@ export default class ShadowVaultPlugin extends Plugin {
     }
 
     // Мобильная архитектура (новая, Web APIs).
-    // engine здесь — WebCryptoEngine; main.ts всё равно пересоздаёт его из пароля.
-    await this.onUnlockMobile(engine, password, isFirstRun);
+    // engine здесь — WebCryptoEngine; main.ts пересоздаёт его из email+password
+    // (обычный вход) либо из сырого мастер-ключа (вход по PIN).
+    await this.onUnlockMobile(engine, { password, email, rawKey }, isFirstRun);
   }
 
   /**
@@ -498,14 +547,23 @@ export default class ShadowVaultPlugin extends Plugin {
   /**
    * Мобильная инициализация (Web APIs, виртуальный shadow в памяти)
    */
-  private async onUnlockMobile(engine: CryptoEngine | WebCryptoEngine, password: string, isFirstRun: boolean): Promise<void> {
+  private async onUnlockMobile(
+    engine: CryptoEngine | WebCryptoEngine,
+    creds: { password: string | null; email: string; rawKey?: Uint8Array },
+    isFirstRun: boolean
+  ): Promise<void> {
     try {
       console.info("[ShadowVault] onUnlockMobile: старт");
 
       // ── Phase 1: создаём Web Crypto engine ────────────────────────────
       const webEngine = new WebCryptoEngine();
-      // TODO(ФАЗА 3): передавать реальный email из формы входа вместо STUB_EMAIL
-      await webEngine.deriveKey(STUB_EMAIL, password);
+      if (creds.rawKey) {
+        // Вход по PIN: загружаем уже развёрнутый мастер-ключ напрямую.
+        await webEngine.loadRawKey(creds.rawKey);
+      } else {
+        // Обычный вход: деривируем ключ из email + пароля.
+        await webEngine.deriveKey(creds.email, creds.password ?? "");
+      }
       this.cryptoEngine = webEngine;
 
       // Уничтожаем десктопный engine, он больше не нужен

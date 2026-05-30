@@ -17,9 +17,11 @@
  */
 
 import { App, Modal } from "obsidian";
-import { PluginSettings } from "./types";
+import { PluginSettings, isValidEmail } from "./types";
 import { AuthService, AuthResult, PasswordError, SettingsCorruptedError, SaveSettingsFn } from "./auth-service";
 import { createPasswordField } from "./password-field";
+import { PinStore, PinError, PinLockoutError } from "./pin-store";
+import { createCryptoEngine } from "./crypto/factory";
 
 export type UnlockCallback = (result: AuthResult) => void;
 
@@ -35,9 +37,15 @@ export class InitModal extends Modal {
   /** Текущий экран (только для orphan-режима) */
   private orphanScreen: OrphanScreen = "choice";
 
+  private pinStore: PinStore;
+  /** true — на экране разблокировки показан ввод PIN вместо пароля */
+  private pinMode = false;
+
   // DOM-элементы — устанавливаются в render()
+  private inputEmail: HTMLInputElement | null = null;
   private inputPassword: HTMLInputElement | null = null;
   private inputConfirm: HTMLInputElement | null = null;
+  private inputPin: HTMLInputElement | null = null;
   private btnSubmit: HTMLButtonElement | null = null;
   private errorEl: HTMLElement | null = null;
   private loadingEl: HTMLElement | null = null;
@@ -58,6 +66,9 @@ export class InitModal extends Modal {
     this.onUnlock = onUnlock;
     this.authService = new AuthService();
     this.orphanVault = orphanVault;
+    this.pinStore = new PinStore();
+    // Если на устройстве настроен PIN — по умолчанию предлагаем вход по PIN.
+    this.pinMode = this.pinStore.isPinSet() && settings.verificationBlob !== null && !orphanVault;
   }
 
   onOpen(): void {
@@ -92,8 +103,10 @@ export class InitModal extends Modal {
     contentEl.empty();
 
     // Сброс DOM-refs
+    this.inputEmail = null;
     this.inputPassword = null;
     this.inputConfirm = null;
+    this.inputPin = null;
     this.btnSubmit = null;
     this.errorEl = null;
     this.loadingEl = null;
@@ -118,13 +131,35 @@ export class InitModal extends Modal {
 
     if (this.settings.verificationBlob === null) {
       this.renderHeader(contentEl, "🔐", "Создать зашифрованное хранилище",
-        "Придумайте надёжный пароль. Восстановить его будет невозможно.");
+        "Укажите email и придумайте надёжный пароль. Восстановить пароль будет невозможно.");
       this.renderCreateForm(contentEl);
+    } else if (this.pinMode) {
+      this.renderHeader(contentEl, "🔢", "Вход по PIN",
+        "Введите PIN-код для быстрого входа.");
+      this.renderPinForm(contentEl);
     } else {
       this.renderHeader(contentEl, "🔐", "Разблокировать хранилище",
         "Введите пароль для расшифровки хранилища.");
       this.renderUnlockForm(contentEl);
     }
+  }
+
+  /** Создаёт поле email (текстовое, не пароль). */
+  private createEmailField(parent: HTMLElement, value: string, readOnly: boolean): HTMLInputElement {
+    const wrapper = parent.createEl("div", { cls: "sv-field" });
+    wrapper.createEl("label", { text: "Email", attr: { for: "sv-email" } });
+    const input = wrapper.createEl("input", {
+      type: "email",
+      attr: {
+        id: "sv-email",
+        placeholder: "you@example.com",
+        autocomplete: "off",
+        spellcheck: "false",
+        ...(readOnly ? { readonly: "true" } : {}),
+      },
+    });
+    input.value = value;
+    return input;
   }
 
   private renderHeader(parent: HTMLElement, icon: string, title: string, subtitle: string): void {
@@ -173,9 +208,11 @@ export class InitModal extends Modal {
     });
   }
 
-  /** Форма восстановления: одно поле пароля, без подтверждения */
+  /** Форма восстановления: email + пароль, без подтверждения */
   private renderRestoreForm(parent: HTMLElement): void {
     const form = parent.createEl("div", { cls: "shadow-vault-form" });
+
+    this.inputEmail = this.createEmailField(form, this.settings.email || "", false);
 
     this.inputPassword = createPasswordField({
       parent: form,
@@ -203,9 +240,11 @@ export class InitModal extends Modal {
     setTimeout(() => this.inputPassword?.focus(), 50);
   }
 
-  /** Форма создания хранилища: пароль + подтверждение */
+  /** Форма создания хранилища: email + пароль + подтверждение */
   private renderCreateForm(parent: HTMLElement): void {
     const form = parent.createEl("div", { cls: "shadow-vault-form" });
+
+    this.inputEmail = this.createEmailField(form, this.settings.email || "", false);
 
     this.inputPassword = createPasswordField({
       parent: form,
@@ -245,9 +284,12 @@ export class InitModal extends Modal {
     setTimeout(() => this.inputPassword?.focus(), 50);
   }
 
-  /** Форма разблокировки: только пароль */
+  /** Форма разблокировки: email (read-only, если сохранён) + пароль */
   private renderUnlockForm(parent: HTMLElement): void {
     const form = parent.createEl("div", { cls: "shadow-vault-form" });
+
+    const hasSavedEmail = !!this.settings.email;
+    this.inputEmail = this.createEmailField(form, this.settings.email || "", hasSavedEmail);
 
     this.inputPassword = createPasswordField({
       parent: form,
@@ -263,7 +305,56 @@ export class InitModal extends Modal {
       if (e.key === "Enter") void this.handleSubmit();
     });
 
-    setTimeout(() => this.inputPassword?.focus(), 50);
+    // Ссылка на вход по PIN (если на устройстве он настроен).
+    if (this.pinStore.isPinSet()) {
+      const pinLink = form.createEl("button", {
+        cls: "shadow-vault-btn sv-btn-back",
+        text: "🔢 Войти по PIN",
+      });
+      pinLink.addEventListener("click", () => {
+        this.pinMode = true;
+        this.render();
+      });
+    }
+
+    setTimeout(() => (hasSavedEmail ? this.inputPassword : this.inputEmail)?.focus(), 50);
+  }
+
+  /** Форма входа по PIN. */
+  private renderPinForm(parent: HTMLElement): void {
+    const form = parent.createEl("div", { cls: "shadow-vault-form" });
+
+    const wrapper = form.createEl("div", { cls: "sv-field" });
+    wrapper.createEl("label", { text: "PIN-код", attr: { for: "sv-pin" } });
+    this.inputPin = wrapper.createEl("input", {
+      type: "password",
+      attr: {
+        id: "sv-pin",
+        inputmode: "numeric",
+        placeholder: "Введите PIN…",
+        autocomplete: "off",
+      },
+    });
+
+    this.renderSharedControls(form);
+    this.btnSubmit!.textContent = "Войти";
+
+    this.inputPin.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") void this.handlePinSubmit();
+    });
+    // Перенаправляем submit-кнопку на PIN-обработчик.
+    this.btnSubmit!.onclick = () => { void this.handlePinSubmit(); };
+
+    const pwdLink = form.createEl("button", {
+      cls: "shadow-vault-btn sv-btn-back",
+      text: "Войти по паролю",
+    });
+    pwdLink.addEventListener("click", () => {
+      this.pinMode = false;
+      this.render();
+    });
+
+    setTimeout(() => this.inputPin?.focus(), 50);
   }
 
   /** Общие элементы всех форм: ошибка, загрузка, кнопка submit */
@@ -290,10 +381,21 @@ export class InitModal extends Modal {
     if (!this.inputPassword || !this.btnSubmit || !this.errorEl) return;
     this.hideError();
     const password = this.inputPassword.value;
+    // Email: из поля ввода (если редактируемое) либо из сохранённых настроек.
+    const email = (this.inputEmail?.value ?? this.settings.email ?? "").trim();
 
     const isCreateMode =
       (!this.orphanVault && this.settings.verificationBlob === null) ||
       (this.orphanVault && this.orphanScreen === "create");
+
+    // Мягкая валидация email на всех экранах ввода email.
+    if (this.inputEmail && !this.inputEmail.hasAttribute("readonly")) {
+      if (!isValidEmail(email)) {
+        this.showError("Введите корректный email (например you@example.com).");
+        this.inputEmail.focus();
+        return;
+      }
+    }
 
     // В create-режиме: пароли должны совпасть, минимум 8 символов
     if (isCreateMode) {
@@ -314,6 +416,7 @@ export class InitModal extends Modal {
 
     try {
       const result = await this.authService.authenticate(
+        email,
         password,
         this.settings,
         this.saveFn
@@ -341,11 +444,67 @@ export class InitModal extends Modal {
     }
   }
 
+  /**
+   * Вход по PIN: разворачивает локальный wrapped-ключ, строит движок из
+   * сырого мастер-ключа и отдаёт его как AuthResult (без пароля).
+   */
+  private async handlePinSubmit(): Promise<void> {
+    if (!this.inputPin || !this.btnSubmit || !this.errorEl) return;
+    this.hideError();
+    const pin = this.inputPin.value;
+    if (!pin.trim()) {
+      this.showError("Введите PIN.");
+      return;
+    }
+
+    this.setLoading(true);
+    let rawKey: Uint8Array | null = null;
+    try {
+      rawKey = await this.pinStore.unlockWithPin(pin);
+
+      // Строим движок из сырого мастер-ключа (минуя PBKDF2 из пароля).
+      const engine = createCryptoEngine();
+      await Promise.resolve((engine as { loadRawKey: (k: Uint8Array) => unknown }).loadRawKey(rawKey));
+
+      const result: AuthResult = {
+        engine,
+        password: null,
+        email: this.settings.email,
+        rawKey: rawKey.slice(),
+        isFirstRun: false,
+      };
+
+      this.inputPin.value = "";
+      this.allowClose = true;
+      this.close();
+      this.onUnlock(result);
+    } catch (err) {
+      this.setLoading(false);
+      if (err instanceof PinLockoutError) {
+        // PIN сброшен → возвращаемся к вводу пароля.
+        this.pinMode = false;
+        this.render();
+        this.showError(`⚠️ ${err.message}`);
+      } else if (err instanceof PinError) {
+        this.showError(err.message);
+        this.inputPin.select();
+        this.inputPin.focus();
+      } else {
+        this.showError("Ошибка входа по PIN. Войдите по паролю.");
+        console.error("[ShadowVault] PIN unlock ошибка:", err);
+        this.pinMode = false;
+        this.render();
+      }
+    }
+  }
+
   private setLoading(active: boolean): void {
-    if (!this.btnSubmit || !this.loadingEl || !this.inputPassword) return;
+    if (!this.btnSubmit || !this.loadingEl) return;
     this.btnSubmit.disabled = active;
-    this.inputPassword.disabled = active;
+    if (this.inputPassword) this.inputPassword.disabled = active;
     if (this.inputConfirm) this.inputConfirm.disabled = active;
+    if (this.inputEmail) this.inputEmail.disabled = active;
+    if (this.inputPin) this.inputPin.disabled = active;
 
     if (active) {
       this.loadingEl.removeClass("sv-hidden");

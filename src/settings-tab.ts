@@ -11,6 +11,8 @@ import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type ShadowVaultPlugin from "./main";
 import { ChangePasswordModal } from "./change-password-modal";
 import { ConfirmModal } from "./confirm-modal";
+import { SetPinModal } from "./set-pin-modal";
+import { PinStore } from "./pin-store";
 
 export class ShadowVaultSettingTab extends PluginSettingTab {
   constructor(app: App, private readonly plugin: ShadowVaultPlugin) {
@@ -92,6 +94,84 @@ export class ShadowVaultSettingTab extends PluginSettingTab {
           .setWarning()
           .onClick(async () => {
             await this.plugin.lockVault();
+          });
+      });
+
+    // ── Учётная запись (email) ─────────────────────────────────────────
+    new Setting(containerEl).setName("Учётная запись").setHeading();
+
+    new Setting(containerEl)
+      .setName("Email")
+      .setDesc(
+        "Email задаёт соль деривации ключа. Сейчас смену email делать НЕЛЬЗЯ: " +
+        "новый email = новый ключ = существующие файлы станут нечитаемыми " +
+        "без перешифровки (запланировано на будущей фазе миграции)."
+      )
+      .addText((text) => {
+        text
+          .setValue(this.plugin.settings.email || "(не задан)")
+          .setDisabled(true); // read-only: смена email = TODO(ФАЗА 4 миграция)
+      });
+
+    // ── Быстрый вход: PIN ──────────────────────────────────────────────
+    new Setting(containerEl).setName("Быстрый вход").setHeading();
+
+    const pinStore = new PinStore();
+    const pinSet = pinStore.isPinSet();
+
+    new Setting(containerEl)
+      .setName("PIN-код")
+      .setDesc(
+        pinSet
+          ? "PIN настроен для этого устройства (хранится локально, не синхронизируется)."
+          : "Задайте PIN (4–8 цифр) для быстрого входа на этом устройстве. " +
+            "PIN не заменяет пароль и хранится только локально."
+      )
+      .addButton((btn) => {
+        btn
+          .setButtonText(pinSet ? "Сменить PIN" : "Задать PIN")
+          .onClick(() => {
+            if (this.plugin.settings.verificationBlob === null) {
+              new Notice("🔒 Сначала создайте/разблокируйте хранилище.", 4000);
+              return;
+            }
+            new SetPinModal(this.app, this.plugin).open();
+          });
+      });
+
+    if (pinSet) {
+      new Setting(containerEl)
+        .setName("Удалить PIN")
+        .setDesc("Отключить быстрый вход по PIN на этом устройстве.")
+        .addButton((btn) => {
+          btn
+            .setButtonText("Удалить PIN")
+            .setWarning()
+            .onClick(() => {
+              this.plugin.removePin();
+              new Notice("PIN удалён с этого устройства.", 4000);
+              this.display();
+            });
+        });
+    }
+
+    // ── Биометрия (опционально, точка расширения) ──────────────────────
+    const biometricSupported = pinStore.isBiometricSupported();
+    new Setting(containerEl)
+      .setName("Биометрия")
+      .setDesc(
+        biometricSupported
+          ? "Разблокировка по биометрии (тот же локальный механизм, что и PIN)."
+          : "Биометрия пока недоступна: плагин Obsidian в песочнице не имеет " +
+            "прямого доступа к FaceID/Touch ID. Будет включена, когда появится " +
+            "поддерживаемый API устройства."
+      )
+      .addToggle((tg) => {
+        tg
+          .setValue(pinStore.isBiometricEnabled())
+          .setDisabled(!biometricSupported) // TODO(биометрия): нет нативного API
+          .onChange((v) => {
+            pinStore.setBiometricEnabled(v);
           });
       });
 
