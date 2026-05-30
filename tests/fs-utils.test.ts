@@ -20,8 +20,11 @@ import {
   fileExists,
   filesEqual,
   isTempFile,
+  listEncryptedDir,
   parallelMap,
   removeSymlink,
+  walkDir,
+  WalkEntry,
 } from "../src/fs-utils";
 
 let tmpBase: string;
@@ -294,5 +297,98 @@ describe("atomicWrite", () => {
     await atomicWrite(p, Buffer.from("data"), ".sessiontmp");
     expect(fs.readFileSync(p, "utf8")).toBe("data");
     expect(await fileExists(p + ".sessiontmp")).toBe(false);
+  });
+});
+
+// ─────────────────────────────────────────────
+// walkDir — единый рекурсивный сканер каталогов
+// ─────────────────────────────────────────────
+
+describe("walkDir", () => {
+  beforeEach(async () => {
+    // структура: a.md, sub/b.md, sub/deep/c.md, .hidden/x.md
+    fs.writeFileSync(nodePath.join(tmpBase, "a.md"), "a");
+    fs.mkdirSync(nodePath.join(tmpBase, "sub", "deep"), { recursive: true });
+    fs.writeFileSync(nodePath.join(tmpBase, "sub", "b.md"), "b");
+    fs.writeFileSync(nodePath.join(tmpBase, "sub", "deep", "c.md"), "c");
+    fs.mkdirSync(nodePath.join(tmpBase, ".hidden"));
+    fs.writeFileSync(nodePath.join(tmpBase, ".hidden", "x.md"), "x");
+  });
+
+  it("обходит рекурсивно и отдаёт relative-пути через '/'", async () => {
+    const files: string[] = [];
+    await walkDir(tmpBase, (e: WalkEntry) => {
+      if (e.isFile) files.push(e.rel);
+      return "recurse";
+    });
+    expect(files.sort()).toEqual(
+      [".hidden/x.md", "a.md", "sub/b.md", "sub/deep/c.md"].sort()
+    );
+  });
+
+  it("'skip' для каталога не заходит внутрь", async () => {
+    const files: string[] = [];
+    await walkDir(tmpBase, (e: WalkEntry) => {
+      if (e.isDirectory && e.name.startsWith(".")) return "skip";
+      if (e.isFile) files.push(e.rel);
+      return "recurse";
+    });
+    expect(files).not.toContain(".hidden/x.md");
+    expect(files).toContain("a.md");
+    expect(files).toContain("sub/deep/c.md");
+  });
+
+  it("несуществующий каталог трактуется как пустой (без throw)", async () => {
+    const visited: string[] = [];
+    await walkDir(nodePath.join(tmpBase, "nope"), (e) => {
+      visited.push(e.rel);
+      return "recurse";
+    });
+    expect(visited).toEqual([]);
+  });
+});
+
+// ─────────────────────────────────────────────
+// listEncryptedDir — единый list-транслятор .enc → имена
+// ─────────────────────────────────────────────
+
+describe("listEncryptedDir", () => {
+  it("снимает суффикс .enc и пропускает dot/временные файлы", async () => {
+    fs.writeFileSync(nodePath.join(tmpBase, "note.md.enc"), "x");
+    fs.writeFileSync(nodePath.join(tmpBase, "image.png.enc"), "x");
+    fs.writeFileSync(nodePath.join(tmpBase, "plain.md"), "x"); // не .enc — скрываем
+    fs.writeFileSync(nodePath.join(tmpBase, ".session_active"), "x");
+    fs.writeFileSync(nodePath.join(tmpBase, "tmp.md.enc.shadowtmp"), "x");
+    fs.mkdirSync(nodePath.join(tmpBase, "folder"));
+
+    const res = await listEncryptedDir(tmpBase, "", ".obsidian");
+    expect(res.files.sort()).toEqual(["image.png", "note.md"].sort());
+    expect(res.folders).toEqual(["folder"]);
+  });
+
+  it("показывает configDir несмотря на dot-префикс", async () => {
+    fs.mkdirSync(nodePath.join(tmpBase, ".obsidian"));
+    const res = await listEncryptedDir(tmpBase, "", ".obsidian");
+    expect(res.folders).toContain(".obsidian");
+  });
+
+  it("проставляет префикс normalizedPath к именам", async () => {
+    fs.mkdirSync(nodePath.join(tmpBase, "sub"));
+    fs.writeFileSync(nodePath.join(tmpBase, "sub", "n.md.enc"), "x");
+    const res = await listEncryptedDir(
+      nodePath.join(tmpBase, "sub"),
+      "sub",
+      ".obsidian"
+    );
+    expect(res.files).toEqual(["sub/n.md"]);
+  });
+
+  it("несуществующий каталог → пустой результат", async () => {
+    const res = await listEncryptedDir(
+      nodePath.join(tmpBase, "nope"),
+      "nope",
+      ".obsidian"
+    );
+    expect(res).toEqual({ files: [], folders: [] });
   });
 });

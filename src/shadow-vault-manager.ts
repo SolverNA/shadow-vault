@@ -37,8 +37,10 @@ import {
   fileExists,
   filesEqual,
   isTempFile,
+  listEncryptedDir,
   parallelMap,
   removeSymlink,
+  walkDir,
 } from "./fs-utils";
 
 /**
@@ -620,35 +622,16 @@ export class ShadowVaultManager {
    * Пропускает .obsidian (symlink → оригинал, не шифруется),
    * скрытые файлы и временные .tmp/.shadowtmp.
    */
-  private async scanShadowFilesForSync(relDir = ""): Promise<string[]> {
+  private async scanShadowFilesForSync(): Promise<string[]> {
     const result: string[] = [];
-    const absDir = relDir
-      ? nodePath.join(this.shadowRoot, ...relDir.split("/"))
-      : this.shadowRoot;
-
-    let entries: fs.Dirent[];
-    try {
-      entries = await fsp.readdir(absDir, { withFileTypes: true });
-    } catch {
-      return result;
-    }
-
-    const prefix = relDir ? relDir + "/" : "";
-    for (const entry of entries) {
-      // .obsidian — symlink на оригинал, его шифровать не надо
-      if (entry.name === this.configDir) continue;
-      // Скрытые/служебные
-      if (entry.name.startsWith(".")) continue;
-      // Временные файлы атомарных операций
-      if (isTempFile(entry.name)) continue;
-
-      const rel = prefix + entry.name;
-      if (entry.isDirectory()) {
-        result.push(...await this.scanShadowFilesForSync(rel));
-      } else if (entry.isFile()) {
-        result.push(rel);
+    await walkDir(this.shadowRoot, (e) => {
+      // .obsidian — symlink на оригинал; скрытые/служебные; временные — пропуск
+      if (e.name === this.configDir || e.name.startsWith(".") || isTempFile(e.name)) {
+        return "skip";
       }
-    }
+      if (e.isFile) result.push(e.rel);
+      return "recurse";
+    });
     return result;
   }
 
@@ -887,31 +870,18 @@ export class ShadowVaultManager {
    * Пропускает: dotfiles (включая configDir — для него отдельный symlink).
    * Возвращает количество созданных директорий (для прогресс-логов).
    */
-  private async replicateFolderStructure(relDir = ""): Promise<number> {
+  private async replicateFolderStructure(): Promise<number> {
     let count = 0;
-    const absDir = relDir
-      ? nodePath.join(this.originalRoot, ...relDir.split("/"))
-      : this.originalRoot;
-
-    let entries: fs.Dirent[];
-    try {
-      entries = await fsp.readdir(absDir, { withFileTypes: true });
-    } catch {
-      return 0;
-    }
-
-    for (const entry of entries) {
-      if (entry.name.startsWith(".")) continue;
-      if (!entry.isDirectory()) continue;
-
-      const rel = relDir ? relDir + "/" + entry.name : entry.name;
-      const shadowDirAbs = nodePath.join(this.shadowRoot, ...rel.split("/"));
-      await fsp.mkdir(shadowDirAbs, { recursive: true });
+    const mkdirs: Promise<unknown>[] = [];
+    await walkDir(this.originalRoot, (e) => {
+      if (e.name.startsWith(".") || !e.isDirectory) return "skip";
+      const shadowDirAbs = nodePath.join(this.shadowRoot, ...e.rel.split("/"));
+      mkdirs.push(fsp.mkdir(shadowDirAbs, { recursive: true }));
       count++;
-
       // Рекурсивно — не теряем глубоко вложенные пустые папки
-      count += await this.replicateFolderStructure(rel);
-    }
+      return "recurse";
+    });
+    await Promise.all(mkdirs);
     return count;
   }
 
@@ -919,29 +889,15 @@ export class ShadowVaultManager {
    * Сканирует оригинальное хранилище и возвращает normalizedPath
    * для всех зашифрованных файлов (.enc).
    */
-  private async scanEncryptedFiles(relDir = ""): Promise<string[]> {
+  private async scanEncryptedFiles(): Promise<string[]> {
     const result: string[] = [];
-    const absDir = relDir
-      ? nodePath.join(this.originalRoot, ...relDir.split("/"))
-      : this.originalRoot;
-
-    let entries: fs.Dirent[];
-    try {
-      entries = await fsp.readdir(absDir, { withFileTypes: true });
-    } catch {
-      return result;
-    }
-
-    const prefix = relDir ? relDir + "/" : "";
-    for (const entry of entries) {
-      if (entry.name.startsWith(".")) continue;
-      const rel = prefix + entry.name;
-      if (entry.isDirectory()) {
-        result.push(...await this.scanEncryptedFiles(rel));
-      } else if (entry.isFile() && entry.name.endsWith(ENCRYPTED_EXT)) {
-        result.push(rel.slice(0, -ENCRYPTED_EXT.length));
+    await walkDir(this.originalRoot, (e) => {
+      if (e.name.startsWith(".")) return "skip";
+      if (e.isFile && e.name.endsWith(ENCRYPTED_EXT)) {
+        result.push(e.rel.slice(0, -ENCRYPTED_EXT.length));
       }
-    }
+      return "recurse";
+    });
     return result;
   }
 
@@ -1152,37 +1108,13 @@ export class ShadowVaultManager {
       return this.originalMethods.list!(normalizedPath);
     }
 
-    // Источник истины: оригинальное хранилище (содержит .enc файлы)
-    const absDir = this.originalAbs(normalizedPath);
-    const files: string[] = [];
-    const folders: string[] = [];
-
-    let entries: fs.Dirent[];
-    try {
-      entries = await fsp.readdir(absDir, { withFileTypes: true });
-    } catch {
-      return { files: [], folders: [] };
-    }
-
-    const prefix = normalizedPath ? normalizedPath + "/" : "";
-    for (const entry of entries) {
-      // Скрытые файлы (.session_active и т.п.) — не показываем Obsidian
-      if (entry.name.startsWith(".") && entry.name !== this.configDir) continue;
-      // Временные файлы атомарных операций
-      if (isTempFile(entry.name)) continue;
-
-      if (entry.isDirectory()) {
-        folders.push(prefix + entry.name);
-      } else if (entry.isFile() && entry.name.endsWith(ENCRYPTED_EXT)) {
-        // Снимаем суффикс .enc — Obsidian видит обычные имена файлов
-        const baseName = entry.name.slice(0, -ENCRYPTED_EXT.length);
-        files.push(prefix + baseName);
-      }
-      // Не-.enc файлы в оригинальном хранилище не показываем:
-      // они либо ещё не прошли миграцию (редко), либо системные файлы
-    }
-
-    return { files, folders };
+    // Источник истины: оригинальное хранилище (содержит .enc файлы).
+    // Единый list-транслятор (см. fs-utils.listEncryptedDir).
+    return listEncryptedDir(
+      this.originalAbs(normalizedPath),
+      normalizedPath,
+      this.configDir
+    );
   }
 
   private async patchedMkdir(normalizedPath: string): Promise<void> {
