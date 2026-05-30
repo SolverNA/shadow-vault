@@ -11,16 +11,41 @@
  * Соль не используется — ключ зависит только от пароля, см. CryptoEngine.
  */
 
-import { CryptoEngine } from "./crypto-engine";
+import { createCryptoEngine, AnyCryptoEngine } from "./crypto/factory";
 import {
   PluginSettings,
   VERIFICATION_PLAINTEXT,
+  STUB_EMAIL,
 } from "./types";
 
 export type SaveSettingsFn = (settings: PluginSettings) => Promise<void>;
 
+/** Приводит результат encryptBuffer (Buffer | ArrayBuffer) к Uint8Array. */
+function toBytes(x: unknown): Uint8Array {
+  if (x instanceof Uint8Array) return x;
+  if (x instanceof ArrayBuffer) return new Uint8Array(x);
+  throw new Error("[AuthService] неподдерживаемый результат движка");
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  let s = "";
+  for (let i = 0; i < bytes.length; i++) s += bytes[i].toString(16).padStart(2, "0");
+  return s;
+}
+
+function hexToBytes(hex: string): Uint8Array {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return out;
+}
+
 export interface AuthResult {
-  engine: CryptoEngine;
+  /**
+   * Движок с загруженным ключом. На десктопе — NodeCryptoEngine, на мобильных —
+   * WebCryptoEngine (выбор делает фабрика по платформе). main.ts на десктопе
+   * использует его напрямую, на мобильных пересоздаёт WebCryptoEngine из пароля.
+   */
+  engine: AnyCryptoEngine;
   /** Пароль для инициализации WebCryptoEngine на мобильных */
   password: string;
   /** true если это был первый запуск и настройки уже сохранены */
@@ -56,18 +81,24 @@ export class AuthService {
 
     if (isFirstRun) {
       // ── Первый запуск: создаём хранилище ──────────────────────────────────
-      const engine = new CryptoEngine();
-      await engine.deriveKey(password);
+      // Фабрика выбирает движок по платформе (Node на десктопе, Web на mobile).
+      // Формат v2 идентичен на обеих платформах, поэтому verificationBlob
+      // кросс-платформенно совместим.
+      const engine = createCryptoEngine();
+      // TODO(ФАЗА 3): передавать реальный email из формы входа вместо STUB_EMAIL
+      await engine.deriveKey(STUB_EMAIL, password);
 
       // Шифруем маркер верификации — чтобы при следующем входе можно было
       // проверить пароль, не расшифровывая реальные файлы
-      const verificationBuf = engine.encryptBuffer(
-        Buffer.from(VERIFICATION_PLAINTEXT, "utf8")
+      const verificationBytes = toBytes(
+        await Promise.resolve(
+          engine.encryptBuffer(Buffer.from(VERIFICATION_PLAINTEXT, "utf8") as Uint8Array)
+        )
       );
 
       const updatedSettings: PluginSettings = {
         ...settings,
-        verificationBlob: verificationBuf.toString("hex"),
+        verificationBlob: bytesToHex(verificationBytes),
       };
 
       await saveFn(updatedSettings);
@@ -92,7 +123,7 @@ export class AuthService {
   static async verifyPassword(
     password: string,
     settings: PluginSettings
-  ): Promise<CryptoEngine> {
+  ): Promise<AnyCryptoEngine> {
     if (!settings.verificationBlob) {
       throw new SettingsCorruptedError(
         "Файл настроек повреждён: verificationBlob отсутствует. " +
@@ -100,14 +131,18 @@ export class AuthService {
       );
     }
 
-    const engine = new CryptoEngine();
-    await engine.deriveKey(password);
+    const engine = createCryptoEngine();
+    // TODO(ФАЗА 3): передавать реальный email из формы входа вместо STUB_EMAIL
+    await engine.deriveKey(STUB_EMAIL, password);
 
     try {
-      const decrypted = engine.decryptBuffer(
-        Buffer.from(settings.verificationBlob, "hex")
+      const decryptedBytes = toBytes(
+        await Promise.resolve(
+          engine.decryptBuffer(hexToBytes(settings.verificationBlob))
+        )
       );
-      if (decrypted.toString("utf8") !== VERIFICATION_PLAINTEXT) {
+      const decryptedText = new TextDecoder().decode(decryptedBytes);
+      if (decryptedText !== VERIFICATION_PLAINTEXT) {
         // Технически невозможно при корректном AES-GCM, но перестрахуемся
         engine.destroy();
         throw new PasswordError("Верификация не прошла: неверный пароль.");

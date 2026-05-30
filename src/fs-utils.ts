@@ -6,8 +6,12 @@
 import * as fsp from "fs/promises";
 import * as nodePath from "path";
 
-/** Размер криптографического заголовка: IV (12 б) + AuthTag (16 б) */
-export const CRYPTO_HEADER_SIZE = 28;
+/**
+ * Постоянный размер служебных данных контейнера v2:
+ *   MAGIC+version (5 б) + IV (12 б) + GCM-tag (16 б) = 33 б.
+ * Используется для компенсации размера .enc в stat().
+ */
+export const CRYPTO_HEADER_SIZE = 33;
 
 /** Суффикс зашифрованных файлов в оригинальном хранилище */
 export const ENCRYPTED_EXT = ".enc";

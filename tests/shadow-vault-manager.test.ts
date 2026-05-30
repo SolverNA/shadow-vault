@@ -114,7 +114,7 @@ async function makeEnv(): Promise<TestEnv> {
   fs.mkdirSync(origRoot, { recursive: true });
 
   const engine = new CryptoEngine();
-  await engine.deriveKey("test-password");
+  await engine.deriveKey("test@test.local", "test-password");
 
   const manager = new ShadowVaultManager(engine, origRoot, shadowRoot);
   await manager.initialize();
@@ -162,7 +162,7 @@ describe("ShadowVaultManager — инициализация и пути", () => 
     fs.mkdirSync(origRoot);
 
     const engine = new CryptoEngine();
-    await engine.deriveKey("pwd");
+    await engine.deriveKey("test@test.local", "pwd");
     const manager = new ShadowVaultManager(engine, origRoot, shadowRoot);
     await manager.initialize();
 
@@ -399,7 +399,7 @@ describe("ShadowVaultManager — exists() и stat()", () => {
       const text = "12345"; // 5 байт
       await writeEncrypted(env, "sized.md", text);
       const stat = await env.adapter.stat("sized.md");
-      // Размер должен быть 5 (без 28 байт заголовка IV+AuthTag)
+      // Размер должен быть 5 (без 33 байт служебных данных контейнера v2)
       expect(stat!.size).toBe(5);
     } finally { env.cleanup(); }
   });

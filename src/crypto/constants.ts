@@ -1,0 +1,51 @@
+/**
+ * Единые криптопараметры ShadowVault (ФАЗА 1 — единое криптоядро).
+ *
+ * ВАЖНО: эти константы определяют формат файлов и деривацию ключа.
+ * И NodeCryptoEngine, и WebCryptoEngine ОБЯЗАНЫ использовать ровно эти значения,
+ * иначе нарушится байт-в-байт совместимость между десктопом и мобильными.
+ *
+ * Менять только с миграцией существующих .enc файлов.
+ */
+
+/** Магия формата v2 — ASCII "SVLT" (ShadowVault) */
+export const MAGIC = new Uint8Array([0x53, 0x56, 0x4c, 0x54]); // "SVLT"
+export const MAGIC_LENGTH = 4;
+
+/** Версия формата контейнера */
+export const FORMAT_VERSION = 0x02;
+export const VERSION_LENGTH = 1;
+
+/** Длина префикса заголовка: MAGIC(4) + version(1) */
+export const HEADER_LENGTH = MAGIC_LENGTH + VERSION_LENGTH;
+
+/** Параметры AES-GCM */
+export const IV_LENGTH = 12; // байт, рекомендация NIST для GCM
+export const GCM_TAG_LENGTH = 16; // байт, 128-битный тег аутентификации
+export const KEY_LENGTH = 32; // байт = AES-256
+
+/**
+ * Параметры PBKDF2 — ОДИНАКОВЫ на Node и WebCrypto.
+ * 600000 итераций SHA-512 — баланс безопасности и скорости (OWASP-уровень).
+ */
+export const PBKDF2_ITERATIONS = 600_000;
+export const PBKDF2_KEY_LENGTH = KEY_LENGTH; // 32 байта (256 бит)
+/** Имя hash для Node ("sha512") и WebCrypto ("SHA-512") выводится отдельно ниже */
+export const PBKDF2_HASH_NODE = "sha512" as const;
+export const PBKDF2_HASH_WEB = "SHA-512" as const;
+
+/**
+ * Доменная строка соли v2.
+ * salt = SHA-256( utf8(normalize(email)) ‖ utf8(SALT_DOMAIN) )
+ */
+export const SALT_DOMAIN = "shadow-vault:v2";
+
+/** Константа верификационного блоба v2 */
+export const VERIFICATION_CONSTANT = "shadow-vault-verify-v2";
+
+/**
+ * Маркеры legacy-форматов для detectFormat().
+ * legacy-node: [IV(12)][AuthTag(16)][ciphertext]  (старый crypto-engine.ts)
+ * legacy-web:  [IV(12)][ciphertext‖tag]            (старый web-crypto-engine.ts)
+ * У них нет MAGIC-префикса, поэтому детект эвристический (см. detectFormat).
+ */

@@ -1,10 +1,9 @@
 /**
- * Юнит-тесты для CryptoEngine.
- * Покрывают: деривацию ключа, шифрование/расшифровку буферов,
- * потоковое шифрование/расшифровку, обнуление ключа, граничные случаи.
+ * Юнит-тесты для NodeCryptoEngine (формат v2).
+ * Покрывают: деривацию ключа из email+password, шифрование/расшифровку
+ * буферов, потоковое шифрование/расшифровку, обнуление ключа, граничные случаи.
  *
- * Соль не используется: ключ деривируется только из пароля и фиксированной
- * доменной константы внутри CryptoEngine.
+ * deriveKey теперь принимает (email, password): соль выводится из email.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "@jest/globals";
@@ -13,6 +12,9 @@ import * as os from "os";
 import * as path from "path";
 import * as nodeCrypto from "crypto";
 import { CryptoEngine } from "../src/crypto-engine";
+import { HEADER_LENGTH, IV_LENGTH, GCM_TAG_LENGTH } from "../src/crypto/constants";
+
+const TEST_EMAIL = "user@example.com";
 
 // ─────────────────────────────────────────────
 // Вспомогательные утилиты
@@ -36,7 +38,7 @@ describe("CryptoEngine — deriveKey()", () => {
     const engine = new CryptoEngine();
     expect(engine.isUnlocked()).toBe(false);
 
-    await engine.deriveKey("correct-horse-battery-staple");
+    await engine.deriveKey(TEST_EMAIL, "correct-horse-battery-staple");
     expect(engine.isUnlocked()).toBe(true);
 
     engine.destroy();
@@ -44,7 +46,7 @@ describe("CryptoEngine — deriveKey()", () => {
 
   it("одинаковый пароль → одинаковый ключ (детерминированность без соли)", async () => {
     const engine1 = new CryptoEngine();
-    await engine1.deriveKey("same-password");
+    await engine1.deriveKey(TEST_EMAIL, "same-password");
     const plaintext = Buffer.from("hello world");
     const enc1 = engine1.encryptBuffer(plaintext);
     engine1.destroy();
@@ -52,7 +54,7 @@ describe("CryptoEngine — deriveKey()", () => {
     // Второй движок с тем же паролем должен расшифровать данные первого —
     // соль не нужна, ключ детерминирован
     const engine2 = new CryptoEngine();
-    await engine2.deriveKey("same-password");
+    await engine2.deriveKey(TEST_EMAIL, "same-password");
     const dec = engine2.decryptBuffer(enc1);
     expect(dec.toString()).toBe("hello world");
     engine2.destroy();
@@ -60,12 +62,12 @@ describe("CryptoEngine — deriveKey()", () => {
 
   it("разные пароли → невозможность расшифровки (неверный ключ)", async () => {
     const engine1 = new CryptoEngine();
-    await engine1.deriveKey("password-A");
+    await engine1.deriveKey(TEST_EMAIL, "password-A");
     const enc = engine1.encryptBuffer(Buffer.from("secret data"));
     engine1.destroy();
 
     const engine2 = new CryptoEngine();
-    await engine2.deriveKey("password-B");
+    await engine2.deriveKey(TEST_EMAIL, "password-B");
     expect(() => engine2.decryptBuffer(enc)).toThrow(
       /Расшифровка не удалась/
     );
@@ -82,7 +84,7 @@ describe("CryptoEngine — encryptBuffer() / decryptBuffer()", () => {
 
   beforeEach(async () => {
     engine = new CryptoEngine();
-    await engine.deriveKey("test-password-for-unit-tests");
+    await engine.deriveKey(TEST_EMAIL, "test-password-for-unit-tests");
   });
 
   afterEach(() => {
@@ -125,30 +127,34 @@ describe("CryptoEngine — encryptBuffer() / decryptBuffer()", () => {
     expect(enc1.subarray(0, 12).equals(enc2.subarray(0, 12))).toBe(false);
   });
 
-  it("зашифрованный буфер содержит корректный заголовок (IV + AuthTag)", () => {
+  it("зашифрованный буфер v2 содержит корректный заголовок (MAGIC+version+IV+tag)", () => {
     const data = Buffer.from("test");
     const enc = engine.encryptBuffer(data);
-    // Минимальный размер: 12 (IV) + 16 (AuthTag) + 0 или более байт данных
-    expect(enc.length).toBeGreaterThanOrEqual(12 + 16);
+    // Минимальный размер: header(5) + IV(12) + tag(16) + данные
+    expect(enc.length).toBeGreaterThanOrEqual(HEADER_LENGTH + IV_LENGTH + GCM_TAG_LENGTH);
+    // MAGIC "SVLT" + version 0x02
+    expect(enc.subarray(0, 4).toString("ascii")).toBe("SVLT");
+    expect(enc[4]).toBe(0x02);
   });
 
-  it("повреждение auth tag → ошибка расшифровки", () => {
+  it("повреждение tag (последние 16 байт) → ошибка расшифровки", () => {
     const enc = engine.encryptBuffer(Buffer.from("important data"));
-    // Порча auth tag (байты 12–27)
-    enc[14] = enc[14] ^ 0xff;
+    // Tag в формате v2 — последние 16 байт
+    enc[enc.length - 1] = enc[enc.length - 1] ^ 0xff;
     expect(() => engine.decryptBuffer(enc)).toThrow(/Расшифровка не удалась/);
   });
 
   it("повреждение зашифрованных данных → ошибка расшифровки", () => {
     const enc = engine.encryptBuffer(Buffer.from("important data"));
-    // Порча первого байта данных (после IV+AuthTag)
-    enc[12 + 16] = enc[12 + 16] ^ 0xff;
+    // Порча первого байта ciphertext (после header+IV)
+    const off = HEADER_LENGTH + IV_LENGTH;
+    enc[off] = enc[off] ^ 0xff;
     expect(() => engine.decryptBuffer(enc)).toThrow(/Расшифровка не удалась/);
   });
 
-  it("слишком короткий буфер → явная ошибка с описанием", () => {
+  it("слишком короткий буфер → явная ошибка о неверном формате", () => {
     const tooShort = Buffer.alloc(5);
-    expect(() => engine.decryptBuffer(tooShort)).toThrow(/Файл повреждён/);
+    expect(() => engine.decryptBuffer(tooShort)).toThrow(/формат/);
   });
 
   it("бросает ошибку если ключ не загружен", () => {
@@ -169,7 +175,7 @@ describe("CryptoEngine — encryptStream() / decryptStream()", () => {
 
   beforeEach(async () => {
     engine = new CryptoEngine();
-    await engine.deriveKey("stream-test-password");
+    await engine.deriveKey(TEST_EMAIL, "stream-test-password");
     const tmp = makeTempDir();
     tempDir = tmp.dir;
     cleanup = tmp.cleanup;
@@ -221,7 +227,7 @@ describe("CryptoEngine — encryptStream() / decryptStream()", () => {
     expect(fs.existsSync(encPath + ".tmp")).toBe(false);
   });
 
-  it("зашифрованный файл минимум на 28 байт больше оригинала (12 IV + 16 AuthTag)", async () => {
+  it("зашифрованный файл v2 ровно на 33 байта больше оригинала (5 header + 12 IV + 16 tag)", async () => {
     const srcPath = path.join(tempDir, "small.txt");
     const encPath = path.join(tempDir, "small.txt.enc");
     const content = "tiny";
@@ -231,7 +237,7 @@ describe("CryptoEngine — encryptStream() / decryptStream()", () => {
 
     const originalSize = fs.statSync(srcPath).size;
     const encSize = fs.statSync(encPath).size;
-    expect(encSize).toBe(originalSize + 12 + 16);
+    expect(encSize).toBe(originalSize + HEADER_LENGTH + IV_LENGTH + GCM_TAG_LENGTH);
   });
 });
 
@@ -242,7 +248,7 @@ describe("CryptoEngine — encryptStream() / decryptStream()", () => {
 describe("CryptoEngine — destroy()", () => {
   it("после destroy() isUnlocked() возвращает false", async () => {
     const engine = new CryptoEngine();
-    await engine.deriveKey("password");
+    await engine.deriveKey(TEST_EMAIL, "password");
     expect(engine.isUnlocked()).toBe(true);
 
     engine.destroy();
@@ -251,14 +257,14 @@ describe("CryptoEngine — destroy()", () => {
 
   it("после destroy() encryptBuffer бросает ошибку", async () => {
     const engine = new CryptoEngine();
-    await engine.deriveKey("password");
+    await engine.deriveKey(TEST_EMAIL, "password");
     engine.destroy();
     expect(() => engine.encryptBuffer(Buffer.from("x"))).toThrow(/Ключ не загружен/);
   });
 
   it("повторный вызов destroy() не бросает ошибку", async () => {
     const engine = new CryptoEngine();
-    await engine.deriveKey("password");
+    await engine.deriveKey(TEST_EMAIL, "password");
     engine.destroy();
     expect(() => engine.destroy()).not.toThrow();
   });

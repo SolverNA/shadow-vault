@@ -44,3 +44,14 @@ export const DEFAULT_SETTINGS: PluginSettings = {
  * Значение намеренно нейтральное — не раскрывает информацию о пользователе.
  */
 export const VERIFICATION_PLAINTEXT = "ShadowVault::OK::v1";
+
+/**
+ * TODO(ФАЗА 3 — Auth/UI): заглушка email для деривации ключа.
+ *
+ * Единое криптоядро v2 деривирует соль из email (salt = SHA-256(email‖domain)).
+ * UI ввода email ещё не реализован, поэтому временно используется фиксированный
+ * email-заглушка. На фазе Auth/UI здесь будет реальный email пользователя,
+ * прокинутый из формы входа. До миграции (ФАЗА 4) значение менять НЕЛЬЗЯ —
+ * иначе изменится ключ и существующие .enc станут нерасшифровываемыми.
+ */
+export const STUB_EMAIL = "shadow-vault-local-user@you-encrypt.local";

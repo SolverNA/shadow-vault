@@ -34,7 +34,7 @@ async function makeEnv(): Promise<TestEnv> {
   fs.mkdirSync(pluginDir,    { recursive: true });
 
   const engine = new CryptoEngine();
-  await engine.deriveKey("session-test-password");
+  await engine.deriveKey("test@test.local", "session-test-password");
 
   const session = new SessionManager(engine, originalRoot, shadowRoot, pluginDir);
 

@@ -40,7 +40,7 @@ import { InitModal } from "./init-modal";
 import { ShadowVaultManager } from "./shadow-vault-manager";
 import { SessionManager } from "./session-manager";
 import { ShadowVaultSettingTab } from "./settings-tab";
-import { DEFAULT_SETTINGS, PluginSettings, VERIFICATION_PLAINTEXT } from "./types";
+import { DEFAULT_SETTINGS, PluginSettings, VERIFICATION_PLAINTEXT, STUB_EMAIL } from "./types";
 import { IDataAdapter, ListedFiles } from "./adapter-types";
 import { ENCRYPTED_EXT, isTempFile } from "./fs-utils";
 
@@ -174,7 +174,8 @@ export default class ShadowVaultPlugin extends Plugin {
 
     // 2. Создаём движок с новым паролем
     const newEngine = new CryptoEngine();
-    await newEngine.deriveKey(newPassword);
+    // TODO(ФАЗА 3): передавать реальный email из формы входа вместо STUB_EMAIL
+    await newEngine.deriveKey(STUB_EMAIL, newPassword);
 
     // 3. Пере-шифруем все файлы (двухфазно, атомарно)
     try {
@@ -341,13 +342,15 @@ export default class ShadowVaultPlugin extends Plugin {
   private async onUnlock(result: AuthResult): Promise<void> {
     const { engine, password, isFirstRun } = result;
 
-    // Десктопная архитектура (старая, Node.js)
+    // Десктопная архитектура (старая, Node.js).
+    // На десктопе фабрика гарантированно вернула NodeCryptoEngine (см. AuthService).
     if (this.isDesktop) {
-      await this.onUnlockDesktop(engine, isFirstRun);
+      await this.onUnlockDesktop(engine as CryptoEngine, isFirstRun);
       return;
     }
 
-    // Мобильная архитектура (новая, Web APIs)
+    // Мобильная архитектура (новая, Web APIs).
+    // engine здесь — WebCryptoEngine; main.ts всё равно пересоздаёт его из пароля.
     await this.onUnlockMobile(engine, password, isFirstRun);
   }
 
@@ -482,13 +485,14 @@ export default class ShadowVaultPlugin extends Plugin {
   /**
    * Мобильная инициализация (Web APIs, виртуальный shadow в памяти)
    */
-  private async onUnlockMobile(engine: CryptoEngine, password: string, isFirstRun: boolean): Promise<void> {
+  private async onUnlockMobile(engine: CryptoEngine | WebCryptoEngine, password: string, isFirstRun: boolean): Promise<void> {
     try {
       console.info("[ShadowVault] onUnlockMobile: старт");
 
       // ── Phase 1: создаём Web Crypto engine ────────────────────────────
       const webEngine = new WebCryptoEngine();
-      await webEngine.deriveKey(password);
+      // TODO(ФАЗА 3): передавать реальный email из формы входа вместо STUB_EMAIL
+      await webEngine.deriveKey(STUB_EMAIL, password);
       this.cryptoEngine = webEngine;
 
       // Уничтожаем десктопный engine, он больше не нужен
@@ -659,7 +663,7 @@ export default class ShadowVaultPlugin extends Plugin {
   // lazy-режима в будущем — но не вызываются в текущем flow.
 
   /** Освобождает частично созданное состояние при ошибке инициализации. */
-  private rollbackInitialization(engine: CryptoEngine): void {
+  private rollbackInitialization(engine: CryptoEngine | WebCryptoEngine): void {
     engine.destroy();
     if (this.shadowManager) {
       const adapter = this.app.vault.adapter as unknown as IDataAdapter;
