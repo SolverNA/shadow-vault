@@ -26,23 +26,23 @@
  *   SessionManager.endSession() — удаление shadow + ключ destroy
  */
 
-import * as fs from "fs";
-import * as fsp from "fs/promises";
-import * as nodePath from "path";
 import { DataAdapter, Notice, Platform, Plugin, TAbstractFile, TFile, TFolder } from "obsidian";
+import { nfs, nfsp, npath } from "./node-fs";
 import { CryptoEngine } from "./crypto-engine";
 import { WebCryptoEngine } from "./web-crypto-engine";
-import { DesktopAdapter, MobileAdapter, PlatformAdapter } from "./platform-adapter";
+import { MobileAdapter, PlatformAdapter } from "./platform-adapter";
 import { VirtualShadowManager } from "./virtual-shadow-manager";
 import { AdapterPatcher } from "./adapter-patcher";
 import { AuthResult, AuthService } from "./auth-service";
 import { InitModal } from "./init-modal";
-import { ShadowVaultManager } from "./shadow-vault-manager";
-import { SessionManager } from "./session-manager";
+// Desktop-only модули грузятся ЛЕНИВО (await import) только в desktop-ветке
+// onUnlockDesktop — их top-level node-импорты не должны выполняться на mobile.
+import type { ShadowVaultManager } from "./shadow-vault-manager";
+import type { SessionManager } from "./session-manager";
 import { ShadowVaultSettingTab } from "./settings-tab";
 import { DEFAULT_SETTINGS, PluginSettings, VERIFICATION_PLAINTEXT, STUB_EMAIL } from "./types";
 import { IDataAdapter, ListedFiles } from "./adapter-types";
-import { ENCRYPTED_EXT, isTempFile } from "./fs-utils";
+import { ENCRYPTED_EXT, listEncryptedDir } from "./fs-utils";
 
 interface AdapterWithInternals extends IDataAdapter {
   files?: Record<string, { type: string; realpath: string; ctime?: number; mtime?: number; size?: number }>;
@@ -129,7 +129,13 @@ export default class ShadowVaultPlugin extends Plugin {
     // изменения в оригинал на каждый save, на shutdown остаётся только
     // удалить shadow и lock — это всё делается синхронно через fs.*Sync.
     if (this.sessionActive) {
-      this.syncCleanup();
+      // Разводим очистку по платформе: desktop удаляет реальный shadow через
+      // fs.*Sync, mobile снимает патч и чистит in-memory кэш (без node:fs).
+      if (this.isDesktop) {
+        this.syncCleanup();
+      } else {
+        this.syncCleanupMobile();
+      }
     }
   }
 
@@ -318,14 +324,15 @@ export default class ShadowVaultPlugin extends Plugin {
 
   private scanDirForEnc(absDir: string, depth: number): boolean {
     if (depth < 0) return false;
-    let entries: fs.Dirent[];
+    const fs = nfs();
+    let entries: import("fs").Dirent[];
     try {
       entries = fs.readdirSync(absDir, { withFileTypes: true });
     } catch { return false; }
     for (const e of entries) {
       if (e.name.startsWith(".")) continue;
       if (e.isFile() && e.name.endsWith(ENCRYPTED_EXT)) return true;
-      if (e.isDirectory() && this.scanDirForEnc(nodePath.join(absDir, e.name), depth - 1)) {
+      if (e.isDirectory() && this.scanDirForEnc(npath().join(absDir, e.name), depth - 1)) {
         return true;
       }
     }
@@ -370,6 +377,12 @@ export default class ShadowVaultPlugin extends Plugin {
 
     try {
       console.info("[ShadowVault] onUnlockDesktop: старт, basePath =", basePath);
+
+      // Ленивая загрузка desktop-only модулей. Их top-level node-импорты
+      // выполнятся только здесь (Node runtime гарантирован), на mobile этот
+      // код недостижим — бандл не вычисляет fs/path/os при загрузке.
+      const { ShadowVaultManager } = await import("./shadow-vault-manager");
+      const { SessionManager } = await import("./session-manager");
 
       // ── Phase 1: создаём shadow manager и initialize ──────────────────
       this.shadowManager = new ShadowVaultManager(
@@ -558,8 +571,53 @@ export default class ShadowVaultPlugin extends Plugin {
   }
 
   /**
-   * Подписки на vault-события: Obsidian работает в shadow натив но,
-   * мы только зеркалим изменения в оригинал.enc через стандартный API.
+   * Разводит подписку на vault-события по платформе.
+   *
+   * DESKTOP: Obsidian работает в реальном shadow на диске; мы зеркалим
+   *   каждое изменение в оригинал.enc через ShadowVaultManager (write-through
+   *   поверх vault-событий).
+   *
+   * MOBILE: shadow виртуальный; write-through уже выполняет AdapterPatcher
+   *   на уровне adapter.read/write/remove/rename/copy (события Obsidian
+   *   приходят ПОСЛЕ завершения этих операций). Поэтому на mobile НЕ дёргаем
+   *   desktop-only shadowManager (его нет — был бы TypeError), достаточно
+   *   лёгких обработчиков для логирования/папок.
+   */
+  private setupVaultEventHandlers(): void {
+    if (this.isDesktop) {
+      this.setupVaultEventHandlersDesktop();
+    } else {
+      this.setupVaultEventHandlersMobile();
+    }
+  }
+
+  /**
+   * Mobile: контент уже шифруется в .enc через AdapterPatcher (write-through
+   * на adapter.write/remove/rename). Vault-события здесь информативны —
+   * мы лишь логируем их; повторное шифрование не требуется и привело бы
+   * к двойной работе. Папки на mobile хранятся plaintext (не шифруются),
+   * их создание/удаление идёт через нетронутый adapter.mkdir/rmdir.
+   */
+  private setupVaultEventHandlersMobile(): void {
+    const configDir = this.app.vault.configDir;
+    const isConfigPath = (p: string) => p === configDir || p.startsWith(configDir + "/");
+
+    const log = (kind: string, path: string) => {
+      if (isConfigPath(path)) return;
+      console.debug(`[ShadowVault:event:mobile] ${kind} ${path} (write-through via AdapterPatcher)`);
+    };
+
+    this.registerEvent(this.app.vault.on("create", (file) => log("create", file.path)));
+    this.registerEvent(this.app.vault.on("modify", (file) => log("modify", file.path)));
+    this.registerEvent(this.app.vault.on("delete", (file) => log("delete", file.path)));
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => log("rename", `${oldPath} → ${file.path}`)));
+
+    console.info("[ShadowVault] mobile vault event handlers подписаны (логирование, write-through на AdapterPatcher)");
+  }
+
+  /**
+   * Desktop: Obsidian работает в shadow натив но, мы зеркалим изменения
+   * в оригинал.enc через стандартный API.
    *
    *   create  → encryptOne (или mkdirOriginal для папок)
    *   modify  → encryptOne
@@ -570,7 +628,7 @@ export default class ShadowVaultPlugin extends Plugin {
    * через symlink, шифровать его не нужно (и Obsidian заваливал бы handler
    * каждое сохранение workspace.json).
    */
-  private setupVaultEventHandlers(): void {
+  private setupVaultEventHandlersDesktop(): void {
     const configDir = this.app.vault.configDir;
     const isConfigPath = (p: string) => p === configDir || p.startsWith(configDir + "/");
 
@@ -634,6 +692,8 @@ export default class ShadowVaultPlugin extends Plugin {
         await this.shadowManager!.renameEnc(oldPath, file.path);
       } else if (file instanceof TFolder) {
         // Папка: переименовать в оригинале (там тоже структура с .enc)
+        const nodePath = npath();
+        const fsp = nfsp();
         const oldOrig = nodePath.join(this.shadowManager!.originalRoot, ...oldPath.split("/"));
         const newOrig = nodePath.join(this.shadowManager!.originalRoot, ...file.path.split("/"));
         await fsp.mkdir(nodePath.dirname(newOrig), { recursive: true });
@@ -650,7 +710,7 @@ export default class ShadowVaultPlugin extends Plugin {
    * хранилище и не попадать под Obsidian-индексацию.
    */
   private getPluginDirAbs(originalRoot: string): string {
-    return nodePath.join(
+    return npath().join(
       originalRoot,
       this.app.vault.configDir,
       "plugins",
@@ -859,33 +919,11 @@ export default class ShadowVaultPlugin extends Plugin {
       }
 
       const absDir = normalizedPath
-        ? nodePath.join(originalRoot, ...normalizedPath.split("/"))
+        ? npath().join(originalRoot, ...normalizedPath.split("/"))
         : originalRoot;
 
-      const files: string[] = [];
-      const folders: string[] = [];
-
-      let entries: fs.Dirent[];
-      try {
-        entries = await fsp.readdir(absDir, { withFileTypes: true });
-      } catch {
-        return { files: [], folders: [] };
-      }
-
-      const prefix = normalizedPath ? normalizedPath + "/" : "";
-      for (const entry of entries) {
-        if (entry.name.startsWith(".") && entry.name !== configDir) continue;
-        if (isTempFile(entry.name)) continue;
-
-        if (entry.isDirectory()) {
-          folders.push(prefix + entry.name);
-        } else if (entry.isFile() && entry.name.endsWith(ENCRYPTED_EXT)) {
-          const baseName = entry.name.slice(0, -ENCRYPTED_EXT.length);
-          files.push(prefix + baseName);
-        }
-      }
-
-      return { files, folders };
+      // Единый list-транслятор .enc → имена (см. fs-utils.listEncryptedDir).
+      return listEncryptedDir(absDir, normalizedPath, configDir);
     };
   }
 
@@ -954,31 +992,43 @@ export default class ShadowVaultPlugin extends Plugin {
         continue;
       }
 
-      // Защита от каскадных ENOENT: регистрируем файл только если он
-      // ФАКТИЧЕСКИ существует в shadow (т.е. был успешно расшифрован).
-      // Файлы из decryptAllToShadow.failed[] есть в .enc, но не в shadow —
-      // если их зарегистрировать, любой клик пользователя приведёт к
-      // ENOENT при native readFile/lstat.
-      const shadowAbs = this.shadowManager!.shadowAbs(filePath);
-      try {
-        await fsp.access(shadowAbs);
-      } catch {
-        console.warn(
-          `[ShadowVault] reconcile skip: "${filePath}" нет в shadow ` +
-          `(decrypt failed?), не регистрируем в fileMap`
-        );
-        stats.skipped++;
-        continue;
-      }
+      let statObj: { ctime: number; mtime: number; size: number };
 
-      const s = await fsp.stat(shadowAbs).catch(() => null);
-      const statObj = s
-        ? {
-            ctime: Math.round(s.birthtimeMs ?? s.ctimeMs),
-            mtime: Math.round(s.mtimeMs),
-            size: s.size,
-          }
-        : { ctime: Date.now(), mtime: Date.now(), size: 0 };
+      if (this.isDesktop) {
+        // Desktop: защита от каскадных ENOENT — регистрируем файл только если он
+        // ФАКТИЧЕСКИ существует в shadow (т.е. был успешно расшифрован).
+        // Файлы из decryptAllToShadow.failed[] есть в .enc, но не в shadow —
+        // если их зарегистрировать, любой клик пользователя приведёт к
+        // ENOENT при native readFile/lstat.
+        const shadowAbs = this.shadowManager!.shadowAbs(filePath);
+        const fsp = nfsp();
+        try {
+          await fsp.access(shadowAbs);
+        } catch {
+          console.warn(
+            `[ShadowVault] reconcile skip: "${filePath}" нет в shadow ` +
+            `(decrypt failed?), не регистрируем в fileMap`
+          );
+          stats.skipped++;
+          continue;
+        }
+
+        const s = await fsp.stat(shadowAbs).catch(() => null);
+        statObj = s
+          ? {
+              ctime: Math.round(s.birthtimeMs ?? s.ctimeMs),
+              mtime: Math.round(s.mtimeMs),
+              size: s.size,
+            }
+          : { ctime: Date.now(), mtime: Date.now(), size: 0 };
+      } else {
+        // Mobile: shadow виртуальный (in-memory). Метаданные берём через
+        // пропатченный adapter.stat → VirtualShadowManager (читает .enc-stat).
+        const s = await this.app.vault.adapter.stat(filePath).catch(() => null);
+        statObj = s
+          ? { ctime: s.ctime ?? s.mtime, mtime: s.mtime, size: s.size }
+          : { ctime: Date.now(), mtime: Date.now(), size: 0 };
+      }
 
       adapter.files ??= {};
       adapter.files[filePath] = { type: "file", realpath: filePath, ...statObj };
@@ -1015,6 +1065,8 @@ export default class ShadowVaultPlugin extends Plugin {
     this.sessionActive = false;
 
     const adapter = this.app.vault.adapter as unknown as IDataAdapter;
+    const fs = nfs();
+    const nodePath = npath();
     console.info("[ShadowVault] syncCleanup: старт");
 
     if (this.shadowManager) {
