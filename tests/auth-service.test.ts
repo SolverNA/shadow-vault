@@ -10,6 +10,9 @@ import { describe, it, expect, jest } from "@jest/globals";
 import { AuthService, PasswordError, SettingsCorruptedError } from "../src/auth-service";
 import { DEFAULT_SETTINGS, PluginSettings } from "../src/types";
 
+/** Email для тестов — фиксированная соль деривации. */
+const TEST_EMAIL = "test@vault.local";
+
 // ─────────────────────────────────────────────
 // Хелперы
 // ─────────────────────────────────────────────
@@ -35,18 +38,18 @@ describe("AuthService — первый запуск (verificationBlob === null)"
     const svc = new AuthService();
     const { fn } = makeSaveFn();
 
-    const result = await svc.authenticate("my-secure-password", DEFAULT_SETTINGS, fn);
+    const result = await svc.authenticate(TEST_EMAIL, "my-secure-password", DEFAULT_SETTINGS, fn);
 
     expect(result.isFirstRun).toBe(true);
     expect(result.engine.isUnlocked()).toBe(true);
     result.engine.destroy();
   });
 
-  it("сохраняет verificationBlob в settings", async () => {
+  it("сохраняет verificationBlob, email и KDF-параметры в settings", async () => {
     const svc = new AuthService();
     const { fn, lastSaved } = makeSaveFn();
 
-    await svc.authenticate("my-secure-password", DEFAULT_SETTINGS, fn);
+    await svc.authenticate(TEST_EMAIL, "my-secure-password", DEFAULT_SETTINGS, fn);
 
     expect(fn).toHaveBeenCalledTimes(1);
     const saved = lastSaved()!;
@@ -54,6 +57,33 @@ describe("AuthService — первый запуск (verificationBlob === null)"
     // verificationBlob — hex-строка зашифрованного маркера длиной минимум 56 символов
     // (12 байт IV + 16 байт authTag + ≥0 байт ciphertext, всё в hex = ×2)
     expect(saved.verificationBlob!.length).toBeGreaterThanOrEqual(56);
+    // Email НЕ секрет — сохраняется для автоподстановки при следующем входе.
+    expect(saved.email).toBe(TEST_EMAIL);
+    expect(saved.kdfIterations).toBe(600_000);
+    expect(saved.formatVersion).toBe(2);
+  });
+
+  it("бросает PasswordError при пустом email", async () => {
+    const svc = new AuthService();
+    const { fn } = makeSaveFn();
+    await expect(svc.authenticate("", "password", DEFAULT_SETTINGS, fn)).rejects.toThrow(PasswordError);
+  });
+
+  it("разный email → разный ключ (разная соль)", async () => {
+    const svc1 = new AuthService();
+    const { fn: f1, lastSaved: ls1 } = makeSaveFn();
+    const r1 = await svc1.authenticate("a@vault.local", "same-pwd", DEFAULT_SETTINGS, f1);
+    const enc = r1.engine.encryptBuffer(Buffer.from("data"));
+    r1.engine.destroy();
+
+    // Вход с тем же паролем, но другим email и сохранённым blob от первого —
+    // должен провалиться (другая соль → другой ключ).
+    const svc2 = new AuthService();
+    const { fn: f2 } = makeSaveFn();
+    await expect(
+      svc2.authenticate("b@vault.local", "same-pwd", { ...ls1()!, email: "b@vault.local" }, f2)
+    ).rejects.toThrow(PasswordError);
+    void enc;
   });
 
   it("разные запуски с одним паролем → разные verificationBlob (случайный IV)", async () => {
@@ -61,8 +91,8 @@ describe("AuthService — первый запуск (verificationBlob === null)"
     const { fn: fn1, lastSaved: ls1 } = makeSaveFn();
     const { fn: fn2, lastSaved: ls2 } = makeSaveFn();
 
-    await svc.authenticate("password", DEFAULT_SETTINGS, fn1);
-    await svc.authenticate("password", DEFAULT_SETTINGS, fn2);
+    await svc.authenticate(TEST_EMAIL, "password", DEFAULT_SETTINGS, fn1);
+    await svc.authenticate(TEST_EMAIL, "password", DEFAULT_SETTINGS, fn2);
 
     // Ключ одинаковый (соли нет), но IV случайный — blob'ы должны различаться
     expect(ls1()!.verificationBlob).not.toBe(ls2()!.verificationBlob);
@@ -73,14 +103,14 @@ describe("AuthService — первый запуск (verificationBlob === null)"
     const { fn: fn1, lastSaved: ls1 } = makeSaveFn();
 
     // Первый запуск создаёт хранилище
-    const r1 = await svc.authenticate("same-password", DEFAULT_SETTINGS, fn1);
+    const r1 = await svc.authenticate(TEST_EMAIL, "same-password", DEFAULT_SETTINGS, fn1);
     const enc = r1.engine.encryptBuffer(Buffer.from("test data"));
     r1.engine.destroy();
 
     // Второй "первый запуск" с тем же паролем — engine с тем же ключом
     // должен расшифровать данные первого
     const { fn: fn2 } = makeSaveFn();
-    const r2 = await svc.authenticate("same-password", DEFAULT_SETTINGS, fn2);
+    const r2 = await svc.authenticate(TEST_EMAIL, "same-password", DEFAULT_SETTINGS, fn2);
     const dec = r2.engine.decryptBuffer(enc);
     expect(dec.toString("utf8")).toBe("test data");
     r2.engine.destroy();
@@ -90,8 +120,8 @@ describe("AuthService — первый запуск (verificationBlob === null)"
     const svc = new AuthService();
     const { fn } = makeSaveFn();
 
-    await expect(svc.authenticate("", DEFAULT_SETTINGS, fn)).rejects.toThrow(PasswordError);
-    await expect(svc.authenticate("   ", DEFAULT_SETTINGS, fn)).rejects.toThrow(PasswordError);
+    await expect(svc.authenticate(TEST_EMAIL, "", DEFAULT_SETTINGS, fn)).rejects.toThrow(PasswordError);
+    await expect(svc.authenticate(TEST_EMAIL, "   ", DEFAULT_SETTINGS, fn)).rejects.toThrow(PasswordError);
   });
 });
 
@@ -104,7 +134,7 @@ describe("AuthService — повторный вход", () => {
   async function initVault(password: string): Promise<PluginSettings> {
     const svc = new AuthService();
     const { fn, lastSaved } = makeSaveFn();
-    const result = await svc.authenticate(password, DEFAULT_SETTINGS, fn);
+    const result = await svc.authenticate(TEST_EMAIL, password, DEFAULT_SETTINGS, fn);
     result.engine.destroy();
     return lastSaved()!;
   }
@@ -114,7 +144,7 @@ describe("AuthService — повторный вход", () => {
 
     const svc = new AuthService();
     const { fn } = makeSaveFn();
-    const result = await svc.authenticate("correct-password", savedSettings, fn);
+    const result = await svc.authenticate(TEST_EMAIL, "correct-password", savedSettings, fn);
 
     expect(result.isFirstRun).toBe(false);
     expect(result.engine.isUnlocked()).toBe(true);
@@ -126,7 +156,7 @@ describe("AuthService — повторный вход", () => {
 
     const svc = new AuthService();
     const { fn } = makeSaveFn();
-    const result = await svc.authenticate("password", savedSettings, fn);
+    const result = await svc.authenticate(TEST_EMAIL, "password", savedSettings, fn);
     result.engine.destroy();
 
     expect(fn).not.toHaveBeenCalled();
@@ -139,7 +169,7 @@ describe("AuthService — повторный вход", () => {
     const { fn } = makeSaveFn();
 
     await expect(
-      svc.authenticate("wrong-password", savedSettings, fn)
+      svc.authenticate(TEST_EMAIL, "wrong-password", savedSettings, fn)
     ).rejects.toThrow(PasswordError);
   });
 
@@ -150,11 +180,11 @@ describe("AuthService — повторный вход", () => {
     const { fn } = makeSaveFn();
 
     await expect(
-      svc.authenticate("wrong", savedSettings, fn)
+      svc.authenticate(TEST_EMAIL, "wrong", savedSettings, fn)
     ).rejects.toThrow(PasswordError);
     // Если бы engine утёк — он бы остался в памяти в unlocked состоянии.
     // Проверяем косвенно: следующая попытка с правильным паролем должна работать нормально.
-    const result = await svc.authenticate("correct-password", savedSettings, fn);
+    const result = await svc.authenticate(TEST_EMAIL, "correct-password", savedSettings, fn);
     expect(result.engine.isUnlocked()).toBe(true);
     result.engine.destroy();
   });
@@ -165,7 +195,7 @@ describe("AuthService — повторный вход", () => {
     const corruptedSettings: PluginSettings = { ...DEFAULT_SETTINGS, verificationBlob: null };
 
     await expect(
-      AuthService.verifyPassword("password", corruptedSettings)
+      AuthService.verifyPassword(TEST_EMAIL, "password", corruptedSettings)
     ).rejects.toThrow(SettingsCorruptedError);
   });
 
@@ -181,7 +211,7 @@ describe("AuthService — повторный вход", () => {
     const { fn } = makeSaveFn();
 
     await expect(
-      svc.authenticate("password", corruptedSettings, fn)
+      svc.authenticate(TEST_EMAIL, "password", corruptedSettings, fn)
     ).rejects.toThrow(PasswordError);
   });
 });
@@ -196,14 +226,14 @@ describe("AuthService — сквозные сценарии", () => {
     const { fn, lastSaved } = makeSaveFn();
 
     // Первый запуск — создаём хранилище
-    const { engine: engine1 } = await svc1.authenticate("vault-password", DEFAULT_SETTINGS, fn);
+    const { engine: engine1 } = await svc1.authenticate(TEST_EMAIL, "vault-password", DEFAULT_SETTINGS, fn);
     const enc = engine1.encryptBuffer(Buffer.from("Секретная заметка"));
     engine1.destroy();
 
     // Повторный вход с тем же паролем
     const svc2 = new AuthService();
     const { fn: fn2 } = makeSaveFn();
-    const { engine: engine2 } = await svc2.authenticate("vault-password", lastSaved()!, fn2);
+    const { engine: engine2 } = await svc2.authenticate(TEST_EMAIL, "vault-password", lastSaved()!, fn2);
     const dec = engine2.decryptBuffer(enc);
     engine2.destroy();
 
@@ -214,7 +244,7 @@ describe("AuthService — сквозные сценарии", () => {
     // Создаём vault, шифруем данные
     const svc1 = new AuthService();
     const { fn: fn1, lastSaved: ls1 } = makeSaveFn();
-    const { engine: engine1 } = await svc1.authenticate("user-password", DEFAULT_SETTINGS, fn1);
+    const { engine: engine1 } = await svc1.authenticate(TEST_EMAIL, "user-password", DEFAULT_SETTINGS, fn1);
     const enc = engine1.encryptBuffer(Buffer.from("data from old vault"));
     engine1.destroy();
 
@@ -225,7 +255,7 @@ describe("AuthService — сквозные сценарии", () => {
     const svc2 = new AuthService();
     const { fn: fn2, lastSaved: ls2 } = makeSaveFn();
     const { engine: engine2, isFirstRun } = await svc2.authenticate(
-      "user-password", DEFAULT_SETTINGS, fn2
+      TEST_EMAIL, "user-password", DEFAULT_SETTINGS, fn2
     );
 
     expect(isFirstRun).toBe(true);

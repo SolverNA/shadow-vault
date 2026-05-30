@@ -17,7 +17,8 @@ import { WebCryptoEngine } from "../src/web-crypto-engine";
 import { VirtualShadowManager } from "../src/virtual-shadow-manager";
 import { PlatformAdapter } from "../src/platform-adapter";
 import { isV2 } from "../src/crypto/format";
-import { STUB_EMAIL } from "../src/types";
+
+const STUB_EMAIL = "test@shadow-vault.local";
 
 /** In-memory реализация PlatformAdapter — без node:fs (как mobile Vault API). */
 class InMemoryAdapter implements PlatformAdapter {

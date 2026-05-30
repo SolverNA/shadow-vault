@@ -64,6 +64,18 @@ export class NodeCryptoEngine {
     this.keyBuffer = Buffer.from(raw);
   }
 
+  /**
+   * Загружает уже готовый сырой мастер-ключ (32 байта) напрямую, минуя PBKDF2.
+   * Используется при входе по PIN: masterKey извлекается из локального
+   * wrapped-контейнера (см. pin-store) и инжектится в движок.
+   */
+  loadRawKey(raw: Uint8Array): void {
+    if (raw.length !== KEY_LENGTH) {
+      throw new Error(`[NodeCryptoEngine] Неверная длина ключа: ${raw.length}`);
+    }
+    this.keyBuffer = Buffer.from(raw);
+  }
+
   isUnlocked(): boolean {
     return this.keyBuffer !== null;
   }

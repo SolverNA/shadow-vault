@@ -12,9 +12,32 @@ export interface PluginSettings {
    * null = хранилище ещё не инициализировано (первый запуск).
    *
    * Это единственный признак инициализированности хранилища: соль
-   * больше не хранится, ключ деривируется только из пароля.
+   * больше не хранится, ключ деривируется из email+password.
    */
   verificationBlob: string | null;
+
+  /**
+   * Email пользователя — корень соли деривации ключа
+   * (salt = SHA-256(normalize(email)‖domain)). НЕ секрет: хранится в
+   * открытом виде, чтобы при следующем входе подставлять автоматически
+   * (пользователь вводит только пароль). Пустая строка — ещё не задан.
+   *
+   * ВНИМАНИЕ: смена email меняет соль → меняется ключ → существующие .enc
+   * становятся нерасшифровываемыми без перешифровки (см. TODO ФАЗА 4).
+   */
+  email: string;
+
+  /**
+   * Число итераций PBKDF2, использованное при создании verificationBlob.
+   * Сохраняется для будущей смены параметров KDF без потери совместимости.
+   * Сейчас всегда совпадает с crypto/constants PBKDF2_ITERATIONS.
+   */
+  kdfIterations: number;
+
+  /**
+   * Версия формата контейнера (v2 = 2). Сохраняется для миграций.
+   */
+  formatVersion: number;
 
   /**
    * Абсолютный путь к Теневому хранилищу (расшифрованные файлы).
@@ -34,6 +57,9 @@ export interface PluginSettings {
 
 export const DEFAULT_SETTINGS: PluginSettings = {
   verificationBlob: null,
+  email: "",
+  kdfIterations: 600_000,
+  formatVersion: 2,
   shadowVaultPath: "",
   encryptionDisabled: false,
 };
@@ -46,12 +72,12 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 export const VERIFICATION_PLAINTEXT = "ShadowVault::OK::v1";
 
 /**
- * TODO(ФАЗА 3 — Auth/UI): заглушка email для деривации ключа.
- *
- * Единое криптоядро v2 деривирует соль из email (salt = SHA-256(email‖domain)).
- * UI ввода email ещё не реализован, поэтому временно используется фиксированный
- * email-заглушка. На фазе Auth/UI здесь будет реальный email пользователя,
- * прокинутый из формы входа. До миграции (ФАЗА 4) значение менять НЕЛЬЗЯ —
- * иначе изменится ключ и существующие .enc станут нерасшифровываемыми.
+ * Мягкая валидация email на уровне UI (не строгий RFC).
+ * Проверяет непустоту и наличие "локальная_часть@домен.tld".
  */
-export const STUB_EMAIL = "shadow-vault-local-user@you-encrypt.local";
+export function isValidEmail(email: string): boolean {
+  const e = email.trim();
+  if (!e) return false;
+  // Простой паттерн: есть @, домен с точкой, без пробелов.
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
+}

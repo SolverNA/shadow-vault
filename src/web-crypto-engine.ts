@@ -24,6 +24,18 @@ export class WebCryptoEngine {
    */
   async deriveKey(email: string, password: string): Promise<void> {
     const raw = await deriveMasterKey(email, password);
+    await this.loadRawKey(raw);
+  }
+
+  /**
+   * Загружает уже готовый сырой мастер-ключ (32 байта) напрямую, минуя PBKDF2.
+   * Используется при входе по PIN: masterKey извлекается из локального
+   * wrapped-контейнера (см. pin-store) и инжектится в движок.
+   */
+  async loadRawKey(raw: Uint8Array): Promise<void> {
+    if (raw.length !== KEY_LENGTH) {
+      throw new Error(`[WebCryptoEngine] Неверная длина ключа: ${raw.length}`);
+    }
     const subtle = getSubtle();
     this.key = await subtle.importKey(
       "raw",
