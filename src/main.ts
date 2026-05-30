@@ -37,6 +37,7 @@ import { AuthResult, AuthService } from "./auth-service";
 import { InitModal } from "./init-modal";
 import { PinStore } from "./pin-store";
 import { deriveMasterKey } from "./crypto/key-derivation";
+import { FORMAT_VERSION } from "./crypto/constants";
 // Desktop-only модули грузятся ЛЕНИВО (await import) только в desktop-ветке
 // onUnlockDesktop — их top-level node-импорты не должны выполняться на mobile.
 import type { ShadowVaultManager } from "./shadow-vault-manager";
@@ -400,7 +401,7 @@ export default class ShadowVaultPlugin extends Plugin {
     // Десктопная архитектура (старая, Node.js).
     // На десктопе фабрика гарантированно вернула NodeCryptoEngine (см. AuthService).
     if (this.isDesktop) {
-      await this.onUnlockDesktop(engine as CryptoEngine, isFirstRun);
+      await this.onUnlockDesktop(engine as CryptoEngine, isFirstRun, password);
       return;
     }
 
@@ -413,7 +414,11 @@ export default class ShadowVaultPlugin extends Plugin {
   /**
    * Десктопная инициализация (Node.js, shadow vault на диске)
    */
-  private async onUnlockDesktop(engine: CryptoEngine, isFirstRun: boolean): Promise<void> {
+  private async onUnlockDesktop(
+    engine: CryptoEngine,
+    isFirstRun: boolean,
+    password: string | null
+  ): Promise<void> {
     const basePath = this.getVaultBasePath();
     if (!basePath) {
       new Notice(
@@ -473,6 +478,12 @@ export default class ShadowVaultPlugin extends Plugin {
         adapter.list = this.earlyListOriginal;
         this.earlyListOriginal = null;
       }
+
+      // ── Phase 5.5: миграция legacy → v2 (ФАЗА 4) ──────────────────────
+      // Старые .enc (формат до v2) надо перешифровать новым v2-ключом ДО
+      // bulk-decrypt: decryptAllToShadow умеет читать только v2.
+      // Делаем это после проверки пароля (см. ниже probe) и пофайлово атомарно.
+      await this.migrateLegacyIfNeeded(password);
 
       // ── Phase 6: bulk decrypt всё в shadow ────────────────────────────
       const progressNotice = new Notice("🔓 Shadow Vault: расшифровка хранилища...", 0);
@@ -545,6 +556,117 @@ export default class ShadowVaultPlugin extends Plugin {
   }
 
   /**
+   * ФАЗА 4: миграция legacy → v2 на десктопе.
+   *
+   * Вызывается из onUnlockDesktop ПЕРЕД bulk-decrypt. Шаги:
+   *   1. Если formatVersion уже 2 И legacy-файлов нет — быстрый выход.
+   *   2. Если password == null (вход по PIN) — миграцию по паролю сделать
+   *      нельзя; легаси на этом этапе быть не должно (PIN ставится только
+   *      после первого парольного входа). Если вдруг есть — предупреждаем.
+   *   3. Проверяем пароль через trial-decrypt первого .enc (для legacy-хранилищ
+   *      без verificationBlob это единственная проверка). Неверный → ошибка,
+   *      разрушительных операций НЕ начинаем.
+   *   4. Мигрируем пофайлово атомарно. После успеха помечаем formatVersion=2 и
+   *      гарантируем наличие v2 verificationBlob.
+   */
+  private async migrateLegacyIfNeeded(password: string | null): Promise<void> {
+    if (!this.shadowManager) return;
+    const { probeLegacyPassword } = await import("./crypto/migration");
+
+    const hasLegacy = await this.shadowManager.hasLegacyFiles();
+
+    // Гарантируем verificationBlob даже для пустых/уже-v2 legacy-хранилищ:
+    // старые data.json его не имеют. Если blob уже есть (AuthService создал
+    // на "первом запуске") — ничего не делаем.
+    if (!hasLegacy) {
+      if (this.settings.formatVersion !== FORMAT_VERSION) {
+        this.settings.formatVersion = FORMAT_VERSION;
+        await this.saveSettings();
+      }
+      await this.ensureVerificationBlobDesktop();
+      return;
+    }
+
+    if (password === null) {
+      // Вход по PIN над legacy-хранилищем — нештатно. Не трогаем файлы.
+      new Notice(
+        "⚠️ Shadow Vault: обнаружены файлы старого формата, но вход выполнен по PIN. " +
+        "Войдите паролем, чтобы выполнить миграцию.",
+        10000
+      );
+      return;
+    }
+
+    // ── Проверка пароля через trial-decrypt первого legacy-файла ──────────
+    const sample = await this.shadowManager.firstEncBuffer();
+    if (sample) {
+      const ok = await probeLegacyPassword(sample, password);
+      if (!ok) {
+        // Неверный пароль: НЕ начинаем разрушительную миграцию.
+        // AuthService мог только что записать v2-блоб на "первом запуске"
+        // (legacy-хранилище без блоба) — он соответствует НЕВЕРНОМУ ключу.
+        // Сбрасываем его, чтобы следующий вход снова проверялся через legacy.
+        if (this.settings.verificationBlob) {
+          this.settings.verificationBlob = null;
+          await this.saveSettings();
+        }
+        throw new Error(
+          "Неверный пароль для хранилища старого формата — миграция отменена, файлы не тронуты."
+        );
+      }
+    }
+
+    // ── Миграция пофайлово, атомарно, с прогрессом ────────────────────────
+    const migNotice = new Notice("🔄 Shadow Vault: миграция хранилища в новый формат...", 0);
+    let result;
+    try {
+      result = await this.shadowManager.migrateLegacyToV2(password, (done, total, current) => {
+        const percent = total > 0 ? Math.round((done / total) * 100) : 0;
+        migNotice.setMessage(`🔄 Миграция формата: ${done}/${total} (${percent}%)\n${current.slice(-60)}`);
+      });
+    } finally {
+      migNotice.hide();
+    }
+
+    if (result.failed.length > 0) {
+      new Notice(
+        `⚠️ Shadow Vault: ${result.failed.length} файл(ов) не мигрировано (см. консоль). ` +
+        "Остальные переведены в новый формат.",
+        10000
+      );
+    } else {
+      new Notice(`✅ Shadow Vault: миграция завершена (${result.migrated.length} файлов).`, 4000);
+    }
+
+    // formatVersion обновляем ТОЛЬКО если миграция прошла без ошибок —
+    // иначе при следующем входе снова просканируем и домигрируем остаток.
+    if (result.failed.length === 0) {
+      this.settings.formatVersion = FORMAT_VERSION;
+      await this.saveSettings();
+    }
+    // Verification blob для нового v2-ключа (если ещё не создан AuthService'ом).
+    await this.ensureVerificationBlobDesktop();
+  }
+
+  /**
+   * Гарантирует наличие v2 verificationBlob в настройках (для legacy-хранилищ,
+   * у которых его не было). Шифрует маркер текущим v2-движком.
+   */
+  private async ensureVerificationBlobDesktop(): Promise<void> {
+    if (this.settings.verificationBlob || !this.shadowManager) return;
+    try {
+      const engine = this.shadowManager.getEngine();
+      const blob = engine.encryptBuffer(Buffer.from(VERIFICATION_PLAINTEXT, "utf8"));
+      this.settings.verificationBlob = Buffer.from(blob).toString("hex");
+      this.settings.formatVersion = FORMAT_VERSION;
+      await this.saveSettings();
+      console.info("[ShadowVault] Создан v2 verificationBlob для legacy-хранилища.");
+    } catch (err) {
+      console.error("[ShadowVault] Не удалось создать verificationBlob:", err);
+    }
+  }
+
+  /**
    * Мобильная инициализация (Web APIs, виртуальный shadow в памяти)
    */
   private async onUnlockMobile(
@@ -577,6 +699,11 @@ export default class ShadowVaultPlugin extends Plugin {
         webEngine,
         this.platformAdapter
       );
+
+      // ── Phase 3.5: миграция legacy → v2 (ФАЗА 4) ──────────────────────
+      // До патча адаптера: после миграции все .enc в формате v2 и
+      // VirtualShadowManager.read сможет их расшифровать.
+      await this.migrateLegacyMobileIfNeeded(creds.password);
 
       // ── Phase 4: создаём adapter patcher ──────────────────────────────
       this.adapterPatcher = new AdapterPatcher(
@@ -625,6 +752,93 @@ export default class ShadowVaultPlugin extends Plugin {
         10000
       );
       this.rollbackInitialization(engine);
+    }
+  }
+
+  /**
+   * ФАЗА 4: миграция legacy → v2 на mobile (последовательно через Vault API).
+   * Зеркалит логику десктопа: probe пароля → миграция → formatVersion/блоб.
+   */
+  private async migrateLegacyMobileIfNeeded(password: string | null): Promise<void> {
+    const vsm = this.virtualShadowManager;
+    if (!vsm) return;
+    const configDir = this.app.vault.configDir;
+
+    const hasLegacy = await vsm.hasLegacyFiles(configDir);
+    if (!hasLegacy) {
+      if (this.settings.formatVersion !== FORMAT_VERSION) {
+        this.settings.formatVersion = FORMAT_VERSION;
+        await this.saveSettings();
+      }
+      await this.ensureVerificationBlobMobile();
+      return;
+    }
+
+    if (password === null) {
+      new Notice(
+        "⚠️ Shadow Vault: обнаружены файлы старого формата, но вход выполнен по PIN. " +
+        "Войдите паролем, чтобы выполнить миграцию.",
+        10000
+      );
+      return;
+    }
+
+    // Проверка пароля через trial-decrypt (хранилище без verificationBlob).
+    const ok = await vsm.probePassword(configDir, password);
+    if (!ok) {
+      if (this.settings.verificationBlob) {
+        this.settings.verificationBlob = null;
+        await this.saveSettings();
+      }
+      throw new Error(
+        "Неверный пароль для хранилища старого формата — миграция отменена, файлы не тронуты."
+      );
+    }
+
+    const migNotice = new Notice("🔄 Shadow Vault: миграция хранилища в новый формат...", 0);
+    let result;
+    try {
+      result = await vsm.migrateLegacyToV2(configDir, password, (done, total, current) => {
+        const percent = total > 0 ? Math.round((done / total) * 100) : 0;
+        migNotice.setMessage(`🔄 Миграция формата: ${done}/${total} (${percent}%)\n${current.slice(-60)}`);
+      });
+    } finally {
+      migNotice.hide();
+    }
+
+    if (result.failed.length > 0) {
+      new Notice(
+        `⚠️ Shadow Vault: ${result.failed.length} файл(ов) не мигрировано (см. консоль).`,
+        10000
+      );
+    } else {
+      new Notice(`✅ Shadow Vault: миграция завершена (${result.migrated} файлов).`, 4000);
+      this.settings.formatVersion = FORMAT_VERSION;
+      await this.saveSettings();
+    }
+    await this.ensureVerificationBlobMobile();
+  }
+
+  /**
+   * Гарантирует наличие v2 verificationBlob на mobile (WebCryptoEngine async).
+   */
+  private async ensureVerificationBlobMobile(): Promise<void> {
+    if (this.settings.verificationBlob) return;
+    const engine = this.cryptoEngine;
+    if (!engine) return;
+    try {
+      const blob = await Promise.resolve(
+        engine.encryptBuffer(new TextEncoder().encode(VERIFICATION_PLAINTEXT))
+      );
+      const bytes = blob instanceof Uint8Array ? blob : new Uint8Array(blob as ArrayBuffer);
+      let hex = "";
+      for (let i = 0; i < bytes.length; i++) hex += bytes[i].toString(16).padStart(2, "0");
+      this.settings.verificationBlob = hex;
+      this.settings.formatVersion = FORMAT_VERSION;
+      await this.saveSettings();
+      console.info("[ShadowVault] Создан v2 verificationBlob (mobile) для legacy-хранилища.");
+    } catch (err) {
+      console.error("[ShadowVault] Не удалось создать verificationBlob (mobile):", err);
     }
   }
 

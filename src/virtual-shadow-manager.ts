@@ -5,6 +5,9 @@
 
 import { WebCryptoEngine } from "./web-crypto-engine";
 import { PlatformAdapter } from "./platform-adapter";
+import { detectFormat } from "./crypto/format";
+import { migrateBuffer, probeLegacyPassword } from "./crypto/migration";
+import type { LegacyVariant } from "./crypto/legacy";
 
 export class VirtualShadowManager {
   private cache: Map<string, ArrayBuffer> = new Map();
@@ -182,5 +185,118 @@ export class VirtualShadowManager {
    */
   isInCache(normalizedPath: string): boolean {
     return this.cache.has(normalizedPath);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // ФАЗА 4: миграция legacy → v2 (mobile, последовательно через Vault API)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Рекурсивно собирает все .enc файлы хранилища (полные пути с .enc).
+   * Папка configDir (.obsidian) пропускается — там нет наших шифрованных заметок.
+   */
+  private async scanEncFiles(configDir: string): Promise<string[]> {
+    const out: string[] = [];
+    const walk = async (dir: string): Promise<void> => {
+      const { files, folders } = await this.adapter.list(dir);
+      for (const f of files) {
+        if (f.endsWith(".enc")) out.push(f);
+      }
+      for (const sub of folders) {
+        const name = sub.split("/").pop() ?? "";
+        if (name.startsWith(".") || name === configDir) continue;
+        await walk(sub);
+      }
+    };
+    await walk("");
+    return out;
+  }
+
+  /**
+   * Проверяет, есть ли в хранилище хотя бы один legacy .enc (не v2 по MAGIC).
+   */
+  async hasLegacyFiles(configDir: string): Promise<boolean> {
+    const enc = await this.scanEncFiles(configDir);
+    for (const p of enc) {
+      try {
+        const buf = new Uint8Array(await this.adapter.readBinary(p));
+        if (buf.length > 0 && detectFormat(buf) !== "v2") return true;
+      } catch {
+        // нечитаемый файл — пропускаем
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Проверяет пароль через trial-decrypt первого legacy .enc (для хранилищ
+   * без verificationBlob). Возвращает true если пароль подошёл хотя бы к одному
+   * legacy-файлу, либо если legacy-файлов нет (нечего проверять).
+   */
+  async probePassword(configDir: string, password: string): Promise<boolean> {
+    const enc = await this.scanEncFiles(configDir);
+    for (const p of enc) {
+      try {
+        const buf = new Uint8Array(await this.adapter.readBinary(p));
+        if (buf.length === 0 || detectFormat(buf) === "v2") continue;
+        const variant = await probeLegacyPassword(buf, password);
+        if (variant) return true;
+        return false; // первый legacy-файл не дешифруется → неверный пароль
+      } catch {
+        // продолжаем к следующему
+      }
+    }
+    return true; // legacy-файлов нет
+  }
+
+  /**
+   * Мигрирует все legacy .enc → v2 последовательно (mobile через Vault API).
+   *
+   * Пофайлово: read → migrateBuffer (legacy-decrypt + re-encrypt v2 +
+   * round-trip verify) → writeBinary поверх того же .enc. На mobile нет
+   * fs.rename, поэтому writeBinary — это запись через Obsidian adapter (он
+   * сам пишет атомарно на уровне ОС). v2 пишется только ПОСЛЕ успешного
+   * round-trip verify, поэтому окно потери данных минимально.
+   * Идемпотентность: уже-v2 файлы пропускаются (skipped-v2).
+   */
+  async migrateLegacyToV2(
+    configDir: string,
+    password: string,
+    onProgress?: (done: number, total: number, current: string) => void
+  ): Promise<{ migrated: number; skipped: number; failed: Array<{ path: string; error: string }> }> {
+    const encFiles = await this.scanEncFiles(configDir);
+    let migrated = 0;
+    let skipped = 0;
+    let done = 0;
+    const failed: Array<{ path: string; error: string }> = [];
+    let hint: LegacyVariant | undefined;
+
+    for (const encPath of encFiles) {
+      try {
+        const buf = new Uint8Array(await this.adapter.readBinary(encPath));
+        const res = await migrateBuffer(buf, password, this.engine, hint);
+        if (res.status === "skipped-v2") {
+          skipped++;
+        } else {
+          hint = res.variant;
+          const ab = res.v2.buffer.slice(
+            res.v2.byteOffset,
+            res.v2.byteOffset + res.v2.byteLength
+          );
+          await this.adapter.writeBinary(encPath, ab);
+          // Сбрасываем кэш для этого файла — он мог содержать stale-данные.
+          this.cache.delete(encPath.slice(0, -4));
+          migrated++;
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[VirtualShadow] Миграция "${encPath}" не удалась:`, err);
+        failed.push({ path: encPath, error: msg });
+      }
+      done++;
+      onProgress?.(done, encFiles.length, encPath);
+    }
+
+    return { migrated, skipped, failed };
   }
 }
