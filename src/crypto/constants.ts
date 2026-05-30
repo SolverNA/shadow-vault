@@ -49,3 +49,24 @@ export const VERIFICATION_CONSTANT = "shadow-vault-verify-v2";
  * legacy-web:  [IV(12)][ciphertext‖tag]            (старый web-crypto-engine.ts)
  * У них нет MAGIC-префикса, поэтому детект эвристический (см. detectFormat).
  */
+
+/**
+ * Параметры СТАРОГО формата шифрования (legacy, до ФАЗЫ 1).
+ *
+ * Значения сверены БАЙТ-В-БАЙТ со старым кодом из git-истории
+ * (commit 0a66e2e: src/crypto-engine.ts и src/web-crypto-engine.ts).
+ * НЕ МЕНЯТЬ — от них зависит расшифровка уже существующих legacy-хранилищ.
+ *
+ * Общее для обоих legacy-вариантов:
+ *   - AES-256-GCM, IV 12 байт, GCM-tag 16 байт.
+ *   - PBKDF2 поверх пароля с фиксированной доменной СОЛЬЮ "shadow-vault:v1"
+ *     (UTF-8), без участия email. Хэш SHA-512.
+ *   - НЕТ MAGIC-префикса.
+ *
+ * Различия:
+ *   legacy-node: layout [IV(12)][AuthTag(16)][ciphertext], 310000 итераций.
+ *   legacy-web:  layout [IV(12)][ciphertext‖tag(16 в конце)], 600000 итераций.
+ */
+export const LEGACY_SALT_DOMAIN = "shadow-vault:v1";
+export const LEGACY_PBKDF2_ITERATIONS_NODE = 310_000;
+export const LEGACY_PBKDF2_ITERATIONS_WEB = 600_000;

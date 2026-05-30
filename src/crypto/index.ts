@@ -6,6 +6,8 @@ export * from "./constants";
 export * from "./format";
 export * from "./key-derivation";
 export * from "./verification";
+export * from "./legacy";
+export * from "./migration";
 export * from "./factory";
 export type { CryptoEngine } from "./types";
 export { NodeCryptoEngine } from "../crypto-engine";
