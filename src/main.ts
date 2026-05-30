@@ -1001,8 +1001,6 @@ export default class ShadowVaultPlugin extends Plugin {
   }
 
   // setupQueue() удалён: bulk decrypt в setupShadow покрывает весь vault единоразово.
-  // QueueManager/QueueIntegration оставлены в кодовой базе на случай восстановления
-  // lazy-режима в будущем — но не вызываются в текущем flow.
 
   /** Освобождает частично созданное состояние при ошибке инициализации. */
   private rollbackInitialization(engine: CryptoEngine | WebCryptoEngine): void {
