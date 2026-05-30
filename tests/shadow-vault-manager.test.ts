@@ -1028,3 +1028,175 @@ describe("ShadowVaultManager — миграция legacy → v2 (ФАЗА 4)", (
     } finally { env.cleanup(); }
   });
 });
+
+// ─────────────────────────────────────────────
+// ФАЗА 5 — безопасный exportShadowToOriginal (disableEncryption)
+// ─────────────────────────────────────────────
+describe("ShadowVaultManager — exportShadowToOriginal (безопасный откат)", () => {
+  it("успешный путь: plaintext появляется в оригинале, ВСЕ .enc удалены", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "a.md", "alpha");
+      await writeEncrypted(env, "sub/b.md", "beta");
+      await env.manager.decryptAllToShadow();
+
+      const res = await env.manager.exportShadowToOriginal();
+      expect(res.failed).toHaveLength(0);
+      expect(res.exported.sort()).toEqual(["a.md", "sub/b.md"]);
+
+      // plaintext на месте
+      expect(fs.readFileSync(nodePath.join(env.origRoot, "a.md"), "utf8")).toBe("alpha");
+      expect(fs.readFileSync(nodePath.join(env.origRoot, "sub", "b.md"), "utf8")).toBe("beta");
+      // .enc удалены батчем в конце
+      expect(fs.existsSync(nodePath.join(env.origRoot, "a.md.enc"))).toBe(false);
+      expect(fs.existsSync(nodePath.join(env.origRoot, "sub", "b.md.enc"))).toBe(false);
+    } finally { env.cleanup(); }
+  });
+
+  it("сбой в середине: НИ ОДИН .enc не удалён, plaintext не потерян, понятная ошибка", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "ok.md", "good");
+      await writeEncrypted(env, "boom.md", "explode");
+      await env.manager.decryptAllToShadow();
+
+      // Детерминированный сбой фазы 1 без mock'ов: делаем целевой plaintext-путь
+      // boom.md КАТАЛОГОМ — atomicWrite (rename файла поверх каталога) упадёт,
+      // boom.md попадёт в failed, .enc удалять нельзя.
+      fs.mkdirSync(nodePath.join(env.origRoot, "boom.md"), { recursive: true });
+
+      const res = await env.manager.exportShadowToOriginal();
+
+      expect(res.failed.map(f => f.path)).toContain("boom.md");
+      // КРИТИЧНО: оба .enc нетронуты (батч-удаление фазы 2 не выполнялось)
+      expect(fs.existsSync(nodePath.join(env.origRoot, "ok.md.enc"))).toBe(true);
+      expect(fs.existsSync(nodePath.join(env.origRoot, "boom.md.enc"))).toBe(true);
+      // .enc по-прежнему расшифровывается в исходный plaintext (не потеряно)
+      expect(env.engine.decryptBuffer(
+        fs.readFileSync(nodePath.join(env.origRoot, "boom.md.enc"))
+      ).toString("utf8")).toBe("explode");
+    } finally { env.cleanup(); }
+  });
+
+  it("идемпотентность: повторный вызов после успеха безопасен", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "doc.md", "content");
+      await env.manager.decryptAllToShadow();
+
+      const r1 = await env.manager.exportShadowToOriginal();
+      expect(r1.failed).toHaveLength(0);
+      // Повторный вызов: plaintext уже есть, .enc уже нет — не падает
+      const r2 = await env.manager.exportShadowToOriginal();
+      expect(r2.failed).toHaveLength(0);
+      expect(fs.readFileSync(nodePath.join(env.origRoot, "doc.md"), "utf8")).toBe("content");
+    } finally { env.cleanup(); }
+  });
+});
+
+// ─────────────────────────────────────────────
+// ФАЗА 5 — sync encrypt-back при закрытии (потеря последней правки)
+// ─────────────────────────────────────────────
+describe("ShadowVaultManager — encryptUnsyncedChangesSync / hasUnsyncedChangesSync", () => {
+  it("незавершённая правка дошифровывается до удаления shadow", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "note.md", "v1");
+      await env.manager.decryptAllToShadow();
+
+      // Имитируем «последнюю правку» в shadow, которую write-through не успел
+      // зашифровать (mtime shadow заведомо новее .enc).
+      const enc = nodePath.join(env.origRoot, "note.md.enc");
+      const past = new Date(Date.now() - 10_000);
+      fs.utimesSync(enc, past, past);
+      fs.writeFileSync(nodePath.join(env.shadowRoot, "note.md"), "v2-последняя правка");
+
+      expect(env.manager.hasUnsyncedChangesSync()).toBe(true);
+
+      const r = env.manager.encryptUnsyncedChangesSync();
+      expect(r.failed).toHaveLength(0);
+      expect(r.encrypted).toBeGreaterThanOrEqual(1);
+
+      // .enc теперь содержит последнюю правку
+      const plain = env.engine.decryptBuffer(fs.readFileSync(enc)).toString("utf8");
+      expect(plain).toBe("v2-последняя правка");
+    } finally { env.cleanup(); }
+  });
+
+  it("новый файл в shadow без .enc считается несхороненным и шифруется", async () => {
+    const env = await makeEnv();
+    try {
+      fs.mkdirSync(env.shadowRoot, { recursive: true });
+      fs.writeFileSync(nodePath.join(env.shadowRoot, "fresh.md"), "только в shadow");
+
+      expect(env.manager.hasUnsyncedChangesSync()).toBe(true);
+      const r = env.manager.encryptUnsyncedChangesSync();
+      expect(r.encrypted).toBeGreaterThanOrEqual(1);
+
+      const enc = nodePath.join(env.origRoot, "fresh.md.enc");
+      expect(fs.existsSync(enc)).toBe(true);
+      expect(env.engine.decryptBuffer(fs.readFileSync(enc)).toString("utf8")).toBe("только в shadow");
+    } finally { env.cleanup(); }
+  });
+
+  it("после дошифровки несхороненных изменений не остаётся (shadow можно удалять)", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "x.md", "old");
+      await env.manager.decryptAllToShadow();
+      const enc = nodePath.join(env.origRoot, "x.md.enc");
+      const past = new Date(Date.now() - 10_000);
+      fs.utimesSync(enc, past, past);
+      fs.writeFileSync(nodePath.join(env.shadowRoot, "x.md"), "edited");
+
+      env.manager.encryptUnsyncedChangesSync();
+      expect(env.manager.hasUnsyncedChangesSync()).toBe(false);
+    } finally { env.cleanup(); }
+  });
+
+  it("идентичное содержимое (shadow не новее .enc) — не считается несхороненным", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "same.md", "stable");
+      await env.manager.decryptAllToShadow();
+      // shadow не трогаем; даём .enc более новый mtime чтобы исключить ложное срабатывание
+      const enc = nodePath.join(env.origRoot, "same.md.enc");
+      const future = new Date(Date.now() + 5_000);
+      fs.utimesSync(enc, future, future);
+
+      expect(env.manager.hasUnsyncedChangesSync()).toBe(false);
+    } finally { env.cleanup(); }
+  });
+});
+
+// ─────────────────────────────────────────────
+// ФАЗА 5 — pendingWrites / drainPending (дренаж при закрытии)
+// ─────────────────────────────────────────────
+describe("ShadowVaultManager — pendingWrites / drainPending", () => {
+  it("trackPending регистрирует промис и снимает по завершении", async () => {
+    const env = await makeEnv();
+    try {
+      let resolve!: () => void;
+      const p = new Promise<void>((r) => { resolve = r; });
+      env.manager.trackPending(p);
+      expect(env.manager.pendingCount()).toBe(1);
+      resolve();
+      await p;
+      // микрозадача finally
+      await Promise.resolve();
+      expect(env.manager.pendingCount()).toBe(0);
+    } finally { env.cleanup(); }
+  });
+
+  it("drainPending дожидается всех in-flight операций", async () => {
+    const env = await makeEnv();
+    try {
+      let done = false;
+      const p = new Promise<void>((r) => setTimeout(() => { done = true; r(); }, 30));
+      env.manager.trackPending(p);
+      await env.manager.drainPending();
+      expect(done).toBe(true);
+      expect(env.manager.pendingCount()).toBe(0);
+    } finally { env.cleanup(); }
+  });
+});

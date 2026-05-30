@@ -907,28 +907,33 @@ export default class ShadowVaultPlugin extends Plugin {
     this.registerEvent(this.app.vault.on("create", (file) => {
       if (isConfigPath(file.path)) return;
       console.debug(`[ShadowVault:event] create ${file.path}`);
-      void this.handleCreate(file);
+      // Регистрируем в pendingWrites — onunload дренирует их перед удалением shadow.
+      void this.shadowManager!.trackPending(this.handleCreate(file));
     }));
 
     this.registerEvent(this.app.vault.on("modify", (file) => {
       if (isConfigPath(file.path)) return;
       if (!(file instanceof TFile)) return;
       console.debug(`[ShadowVault:event] modify ${file.path}`);
-      void this.shadowManager!.encryptOne(file.path).catch((err) =>
-        console.error(`[ShadowVault:event] modify ${file.path} failed:`, err)
+      // КРИТИЧНО: promise регистрируется в pendingWrites, иначе последняя правка
+      // могла потеряться, если onunload удалит shadow до завершения encryptOne.
+      void this.shadowManager!.trackPending(
+        this.shadowManager!.encryptOne(file.path).catch((err) =>
+          console.error(`[ShadowVault:event] modify ${file.path} failed:`, err)
+        )
       );
     }));
 
     this.registerEvent(this.app.vault.on("delete", (file) => {
       if (isConfigPath(file.path)) return;
       console.debug(`[ShadowVault:event] delete ${file.path}`);
-      void this.handleDelete(file);
+      void this.shadowManager!.trackPending(this.handleDelete(file));
     }));
 
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
       if (isConfigPath(file.path) || isConfigPath(oldPath)) return;
       console.debug(`[ShadowVault:event] rename ${oldPath} → ${file.path}`);
-      void this.handleRename(file, oldPath);
+      void this.shadowManager!.trackPending(this.handleRename(file, oldPath));
     }));
 
     console.info("[ShadowVault] vault event handlers подписаны");
@@ -963,7 +968,12 @@ export default class ShadowVaultPlugin extends Plugin {
       if (file instanceof TFile) {
         await this.shadowManager!.renameEnc(oldPath, file.path);
       } else if (file instanceof TFolder) {
-        // Папка: переименовать в оригинале (там тоже структура с .enc)
+        // Папка: переименовать в оригинале (там тоже структура с .enc).
+        // КРИТИЧНО: сначала дренируем in-flight write-through, иначе
+        // fsp.rename каталога мог унести .enc «из-под» ещё пишущегося encryptOne
+        // (несогласованное состояние). drainPending гарантирует, что все
+        // незавершённые шифрования под старым путём завершены.
+        await this.shadowManager!.drainPending();
         const nodePath = npath();
         const fsp = nfsp();
         const oldOrig = nodePath.join(this.shadowManager!.originalRoot, ...oldPath.split("/"));
@@ -1027,6 +1037,18 @@ export default class ShadowVaultPlugin extends Plugin {
     this.sessionActive = false;
 
     console.debug("[ShadowVault] Завершение сессии...");
+
+    // 0. Дренаж in-flight write-through: дожидаемся завершения всех
+    //    незавершённых encryptOne (modify-обработчики работают через void),
+    //    иначе финальный encrypt-back/удаление shadow могли бы обогнать
+    //    ещё пишущуюся последнюю правку.
+    if (this.shadowManager) {
+      try {
+        await this.shadowManager.drainPending();
+      } catch (err) {
+        console.error("[ShadowVault] shutdown drainPending:", err);
+      }
+    }
 
     // 1. Финальный encrypt-back: страховка на случай если write-through
     //    что-то пропустил (например, файл был изменён сторонним процессом в shadow)
@@ -1345,6 +1367,31 @@ export default class ShadowVaultPlugin extends Plugin {
       const shadowRoot = this.shadowManager.shadowRoot;
       const originalRoot = this.shadowManager.originalRoot;
 
+      // 0. ФИНАЛЬНАЯ ДОШИФРОВКА несхороненных правок (закрывает окно потери
+      //    последней правки: modify-обработчик мог не успеть завершить encryptOne
+      //    до закрытия Obsidian). Делаем синхронно — onunload не ждёт async.
+      let unsyncedRemain = false;
+      try {
+        const r = this.shadowManager.encryptUnsyncedChangesSync();
+        if (r.encrypted > 0) {
+          console.info(`[ShadowVault] sync encrypt-back: дошифровано ${r.encrypted} файл(ов) при закрытии`);
+        }
+        if (r.failed.length > 0) {
+          unsyncedRemain = true;
+          console.error(`[ShadowVault] sync encrypt-back: не удалось ${r.failed.length} файл(ов):`, r.failed);
+        }
+      } catch (e) {
+        unsyncedRemain = true;
+        console.error("[ShadowVault] sync encrypt-back ошибка:", e);
+      }
+      // Повторная сверка: остались ли несхороненные изменения после дошифровки.
+      try {
+        if (this.shadowManager.hasUnsyncedChangesSync()) unsyncedRemain = true;
+      } catch (e) {
+        unsyncedRemain = true;
+        console.error("[ShadowVault] sync проверка несхороненных:", e);
+      }
+
       // 1. unpatch + unmount
       try { this.shadowManager.unpatch(adapter); console.debug("[ShadowVault] sync unpatch ok"); }
       catch (e) { console.error("[ShadowVault] sync unpatch:", e); }
@@ -1366,22 +1413,35 @@ export default class ShadowVaultPlugin extends Plugin {
         if (code !== "ENOENT") console.error("[ShadowVault] sync lstat .obsidian:", e);
       }
 
-      // 3. shadow vault recursive
-      try {
-        fs.rmSync(shadowRoot, { recursive: true, force: true });
-        console.info(`[ShadowVault] sync rm shadow ok: ${shadowRoot}`);
-      } catch (e) {
-        console.error(`[ShadowVault] sync rm shadow ${shadowRoot}:`, e);
+      // 3. shadow vault recursive — ТОЛЬКО если всё гарантированно дошифровано.
+      //    Если остались несхороненные изменения — НЕ удаляем shadow: лучше
+      //    оставить его для crash recovery при следующем старте, чем потерять данные.
+      if (unsyncedRemain) {
+        console.warn(
+          `[ShadowVault] sync: обнаружены несхороненные изменения — shadow НЕ удаляем ` +
+          `(${shadowRoot}). Данные восстановятся через recovery при следующем запуске.`
+        );
+      } else {
+        try {
+          fs.rmSync(shadowRoot, { recursive: true, force: true });
+          console.info(`[ShadowVault] sync rm shadow ok: ${shadowRoot}`);
+        } catch (e) {
+          console.error(`[ShadowVault] sync rm shadow ${shadowRoot}:`, e);
+        }
       }
 
-      // 4. session.lock
-      const lockPath = nodePath.join(this.getPluginDirAbs(originalRoot), "session.lock");
-      try {
-        fs.unlinkSync(lockPath);
-        console.debug(`[ShadowVault] sync unlink lock: ${lockPath}`);
-      } catch (e) {
-        const code = (e as NodeJS.ErrnoException).code;
-        if (code !== "ENOENT") console.error("[ShadowVault] sync unlink lock:", e);
+      // 4. session.lock — снимаем только если shadow удалён (чистый выход).
+      //    Если shadow оставлен для recovery, lock тоже оставляем, чтобы
+      //    следующий старт распознал незавершённую сессию.
+      if (!unsyncedRemain) {
+        const lockPath = nodePath.join(this.getPluginDirAbs(originalRoot), "session.lock");
+        try {
+          fs.unlinkSync(lockPath);
+          console.debug(`[ShadowVault] sync unlink lock: ${lockPath}`);
+        } catch (e) {
+          const code = (e as NodeJS.ErrnoException).code;
+          if (code !== "ENOENT") console.error("[ShadowVault] sync unlink lock:", e);
+        }
       }
     } else {
       console.warn("[ShadowVault] syncCleanup: shadowManager == null, нет данных для очистки");

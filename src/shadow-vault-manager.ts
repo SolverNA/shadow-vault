@@ -236,6 +236,181 @@ export class ShadowVaultManager {
   private encryptLocks: Map<string, Promise<void>> = new Map();
 
   /**
+   * Набор «в полёте» операций записи (write-through из vault-событий и
+   * операции rename папок). Modify-обработчик в main.ts регистрирует сюда
+   * каждый promise. drainPending() ждёт их завершения ПЕРЕД удалением shadow,
+   * закрывая окно потери последней правки при закрытии Obsidian.
+   */
+  private pendingWrites: Set<Promise<unknown>> = new Set();
+
+  /**
+   * Регистрирует promise write-through в набор pendingWrites и
+   * саморегистрирует его удаление по завершении (успех или ошибка).
+   * Возвращает тот же promise для удобной цепочки в вызывающем коде.
+   */
+  trackPending<T>(p: Promise<T>): Promise<T> {
+    this.pendingWrites.add(p);
+    p.finally(() => this.pendingWrites.delete(p)).catch(() => undefined);
+    return p;
+  }
+
+  /** Количество незавершённых write-through операций (для логов/тестов). */
+  pendingCount(): number {
+    return this.pendingWrites.size;
+  }
+
+  /**
+   * Дренаж: ждёт завершения ВСЕХ in-flight write-through операций.
+   * Делает несколько проходов, т.к. завершение одной операции может
+   * породить новую (autosave-каскад). Возвращает после стабилизации
+   * либо по достижении лимита проходов (защита от бесконечного цикла).
+   */
+  async drainPending(maxPasses = 50): Promise<void> {
+    for (let pass = 0; pass < maxPasses; pass++) {
+      if (this.pendingWrites.size === 0) {
+        // Дополнительно убедимся, что и per-file очереди пусты.
+        if (this.encryptLocks.size === 0) return;
+      }
+      const inflight = [
+        ...this.pendingWrites,
+        ...this.encryptLocks.values(),
+      ];
+      if (inflight.length === 0) return;
+      await Promise.allSettled(inflight);
+    }
+    console.warn(
+      `[ShadowVault] drainPending: лимит проходов исчерпан, осталось ` +
+      `${this.pendingWrites.size} pending / ${this.encryptLocks.size} locks`
+    );
+  }
+
+  /**
+   * Синхронная проверка: есть ли в shadow файлы новее своих .enc по mtime.
+   * Грубая, но быстрая эвристика для onunload (где async недопустим): если
+   * хотя бы один shadow-файл изменён позже .enc — значит есть несхороненные
+   * правки, и shadow удалять НЕЛЬЗЯ (оставляем для crash recovery).
+   *
+   * Использует node fs sync напрямую (вызывается только на desktop).
+   * Возвращает true, если найдены несхороненные изменения.
+   */
+  hasUnsyncedChangesSync(): boolean {
+    const stack: string[] = [this.shadowRoot];
+    while (stack.length > 0) {
+      const dir = stack.pop()!;
+      let entries: import("fs").Dirent[];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const e of entries) {
+        if (e.name === this.configDir || e.name.startsWith(".") || isTempFile(e.name)) {
+          continue;
+        }
+        const abs = nodePath.join(dir, e.name);
+        if (e.isDirectory()) {
+          stack.push(abs);
+          continue;
+        }
+        if (!e.isFile()) continue;
+        const rel = nodePath.relative(this.shadowRoot, abs).split(nodePath.sep).join("/");
+        const encAbs = this.originalEncAbs(rel);
+        try {
+          const sStat = fs.statSync(abs);
+          let eStat: import("fs").Stats;
+          try {
+            eStat = fs.statSync(encAbs);
+          } catch {
+            // .enc нет вовсе — файл создан в shadow и не зашифрован → несхороненное
+            return true;
+          }
+          // mtime shadow заметно новее .enc → правка не дошифрована.
+          // Допуск 1с компенсирует разрешение mtime ФС и порядок записи.
+          if (sStat.mtimeMs > eStat.mtimeMs + 1000) {
+            return true;
+          }
+        } catch {
+          continue;
+        }
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Синхронная финальная дошифровка несхороненных изменений (для onunload,
+   * где async недопустим). Проходит shadow, для каждого файла новее своего
+   * .enc (или без .enc) шифрует синхронно через engine.encryptBuffer и пишет
+   * .enc атомарно (tmp + renameSync).
+   *
+   * ВАЖНО: цельным форматом v2 (sync-стрима у node:crypto нет). Для очень
+   * больших файлов это разовая нагрузка при закрытии, но гарантирует, что
+   * последняя правка попадёт в .enc до удаления shadow. Возвращает количество
+   * дошифрованных и список не удавшихся (чтобы вызывающий НЕ удалял shadow).
+   */
+  encryptUnsyncedChangesSync(): { encrypted: number; failed: string[] } {
+    let encrypted = 0;
+    const failed: string[] = [];
+    const stack: string[] = [this.shadowRoot];
+
+    while (stack.length > 0) {
+      const dir = stack.pop()!;
+      let entries: import("fs").Dirent[];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const e of entries) {
+        if (e.name === this.configDir || e.name.startsWith(".") || isTempFile(e.name)) {
+          continue;
+        }
+        const abs = nodePath.join(dir, e.name);
+        if (e.isDirectory()) {
+          stack.push(abs);
+          continue;
+        }
+        if (!e.isFile()) continue;
+        const rel = nodePath.relative(this.shadowRoot, abs).split(nodePath.sep).join("/");
+        const encAbs = this.originalEncAbs(rel);
+
+        // Нужно ли дошифровывать? Нет .enc → да. Иначе по mtime.
+        let needs = false;
+        let sStat: import("fs").Stats;
+        try {
+          sStat = fs.statSync(abs);
+        } catch {
+          continue;
+        }
+        try {
+          const eStat = fs.statSync(encAbs);
+          needs = sStat.mtimeMs > eStat.mtimeMs + 1000;
+        } catch {
+          needs = true; // .enc отсутствует
+        }
+        if (!needs) continue;
+
+        try {
+          fs.mkdirSync(nodePath.dirname(encAbs), { recursive: true });
+          const enc =
+            sStat.size === 0
+              ? Buffer.alloc(0)
+              : this.engine.encryptBuffer(fs.readFileSync(abs));
+          const unique = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+          const tmp = `${encAbs}.${unique}.shadowtmp`;
+          fs.writeFileSync(tmp, enc);
+          fs.renameSync(tmp, encAbs);
+          encrypted++;
+        } catch (err) {
+          console.error(`[ShadowVault] sync encrypt-back "${rel}":`, err);
+          failed.push(rel);
+        }
+      }
+    }
+    return { encrypted, failed };
+  }
+
+  /**
    * Шифрует один файл из shadow в оригинал .enc.
    * Вызывается из vault.on("create" | "modify") в main.ts.
    *
@@ -466,11 +641,21 @@ export class ShadowVaultManager {
    * Используется при отключении шифрования — после этого vault содержит
    * открытые файлы, плагин переходит в спящий режим.
    *
-   * Порядок:
-   *   1. Копируем каждый файл из shadow в оригинал по тому же пути (без .enc).
-   *   2. Удаляем .enc-варианты в оригинале.
-   *   3. Структура папок уже зеркалирована в оригинале — пустые папки трогать
-   *      не нужно (они там и так есть).
+   * БЕЗОПАСНАЯ ДВУХФАЗНАЯ СХЕМА (защита от смешанного состояния при сбое):
+   *   ФАЗА 1 — экспорт+verify ВСЕХ файлов:
+   *     каждый shadow-файл пишется в оригинал атомарно (tmp + rename) и
+   *     ПОБАЙТОВО сверяется с источником. .enc при этом НЕ трогаются.
+   *     Если хоть один файл не удался — операция прерывается, возвращается
+   *     failed[], и НИ ОДИН .enc не удаляется (plaintext появился рядом с
+   *     ещё живым .enc — повторный вызов идемпотентно перезапишет plaintext
+   *     и в этот раз сможет удалить .enc).
+   *   ФАЗА 2 — удаление .enc батчем В КОНЦЕ:
+   *     только если ВСЕ экспорты прошли, удаляем .enc файлы (включая orphan,
+   *     которых не было в shadow). Сбой здесь не теряет данные: plaintext уже
+   *     на месте и проверен, а повторный вызов до-удалит оставшиеся .enc.
+   *
+   * Идемпотентность: повторный вызов после частичного успеха безопасен —
+   * фаза 1 перезапишет plaintext (verify пройдёт), фаза 2 удалит .enc.
    */
   async exportShadowToOriginal(
     onProgress?: (done: number, total: number, current: string) => void
@@ -480,21 +665,26 @@ export class ShadowVaultManager {
 
     const shadowFiles = await this.scanShadowFilesForSync();
     const total = shadowFiles.length;
-    console.info(`[ShadowVault] export shadow→original: ${total} файлов`);
+    console.info(`[ShadowVault] export shadow→original: ${total} файлов (фаза 1: экспорт+verify)`);
 
+    // ── ФАЗА 1: экспортируем и верифицируем ВСЕ файлы, .enc не трогаем ──
     for (let i = 0; i < total; i++) {
       const rel = shadowFiles[i];
       try {
         const src = this.shadowAbs(rel);
         const dst = this.originalAbs(rel);
         await fsp.mkdir(nodePath.dirname(dst), { recursive: true });
-        await fsp.copyFile(src, dst);
 
-        // Удаляем .enc после успешной копии (если есть)
-        await fsp.unlink(this.originalEncAbs(rel)).catch((err) => {
-          const code = (err as NodeJS.ErrnoException).code;
-          if (code !== "ENOENT") throw err;
-        });
+        // Атомарная запись plaintext: tmp + rename, чтобы сбой посреди копии
+        // не оставил усечённый/повреждённый оригинал.
+        const buf = await fsp.readFile(src);
+        await atomicWrite(dst, buf);
+
+        // Verify: побайтовая сверка записанного оригинала с источником.
+        const ok = await filesEqual(src, dst);
+        if (!ok) {
+          throw new Error("verify не прошёл: записанный plaintext не совпал с shadow");
+        }
 
         exported.push(rel);
       } catch (err) {
@@ -505,15 +695,35 @@ export class ShadowVaultManager {
       onProgress?.(i + 1, total, rel);
     }
 
-    // Подчищаем оставшиеся .enc файлы (если в shadow их не оказалось,
-    // но в оригинале они есть — например, после неудачного decrypt)
-    const orphanEnc = await this.scanEncryptedFiles();
-    for (const rel of orphanEnc) {
+    // Если хоть один файл не экспортировался/не верифицировался — НЕ удаляем
+    // .enc. Возвращаем failed: вызывающий (disableEncryption) откатится с
+    // понятной ошибкой, .enc нетронуты, plaintext не потерян.
+    if (failed.length > 0) {
+      console.error(
+        `[ShadowVault] export: ${failed.length} файл(ов) не удалось — ` +
+        `.enc НЕ удаляем, шифрование остаётся включённым (идемпотентный повтор безопасен).`
+      );
+      return { exported, failed };
+    }
+
+    // ── ФАЗА 2: все экспорты успешны → удаляем .enc батчем в конце ──
+    console.info(`[ShadowVault] export фаза 2: удаление .enc (${exported.length} экспортировано)`);
+    const encToRemove = new Set<string>(exported);
+    // Добавляем orphan .enc (есть в оригинале, но не было в shadow —
+    // например после неудачного decrypt); plaintext для них уже есть/нет,
+    // но сами .enc больше не нужны после отключения шифрования.
+    for (const rel of await this.scanEncryptedFiles()) encToRemove.add(rel);
+
+    for (const rel of encToRemove) {
       try {
         await fsp.unlink(this.originalEncAbs(rel));
-        console.warn(`[ShadowVault] export: удалён orphan .enc "${rel}" (не было в shadow)`);
       } catch (err) {
-        console.error(`[ShadowVault] export: не удалось удалить orphan .enc "${rel}":`, err);
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT") {
+          // Удаление .enc не удалось, но plaintext уже на месте и проверен —
+          // данные не потеряны. Логируем; повторный disableEncryption до-удалит.
+          console.error(`[ShadowVault] export: не удалось удалить .enc "${rel}":`, err);
+        }
       }
     }
 
