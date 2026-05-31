@@ -41,12 +41,18 @@ class InMemoryAdapter implements PlatformAdapter {
   async list(path: string): Promise<{ files: string[]; folders: string[] }> {
     const prefix = path ? path + "/" : "";
     const files: string[] = [];
+    const folders = new Set<string>();
     for (const key of this.files.keys()) {
-      if (key.startsWith(prefix) && !key.slice(prefix.length).includes("/")) {
+      if (!key.startsWith(prefix)) continue;
+      const rest = key.slice(prefix.length);
+      const slash = rest.indexOf("/");
+      if (slash === -1) {
         files.push(key);
+      } else {
+        folders.add(prefix + rest.slice(0, slash));
       }
     }
-    return { files, folders: [] };
+    return { files, folders: [...folders] };
   }
   async mkdir(): Promise<void> {
     /* папки в in-memory не нужны */
@@ -143,5 +149,38 @@ describe("VirtualShadowManager (mobile write-through)", () => {
     const st = await vsm.stat("s.md");
     expect(st).not.toBeNull();
     expect(st!.size).toBe(adapter.files.get("s.md.enc")!.byteLength);
+  });
+});
+
+describe("VirtualShadowManager.reEncryptAll (mobile смена ключа)", () => {
+  it("пере-шифровывает все .enc новым ключом и читает их новым ключом", async () => {
+    await vsm.write("a.md", bytes("payload A"));
+    await vsm.write("dir/b.md", bytes("payload B"));
+
+    // Новый ключ — другой email (новая соль), пароль не меняется.
+    const newEngine = new WebCryptoEngine();
+    await newEngine.deriveKey("new@shadow-vault.local", "correct horse battery staple");
+
+    const progress: Array<[number, number]> = [];
+    await vsm.reEncryptAll("", newEngine, (d, t) => progress.push([d, t]));
+
+    // Старым ключом .enc больше не читается
+    const oldReader = new VirtualShadowManager(engine, adapter);
+    await expect(oldReader.read("a.md")).rejects.toBeTruthy();
+
+    // Новым ключом — читается корректно
+    const newReader = new VirtualShadowManager(newEngine, adapter);
+    expect(text(await newReader.read("a.md"))).toBe("payload A");
+    expect(text(await newReader.read("dir/b.md"))).toBe("payload B");
+
+    expect(progress.length).toBeGreaterThan(0);
+  });
+
+  it("после reEncryptAll сам VSM читает новым ключом (engine переключён)", async () => {
+    await vsm.write("c.md", bytes("payload C"));
+    const newEngine = new WebCryptoEngine();
+    await newEngine.deriveKey(STUB_EMAIL, "totally different password 123");
+    await vsm.reEncryptAll("", newEngine, () => {});
+    expect(text(await vsm.read("c.md"))).toBe("payload C");
   });
 });

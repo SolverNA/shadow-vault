@@ -2,14 +2,14 @@
  * ShadowVaultSettingTab — вкладка настроек плагина в Obsidian Settings.
  *
  * Предоставляет:
- *   - Поле для кастомного пути к Теневому хранилищу
  *   - Кнопку "Заблокировать хранилище" (ручная блокировка)
- *   - Зону опасных действий: смена пароля, сброс конфигурации
+ *   - Смену учётных данных (email/пароль) с пере-шифровкой
+ *   - Зону опасных действий: расшифровать хранилище / сброс конфигурации
  */
 
 import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type ShadowVaultPlugin from "./main";
-import { ChangePasswordModal } from "./change-password-modal";
+import { ChangeCredentialsModal } from "./change-password-modal";
 import { ConfirmModal } from "./confirm-modal";
 import { SetPinModal } from "./set-pin-modal";
 import { PinStore } from "./pin-store";
@@ -66,24 +66,6 @@ export class ShadowVaultSettingTab extends PluginSettingTab {
       return;
     }
 
-    // ── Путь к теневому хранилищу ──────────────────────────────────────
-    new Setting(containerEl)
-      .setName("Путь к теневому хранилищу")
-      .setDesc(
-        "Директория для временных расшифрованных файлов. " +
-        "Оставьте пустым для автоматического выбора во временной папке ОС. " +
-        "Изменение вступит в силу при следующем запуске."
-      )
-      .addText((text) => {
-        text
-          .setPlaceholder("По умолчанию: /tmp/shadowvault-…")
-          .setValue(this.plugin.settings.shadowVaultPath)
-          .onChange(async (value) => {
-            this.plugin.settings.shadowVaultPath = value.trim();
-            await this.plugin.saveSettings();
-          });
-      });
-
     // ── Статус сессии ──────────────────────────────────────────────────
     new Setting(containerEl)
       .setName("Заблокировать хранилище")
@@ -101,16 +83,23 @@ export class ShadowVaultSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("Учётная запись").setHeading();
 
     new Setting(containerEl)
-      .setName("Email")
+      .setName("Email / пароль")
       .setDesc(
-        "Email задаёт соль деривации ключа. Сейчас смену email делать НЕЛЬЗЯ: " +
-        "новый email = новый ключ = существующие файлы станут нечитаемыми " +
-        "без перешифровки (запланировано на будущей фазе миграции)."
+        `Текущий email: ${this.plugin.settings.email || "(не задан)"}. ` +
+        "Email задаёт соль деривации ключа. Можно сменить email и/или пароль за " +
+        "одну пере-шифровку. Требует разблокированного хранилища; создайте " +
+        "резервную копию заранее."
       )
-      .addText((text) => {
-        text
-          .setValue(this.plugin.settings.email || "(не задан)")
-          .setDisabled(true); // read-only: смена email = TODO(ФАЗА 4 миграция)
+      .addButton((btn) => {
+        btn
+          .setButtonText("Сменить email/пароль")
+          .onClick(() => {
+            if (!this.plugin.isUnlocked()) {
+              new Notice("🔒 Сначала разблокируйте хранилище.", 4000);
+              return;
+            }
+            new ChangeCredentialsModal(this.app, this.plugin).open();
+          });
       });
 
     // ── Быстрый вход: PIN ──────────────────────────────────────────────
@@ -177,24 +166,6 @@ export class ShadowVaultSettingTab extends PluginSettingTab {
 
     // ── Опасная зона ───────────────────────────────────────────────────
     new Setting(containerEl).setName("Опасная зона").setHeading();
-
-    new Setting(containerEl)
-      .setName("Сменить пароль")
-      .setDesc(
-        "Пере-шифровать все файлы с новым паролем. " +
-        "Требует разблокированного хранилища. Создайте резервную копию заранее."
-      )
-      .addButton((btn) => {
-        btn
-          .setButtonText("Сменить пароль")
-          .onClick(() => {
-            if (!this.plugin.isUnlocked()) {
-              new Notice("🔒 Сначала разблокируйте хранилище.", 4000);
-              return;
-            }
-            new ChangePasswordModal(this.app, this.plugin).open();
-          });
-      });
 
     new Setting(containerEl)
       .setName("Расшифровать хранилище")

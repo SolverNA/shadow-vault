@@ -1,18 +1,34 @@
 import { App, Modal } from "obsidian";
 import { PasswordError } from "./auth-service";
 import { createPasswordField } from "./password-field";
+import { isValidEmail } from "./types";
 import type ShadowVaultPlugin from "./main";
 
-export class ChangePasswordModal extends Modal {
+/**
+ * Объединённая смена учётных данных: email И/ИЛИ пароль за ОДНУ пере-шифровку.
+ *
+ * Поля:
+ *   - текущий пароль (для проверки, обязателен);
+ *   - новый email (предзаполнен текущим; не меняя = оставить как есть);
+ *   - новый пароль (пусто = не менять);
+ *   - подтверждение нового пароля.
+ *
+ * Требование: хотя бы одно из (email, пароль) изменено, иначе ошибка.
+ */
+export class ChangeCredentialsModal extends Modal {
   private inputOld!: HTMLInputElement;
+  private inputEmail!: HTMLInputElement;
   private inputNew!: HTMLInputElement;
   private inputConfirm!: HTMLInputElement;
   private btnSubmit!: HTMLButtonElement;
   private errorEl!: HTMLElement;
   private progressEl!: HTMLElement;
 
+  private readonly currentEmail: string;
+
   constructor(app: App, private readonly plugin: ShadowVaultPlugin) {
     super(app);
+    this.currentEmail = plugin.settings.email || "";
   }
 
   onOpen(): void {
@@ -22,33 +38,49 @@ export class ChangePasswordModal extends Modal {
 
     contentEl.createEl("div", { cls: "shadow-vault-header" }, (h) => {
       h.createEl("div", { cls: "shadow-vault-icon", text: "🔑" });
-      h.createEl("h2", { cls: "shadow-vault-title", text: "Сменить пароль" });
+      h.createEl("h2", { cls: "shadow-vault-title", text: "Сменить email / пароль" });
       h.createEl("p", {
         cls: "shadow-vault-subtitle",
-        text: "Все файлы будут пере-шифрованы. Создайте резервную копию заранее.",
+        text: "Все файлы будут пере-шифрованы новым ключом. Создайте резервную копию заранее.",
       });
     });
 
     const form = contentEl.createEl("div", { cls: "shadow-vault-form" });
 
-    this.inputOld     = createPasswordField({ parent: form, label: "Текущий пароль",   placeholder: "Введите текущий пароль…", id: "cp-old" });
-    this.inputNew     = createPasswordField({ parent: form, label: "Новый пароль",     placeholder: "Введите новый пароль…",   id: "cp-new" });
-    this.inputConfirm = createPasswordField({ parent: form, label: "Подтвердить новый", placeholder: "Повторите новый пароль…", id: "cp-confirm" });
+    this.inputOld = createPasswordField({
+      parent: form, label: "Текущий пароль", placeholder: "Введите текущий пароль…", id: "cc-old",
+    });
+
+    // Поле email (обычный текст, предзаполнено текущим значением).
+    const emailWrap = form.createEl("div", { cls: "sv-field" });
+    emailWrap.createEl("label", { text: "Новый email (оставьте как есть, чтобы не менять)", attr: { for: "cc-email" } });
+    this.inputEmail = emailWrap.createEl("input", {
+      type: "text",
+      attr: { id: "cc-email", autocomplete: "off", spellcheck: "false" },
+    });
+    this.inputEmail.value = this.currentEmail;
+
+    this.inputNew = createPasswordField({
+      parent: form, label: "Новый пароль (пусто = не менять)", placeholder: "Введите новый пароль…", id: "cc-new",
+    });
+    this.inputConfirm = createPasswordField({
+      parent: form, label: "Подтвердить новый пароль", placeholder: "Повторите новый пароль…", id: "cc-confirm",
+    });
 
     this.errorEl = form.createEl("div", { cls: "shadow-vault-error sv-hidden" });
 
     this.progressEl = form.createEl("div", { cls: "shadow-vault-loading sv-hidden" }, (el) => {
       el.createEl("span", { cls: "sv-spinner" });
-      el.createEl("span", { attr: { id: "cp-progress-text" }, text: " Пере-шифрование…" });
+      el.createEl("span", { attr: { id: "cc-progress-text" }, text: " Пере-шифрование…" });
     });
 
     this.btnSubmit = form.createEl("button", {
       cls: "shadow-vault-btn mod-cta",
-      text: "Сменить пароль",
+      text: "Сменить",
     });
     this.btnSubmit.addEventListener("click", () => { void this.handleSubmit(); });
 
-    for (const input of [this.inputOld, this.inputNew, this.inputConfirm]) {
+    for (const input of [this.inputOld, this.inputEmail, this.inputNew, this.inputConfirm]) {
       input.addEventListener("keydown", (e) => { if (e.key === "Enter") void this.handleSubmit(); });
     }
 
@@ -62,8 +94,9 @@ export class ChangePasswordModal extends Modal {
   private async handleSubmit(): Promise<void> {
     this.hideError();
 
-    const oldPwd  = this.inputOld.value;
-    const newPwd  = this.inputNew.value;
+    const oldPwd = this.inputOld.value;
+    const newEmail = this.inputEmail.value.trim();
+    const newPwd = this.inputNew.value;
     const confirm = this.inputConfirm.value;
 
     if (!oldPwd) {
@@ -71,25 +104,48 @@ export class ChangePasswordModal extends Modal {
       this.inputOld.focus();
       return;
     }
-    if (newPwd.length < 8) {
-      this.showError("Новый пароль слишком короткий. Минимум 8 символов.");
-      this.inputNew.focus();
+
+    const emailChanged = newEmail.toLowerCase() !== this.currentEmail.trim().toLowerCase();
+    const passwordChanged = newPwd.length > 0;
+
+    if (!emailChanged && !passwordChanged) {
+      this.showError("Измените email или пароль — иначе менять нечего.");
       return;
     }
-    if (newPwd !== confirm) {
-      this.showError("Новые пароли не совпадают.");
-      this.inputConfirm.focus();
+
+    if (emailChanged && !isValidEmail(newEmail)) {
+      this.showError("Некорректный email.");
+      this.inputEmail.focus();
       return;
+    }
+
+    if (passwordChanged) {
+      if (newPwd.length < 8) {
+        this.showError("Новый пароль слишком короткий. Минимум 8 символов.");
+        this.inputNew.focus();
+        return;
+      }
+      if (newPwd !== confirm) {
+        this.showError("Новые пароли не совпадают.");
+        this.inputConfirm.focus();
+        return;
+      }
     }
 
     this.setLoading(true);
 
     try {
-      await this.plugin.changePassword(oldPwd, newPwd, (done, total) => {
-        const textEl = this.progressEl.querySelector("#cp-progress-text");
-        if (textEl) textEl.textContent = ` Пере-шифрование… ${done} / ${total}`;
-      });
-      // changePassword блокирует хранилище сам — просто закрываем этот модал
+      // newEmail — целевой email (если не менялся, передаём текущий — логика
+      // changeCredentials сама нормализует). newPwd пустой = пароль не меняется.
+      await this.plugin.changeCredentials(
+        oldPwd,
+        emailChanged ? newEmail : this.currentEmail,
+        passwordChanged ? newPwd : "",
+        (done, total) => {
+          const textEl = this.progressEl.querySelector("#cc-progress-text");
+          if (textEl) textEl.textContent = ` Пере-шифрование… ${done} / ${total}`;
+        }
+      );
       super.close();
     } catch (err) {
       this.setLoading(false);
@@ -99,19 +155,20 @@ export class ChangePasswordModal extends Modal {
         this.inputOld.focus();
       } else {
         this.showError("Ошибка пере-шифрования. Смотрите консоль разработчика.");
-        console.error("[ShadowVault] changePassword:", err);
+        console.error("[ShadowVault] changeCredentials:", err);
       }
     }
   }
 
   private setLoading(active: boolean): void {
-    this.btnSubmit.disabled       = active;
-    this.inputOld.disabled        = active;
-    this.inputNew.disabled        = active;
-    this.inputConfirm.disabled    = active;
+    this.btnSubmit.disabled = active;
+    this.inputOld.disabled = active;
+    this.inputEmail.disabled = active;
+    this.inputNew.disabled = active;
+    this.inputConfirm.disabled = active;
 
     if (active) this.progressEl.removeClass("sv-hidden");
-    else        this.progressEl.addClass("sv-hidden");
+    else this.progressEl.addClass("sv-hidden");
   }
 
   private showError(msg: string): void {
@@ -124,3 +181,6 @@ export class ChangePasswordModal extends Modal {
     this.errorEl.addClass("sv-hidden");
   }
 }
+
+/** @deprecated старое имя — оставлено для совместимости. */
+export const ChangePasswordModal = ChangeCredentialsModal;

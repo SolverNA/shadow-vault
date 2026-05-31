@@ -1200,3 +1200,67 @@ describe("ShadowVaultManager — pendingWrites / drainPending", () => {
     } finally { env.cleanup(); }
   });
 });
+
+// ─────────────────────────────────────────────
+// reEncryptAll — смена ключа (пароль и/или email)
+// ─────────────────────────────────────────────
+
+describe("ShadowVaultManager — reEncryptAll (смена ключа)", () => {
+  it("смена ПАРОЛЯ: файлы читаются новым ключом, старым — нет", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "a.md", "alpha");
+      await writeEncrypted(env, "sub/b.md", "beta");
+
+      const newEngine = new CryptoEngine();
+      await newEngine.deriveKey("test@test.local", "new-password");
+
+      const calls: Array<[number, number]> = [];
+      await env.manager.reEncryptAll(newEngine, (d, t) => calls.push([d, t]));
+
+      // Новый ключ читает
+      const encA = await fsp.readFile(nodePath.join(env.origRoot, "a.md.enc"));
+      expect(newEngine.decryptBuffer(encA).toString("utf8")).toBe("alpha");
+      const encB = await fsp.readFile(nodePath.join(env.origRoot, "sub", "b.md.enc"));
+      expect(newEngine.decryptBuffer(encB).toString("utf8")).toBe("beta");
+
+      // Старый ключ больше не читает
+      expect(() => env.engine.decryptBuffer(encA)).toThrow();
+
+      expect(calls.length).toBeGreaterThan(0);
+      newEngine.destroy();
+    } finally { env.cleanup(); }
+  });
+
+  it("смена EMAIL: новый ключ из нового email расшифровывает старые файлы", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "note.md", "secret-email-change");
+
+      // Новый email → новая соль → новый ключ (пароль не меняется).
+      const newEngine = new CryptoEngine();
+      await newEngine.deriveKey("changed@test.local", "test-password");
+
+      await env.manager.reEncryptAll(newEngine, () => {});
+
+      const enc = await fsp.readFile(nodePath.join(env.origRoot, "note.md.enc"));
+      expect(newEngine.decryptBuffer(enc).toString("utf8")).toBe("secret-email-change");
+      // Старый ключ (старый email) больше не подходит
+      expect(() => env.engine.decryptBuffer(enc)).toThrow();
+      newEngine.destroy();
+    } finally { env.cleanup(); }
+  });
+
+  it("не оставляет .enc.new артефактов после успешной пере-шифровки", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "x.md", "data");
+      const newEngine = new CryptoEngine();
+      await newEngine.deriveKey("test@test.local", "another-pass");
+      await env.manager.reEncryptAll(newEngine, () => {});
+      expect(fs.existsSync(nodePath.join(env.origRoot, "x.md.enc.new"))).toBe(false);
+      expect(fs.existsSync(nodePath.join(env.origRoot, "x.md.enc"))).toBe(true);
+      newEngine.destroy();
+    } finally { env.cleanup(); }
+  });
+});

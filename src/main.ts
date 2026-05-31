@@ -161,14 +161,40 @@ export default class ShadowVaultPlugin extends Plugin {
   }
 
   /**
-   * Меняет пароль хранилища: пере-шифровывает все .enc файлы с новым ключом.
-   * Вызывать только при активной сессии.
-   * После успеха блокирует хранилище — пользователь должен войти с новым паролем.
-   *
-   * @throws PasswordError если oldPassword неверный
+   * Меняет пароль хранилища (обратная совместимость / тонкая обёртка).
+   * Email не меняется. См. changeCredentials.
    */
   async changePassword(
     oldPassword: string,
+    newPassword: string,
+    onProgress: (done: number, total: number) => void
+  ): Promise<void> {
+    await this.changeCredentials(oldPassword, this.settings.email, newPassword, onProgress);
+  }
+
+  /**
+   * ОБЪЕДИНЁННАЯ смена учётных данных: email и/или пароль за ОДНУ
+   * пере-шифровку. Смена email меняет соль (salt = SHA-256(email‖domain)),
+   * смена пароля меняет KDF-вход — в обоих случаях это новый masterKey, т.е.
+   * один и тот же процесс: пере-шифровать всё хранилище новым ключом.
+   *
+   * Шаги:
+   *   1. Проверить ТЕКУЩИЙ пароль через verifyPassword (текущий email+пароль)
+   *      ДО любых разрушительных операций. Неверный → PasswordError, ничего
+   *      не тронуто.
+   *   2. Вычислить НОВЫЙ ключ из (newEmail, newPassword).
+   *   3. Пере-шифровать ВСЁ хранилище новым ключом (desktop: двухфазно
+   *      атомарно через .enc.new→.enc; mobile: пофайлово с round-trip verify).
+   *   4. Только после полного успеха: обновить data.json (email,
+   *      verificationBlob новым ключом), СБРОСИТЬ PIN, заблокировать.
+   *
+   * Хотя бы одно из (email, пароль) должно отличаться — проверяет вызывающий UI.
+   *
+   * @throws PasswordError если текущий пароль неверный
+   */
+  async changeCredentials(
+    oldPassword: string,
+    newEmail: string,
     newPassword: string,
     onProgress: (done: number, total: number) => void
   ): Promise<void> {
@@ -176,41 +202,66 @@ export default class ShadowVaultPlugin extends Plugin {
       throw new Error("Хранилище не разблокировано.");
     }
 
-    // 1. Верифицируем старый пароль независимо от активной сессии —
-    //    защита от смены пароля на разблокированном чужом устройстве.
-    //    Email берётся из сохранённых настроек (соль = SHA-256(email‖domain)).
-    const email = this.settings.email;
-    const checkEngine = await AuthService.verifyPassword(email, oldPassword, this.settings);
+    const oldEmail = this.settings.email;
+    const targetEmail = (newEmail || oldEmail).trim();
+    const targetPassword = newPassword || oldPassword;
+
+    // 1. Верифицируем ТЕКУЩИЙ пароль (старый email + старый пароль) независимо
+    //    от активной сессии — защита от смены на разблокированном чужом
+    //    устройстве. До этой точки ничего не меняем.
+    const checkEngine = await AuthService.verifyPassword(oldEmail, oldPassword, this.settings);
     checkEngine.destroy();
 
-    // 2. Создаём движок с новым паролем (тот же email → та же соль)
-    const newEngine = new CryptoEngine();
-    await newEngine.deriveKey(email, newPassword);
+    if (this.isDesktop) {
+      // 2. Новый desktop-движок с НОВЫМ ключом (новый email и/или пароль).
+      const newEngine = new CryptoEngine();
+      await newEngine.deriveKey(targetEmail, targetPassword);
 
-    // 3. Пере-шифруем все файлы (двухфазно, атомарно)
-    try {
-      await this.shadowManager!.reEncryptAll(newEngine, onProgress);
-    } catch (err) {
+      // 3. Пере-шифровка всех .enc (двухфазно, атомарно: .enc.new → .enc).
+      try {
+        await this.shadowManager!.reEncryptAll(newEngine, onProgress);
+      } catch (err) {
+        newEngine.destroy();
+        throw err;
+      }
+
+      // 4. Настройки — только после полного успеха пере-шифровки.
+      const newVerificationBuf = newEngine.encryptBuffer(
+        Buffer.from(VERIFICATION_PLAINTEXT, "utf8")
+      );
+      await this.saveSettings({
+        ...this.settings,
+        email: targetEmail,
+        verificationBlob: newVerificationBuf.toString("hex"),
+      });
       newEngine.destroy();
-      throw err;
+    } else {
+      // ── Mobile-путь: WebCryptoEngine + VirtualShadowManager ──────────────
+      const newEngine = new WebCryptoEngine();
+      await newEngine.deriveKey(targetEmail, targetPassword);
+
+      await this.virtualShadowManager!.reEncryptAll(
+        this.app.vault.configDir,
+        newEngine,
+        onProgress
+      );
+
+      const blob = await newEngine.encryptBuffer(
+        new TextEncoder().encode(VERIFICATION_PLAINTEXT)
+      );
+      await this.saveSettings({
+        ...this.settings,
+        email: targetEmail,
+        verificationBlob: Buffer.from(new Uint8Array(blob)).toString("hex"),
+      });
+      // Активный движок плагина переключаем на новый ключ.
+      this.cryptoEngine = newEngine;
     }
 
-    // 4. Сохраняем новые настройки — только после успешной пере-шифровки
-    const newVerificationBuf = newEngine.encryptBuffer(
-      Buffer.from(VERIFICATION_PLAINTEXT, "utf8")
-    );
-    await this.saveSettings({
-      ...this.settings,
-      verificationBlob: newVerificationBuf.toString("hex"),
-    });
-
-    newEngine.destroy();
-
-    // PIN привязан к старому masterKey → после смены пароля он невалиден.
-    // Стираем PIN-данные, чтобы не оставить нерабочий быстрый вход.
+    // PIN привязан к старому masterKey → после смены ключа он невалиден.
     new PinStore().clearPin();
 
-    // 5. Блокируем — при следующем входе используется новый пароль
+    // Блокируем — при следующем входе используется новый email/пароль.
     await this.lockVault();
   }
 
@@ -439,10 +490,12 @@ export default class ShadowVaultPlugin extends Plugin {
       const { SessionManager } = await import("./session-manager");
 
       // ── Phase 1: создаём shadow manager и initialize ──────────────────
+      // Путь к теневому хранилищу больше НЕ пользовательская настройка:
+      // всегда undefined → детерминированное авто-вычисление по хешу basePath.
       this.shadowManager = new ShadowVaultManager(
         engine,
         basePath,
-        this.settings.shadowVaultPath || undefined,
+        undefined,
         this.app.vault.configDir
       );
       await this.shadowManager.initialize();

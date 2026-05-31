@@ -259,6 +259,66 @@ export class VirtualShadowManager {
    * round-trip verify, поэтому окно потери данных минимально.
    * Идемпотентность: уже-v2 файлы пропускаются (skipped-v2).
    */
+  /**
+   * Пере-шифровывает все .enc новым ключом (смена пароля/email на mobile).
+   *
+   * Пофайлово: read(.enc) → decrypt СТАРЫМ движком (this.engine) → encrypt
+   * НОВЫМ движком → round-trip verify (decrypt новым движком, сравнение байт)
+   * → writeBinary поверх .enc. Новый шифртекст пишется ТОЛЬКО после успешного
+   * round-trip verify в памяти, поэтому окно повреждения данных на каждый файл
+   * минимально (одна атомарная writeBinary через Obsidian adapter).
+   *
+   * НЮАНС mobile: настоящей кросс-файловой атомарности (как rename .new→.enc на
+   * desktop) нет. Если процесс упадёт в середине, часть файлов будет под новым
+   * ключом, часть под старым. Для восстановления см. main.changeCredentials:
+   * verificationBlob обновляется только после полного успеха, а смешанное
+   * состояние читаемо, т.к. оба ключа известны во время прогона (повторный
+   * запуск с новым паролем дочитает остаток — будущая доработка).
+   *
+   * После успеха движок чтения переключается на новый ключ и кэш очищается.
+   *
+   * @param newEngine движок с уже загруженным НОВЫМ ключом
+   */
+  async reEncryptAll(
+    configDir: string,
+    newEngine: WebCryptoEngine,
+    onProgress?: (done: number, total: number) => void
+  ): Promise<void> {
+    const encFiles = await this.scanEncFiles(configDir);
+    const total = encFiles.length;
+
+    for (let i = 0; i < total; i++) {
+      const encPath = encFiles[i];
+      const buf = new Uint8Array(await this.adapter.readBinary(encPath));
+      if (buf.length === 0) {
+        onProgress?.(i + 1, total);
+        continue;
+      }
+      // Расшифровываем старым ключом
+      const plain = await this.engine.decryptBuffer(buf);
+      // Шифруем новым
+      const reenc = await newEngine.encryptBuffer(plain);
+      // Round-trip verify: новый шифртекст обязан расшифроваться в исходник
+      const check = new Uint8Array(await newEngine.decryptBuffer(reenc));
+      const orig = new Uint8Array(plain);
+      if (check.length !== orig.length) {
+        throw new Error(`[VirtualShadow] round-trip verify не прошёл (длина): ${encPath}`);
+      }
+      for (let k = 0; k < check.length; k++) {
+        if (check[k] !== orig[k]) {
+          throw new Error(`[VirtualShadow] round-trip verify не прошёл (байты): ${encPath}`);
+        }
+      }
+      await this.adapter.writeBinary(encPath, reenc);
+      this.cache.delete(encPath.slice(0, -4));
+      onProgress?.(i + 1, total);
+    }
+
+    // Переключаем движок чтения на новый ключ и чистим кэш.
+    this.engine = newEngine;
+    this.cache.clear();
+  }
+
   async migrateLegacyToV2(
     configDir: string,
     password: string,
