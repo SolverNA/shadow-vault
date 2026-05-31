@@ -27,6 +27,7 @@
 import { getSubtle, randomBytes } from "./crypto/platform";
 import { KEY_LENGTH, IV_LENGTH, GCM_TAG_LENGTH } from "./crypto/constants";
 import { writeContainer, parseContainer } from "./crypto/format";
+import { bytesToHex, hexToBytes } from "./hex";
 
 /** Префикс ключей localStorage — уникален для устройства/плагина. */
 const LS_PREFIX = "shadow-vault:pin:";
@@ -44,17 +45,6 @@ export const DEVICE_SALT_LENGTH = 16;
 export const PIN_MAX_ATTEMPTS = 5;
 
 const utf8 = new TextEncoder();
-
-function bytesToHex(b: Uint8Array): string {
-  let s = "";
-  for (let i = 0; i < b.length; i++) s += b[i].toString(16).padStart(2, "0");
-  return s;
-}
-function hexToBytes(hex: string): Uint8Array {
-  const out = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
-  return out;
-}
 
 /** Абстракция хранилища (для тестов можно подставить fake). */
 export interface DeviceStore {

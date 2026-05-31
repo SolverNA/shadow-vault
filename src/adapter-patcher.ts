@@ -5,6 +5,7 @@
 
 import { DataAdapter, DataWriteOptions } from "obsidian";
 import { VirtualShadowManager } from "./virtual-shadow-manager";
+import { isBypassPath } from "./path-utils";
 
 export class AdapterPatcher {
   private originalMethods: Partial<DataAdapter> = {};
@@ -211,13 +212,6 @@ export class AdapterPatcher {
    * @param normalizedPath - нормализованный путь
    */
   private isBypassPath(normalizedPath: string): boolean {
-    // Корневая директория
-    if (normalizedPath === "") return true;
-
-    // Конфигурация плагина (.obsidian)
-    if (normalizedPath === this.configDir) return true;
-    if (normalizedPath.startsWith(this.configDir + "/")) return true;
-
-    return false;
+    return isBypassPath(normalizedPath, this.configDir);
   }
 }

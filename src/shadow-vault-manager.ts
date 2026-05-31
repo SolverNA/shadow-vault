@@ -31,6 +31,7 @@ import { CryptoEngine } from "./crypto-engine";
 import { detectFormat, CHUNKED_HEADER_LENGTH, SEGMENT_LEN_PREFIX } from "./crypto/format";
 import { IV_LENGTH, GCM_TAG_LENGTH } from "./crypto/constants";
 import { migrateBuffer } from "./crypto/migration";
+import { isBypassPath } from "./path-utils";
 import type { LegacyVariant } from "./crypto/legacy";
 import { IDataAdapter, AdapterStat, DataWriteOptions, ListedFiles } from "./adapter-types";
 import {
@@ -951,11 +952,7 @@ export class ShadowVaultManager {
   }
 
   isBypassPath(normalizedPath: string): boolean {
-    return (
-      normalizedPath === "" ||
-      normalizedPath === this.configDir ||
-      normalizedPath.startsWith(this.configDir + "/")
-    );
+    return isBypassPath(normalizedPath, this.configDir);
   }
 
   // ═══════════════════════════════════════════════════════════════════════

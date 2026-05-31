@@ -46,6 +46,7 @@ import { ShadowVaultSettingTab } from "./settings-tab";
 import { DEFAULT_SETTINGS, PluginSettings, VERIFICATION_PLAINTEXT } from "./types";
 import { IDataAdapter, ListedFiles } from "./adapter-types";
 import { ENCRYPTED_EXT, listEncryptedDir } from "./fs-utils";
+import { bytesToHex } from "./hex";
 import { Logger, LogLevel, LogAdapter } from "./logger";
 import { BugReporter, VaultStats } from "./bug-report";
 
@@ -479,7 +480,7 @@ export default class ShadowVaultPlugin extends Plugin {
       await this.saveSettings({
         ...this.settings,
         email: targetEmail,
-        verificationBlob: newVerificationBuf.toString("hex"),
+        verificationBlob: bytesToHex(newVerificationBuf),
       });
       newEngine.destroy();
     } else {
@@ -507,7 +508,7 @@ export default class ShadowVaultPlugin extends Plugin {
       await this.saveSettings({
         ...this.settings,
         email: targetEmail,
-        verificationBlob: Buffer.from(new Uint8Array(blob)).toString("hex"),
+        verificationBlob: bytesToHex(new Uint8Array(blob)),
       });
       // Активный движок плагина переключаем на новый ключ.
       this.cryptoEngine = newEngine;
@@ -1267,9 +1268,7 @@ export default class ShadowVaultPlugin extends Plugin {
         engine.encryptBuffer(new TextEncoder().encode(VERIFICATION_PLAINTEXT))
       );
       const bytes = blob instanceof Uint8Array ? blob : new Uint8Array(blob as ArrayBuffer);
-      let hex = "";
-      for (let i = 0; i < bytes.length; i++) hex += bytes[i].toString(16).padStart(2, "0");
-      this.settings.verificationBlob = hex;
+      this.settings.verificationBlob = bytesToHex(bytes);
       this.settings.formatVersion = FORMAT_VERSION;
       await this.saveSettings();
       console.info("[ShadowVault] Создан v2 verificationBlob (mobile) для legacy-хранилища.");
