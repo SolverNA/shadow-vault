@@ -78,8 +78,29 @@ export default class ShadowVaultPlugin extends Plugin {
   /** Подписки на window error/unhandledrejection (снимаются в onunload). */
   private globalErrorHandlers: Array<() => void> = [];
 
+  /**
+   * Дедупликация баг-репортов: сигнатура ошибки → ts последнего репорта.
+   * Идентичная ошибка (operation + name + первая строка stack/message) в
+   * пределах окна REPORT_DEDUP_MS НЕ создаёт новый файл-репорт. Устраняет
+   * лавину одинаковых баг-репортов (напр. при закрытии Obsidian одно и то же
+   * событие срабатывало 9 раз → 9 идентичных файлов). Первая ошибка каждого
+   * типа репортится всегда.
+   */
+  private readonly recentReports = new Map<string, number>();
+  private static readonly REPORT_DEDUP_MS = 10_000;
+
   /** true только пока сессия активна (между onUnlock и shutdown) */
   private sessionActive = false;
+
+  /**
+   * true с момента входа в shutdown()/onunload до полного завершения.
+   * Гейт для vault-обработчиков: пока флаг взведён, менеджер вот-вот будет
+   * (или уже) обнулён — события Obsidian, прилетевшие «в полёте» (autosave/flush
+   * при закрытии), безопасно игнорируются, чтобы не дереференсить null.
+   * Выставляется ДО обнуления shadowManager, но ПОСЛЕ того как drain/encrypt-back
+   * уже захватили все ранее зарегистрированные правки.
+   */
+  private shuttingDown = false;
 
   /**
    * Ссылка на оригинальный adapter.list() до ранней подмены.
@@ -147,6 +168,10 @@ export default class ShadowVaultPlugin extends Plugin {
   }
 
   onunload(): void {
+    // Взводим гейт первым делом: при закрытии Obsidian шлёт flush/autosave
+    // события «в полёте» — обработчики должны их игнорировать, а не
+    // дереференсить обнуляемый shadowManager.
+    this.shuttingDown = true;
     this.logger?.info("main", "onunload: старт", { sessionActive: this.sessionActive });
     // Снимаем глобальные обработчики ошибок.
     for (const off of this.globalErrorHandlers) {
@@ -259,6 +284,22 @@ export default class ShadowVaultPlugin extends Plugin {
       operation,
       ...(context ?? {}),
     });
+
+    // Дедупликация: идентичная ошибка в окне REPORT_DEDUP_MS не плодит файлы.
+    // Логируем всегда (см. выше), но баг-репорт пишем не чаще одного на сигнатуру.
+    const signature = this.errorSignature(operation, error);
+    const now = Date.now();
+    const last = this.recentReports.get(signature);
+    if (last !== undefined && now - last < ShadowVaultPlugin.REPORT_DEDUP_MS) {
+      this.logger?.debug("error", "баг-репорт подавлен дедупликацией", {
+        operation,
+        sinceMs: now - last,
+      });
+      return null;
+    }
+    this.recentReports.set(signature, now);
+    this.pruneRecentReports(now);
+
     let path: string | null = null;
     try {
       const stats = await this.collectVaultStats().catch(() => undefined);
@@ -274,6 +315,37 @@ export default class ShadowVaultPlugin extends Plugin {
       }
     }
     return path;
+  }
+
+  /**
+   * Сигнатура ошибки для дедупликации: operation + name + первая значимая
+   * строка stack (или message). Намеренно грубая — идентичные по сути ошибки
+   * (одно и то же место кода) дают одну сигнатуру независимо от ts/произвольных
+   * чисел в сообщении.
+   */
+  private errorSignature(operation: string, error: unknown): string {
+    let name = "Error";
+    let head = "";
+    if (error instanceof Error) {
+      name = error.name || "Error";
+      const firstStackLine = (error.stack ?? "")
+        .split("\n")
+        .map((l) => l.trim())
+        .find((l) => l.startsWith("at "));
+      head = firstStackLine ?? error.message ?? "";
+    } else {
+      head = String(error);
+    }
+    return `${operation}|${name}|${head}`;
+  }
+
+  /** Удаляет из карты дедупликации записи старше окна — не даём ей расти. */
+  private pruneRecentReports(now: number): void {
+    for (const [sig, ts] of this.recentReports) {
+      if (now - ts >= ShadowVaultPlugin.REPORT_DEDUP_MS) {
+        this.recentReports.delete(sig);
+      }
+    }
   }
 
   /**
@@ -385,7 +457,10 @@ export default class ShadowVaultPlugin extends Plugin {
 
       // 3. Пере-шифровка всех .enc (двухфазно, атомарно: .enc.new → .enc).
       try {
-        await this.shadowManager!.reEncryptAll(newEngine, (done, total) => {
+        if (!this.shadowManager) {
+          throw new Error("shadowManager не инициализирован — сессия не активна");
+        }
+        await this.shadowManager.reEncryptAll(newEngine, (done, total) => {
           if (total > 0 && (done === total || done % 25 === 0)) {
             this.logger.debug("reEncrypt", "прогресс (desktop)", { done, total });
           }
@@ -413,7 +488,10 @@ export default class ShadowVaultPlugin extends Plugin {
       await newEngine.deriveKey(targetEmail, targetPassword);
 
       try {
-        await this.virtualShadowManager!.reEncryptAll(
+        if (!this.virtualShadowManager) {
+          throw new Error("virtualShadowManager не инициализирован — сессия не активна");
+        }
+        await this.virtualShadowManager.reEncryptAll(
           this.app.vault.configDir,
           newEngine,
           onProgress
@@ -788,6 +866,7 @@ export default class ShadowVaultPlugin extends Plugin {
         }
       });
 
+      this.shuttingDown = false;
       this.sessionActive = true;
 
       if (isFirstRun) {
@@ -1052,6 +1131,7 @@ export default class ShadowVaultPlugin extends Plugin {
         }
       });
 
+      this.shuttingDown = false;
       this.sessionActive = true;
 
       if (isFirstRun) {
@@ -1256,44 +1336,96 @@ export default class ShadowVaultPlugin extends Plugin {
    * через symlink, шифровать его не нужно (и Obsidian заваливал бы handler
    * каждое сохранение workspace.json).
    */
+  /**
+   * Гейт жизненного цикла для vault-обработчиков. Возвращает живой
+   * ShadowManager ТОЛЬКО если сессия активна, shutdown не начат и менеджер
+   * не обнулён. Иначе null — обработчик обязан безопасно выйти (ранний return),
+   * не дереференсить менеджер и не бросать исключение.
+   *
+   * Устраняет гонку: события Obsidian (autosave/flush) могут прилетать ПОСЛЕ
+   * того как shutdown() обнулил shadowManager → раньше это давало
+   * `TypeError: Cannot read properties of null (reading 'trackPending')`.
+   */
+  private liveShadowManager(reason: string): ShadowVaultManager | null {
+    if (this.shuttingDown || !this.sessionActive || !this.shadowManager) {
+      this.logger?.debug(
+        "write",
+        "vault-событие проигнорировано: менеджер не инициализирован / идёт завершение",
+        { reason, shuttingDown: this.shuttingDown, sessionActive: this.sessionActive },
+      );
+      return null;
+    }
+    return this.shadowManager;
+  }
+
   private setupVaultEventHandlersDesktop(): void {
     const configDir = this.app.vault.configDir;
     const isConfigPath = (p: string) => p === configDir || p.startsWith(configDir + "/");
 
     this.registerEvent(this.app.vault.on("create", (file) => {
-      if (isConfigPath(file.path)) return;
-      console.debug(`[ShadowVault:event] create ${file.path}`);
-      // Регистрируем в pendingWrites — onunload дренирует их перед удалением shadow.
-      void this.shadowManager!.trackPending(this.handleCreate(file));
+      try {
+        if (isConfigPath(file.path)) return;
+        const sm = this.liveShadowManager(`create ${file.path}`);
+        if (!sm) return;
+        console.debug(`[ShadowVault:event] create ${file.path}`);
+        // Регистрируем в pendingWrites — onunload дренирует их перед удалением shadow.
+        void sm.trackPending(this.handleCreate(file));
+      } catch (err) {
+        // Обработчик вызывается fire-and-forget — исключение всплыло бы в
+        // window.error и породило лавину баг-репортов. Глушим тут.
+        console.error(`[ShadowVault:event] create handler ${file.path}:`, err);
+        void this.reportError("write.create.handler", err, { path: file.path }, { silent: true });
+      }
     }));
 
     this.registerEvent(this.app.vault.on("modify", (file) => {
-      if (isConfigPath(file.path)) return;
-      if (!(file instanceof TFile)) return;
-      console.debug(`[ShadowVault:event] modify ${file.path}`);
-      // КРИТИЧНО: promise регистрируется в pendingWrites, иначе последняя правка
-      // могла потеряться, если onunload удалит shadow до завершения encryptOne.
-      const t0 = Date.now();
-      void this.shadowManager!.trackPending(
-        this.shadowManager!.encryptOne(file.path)
-          .then(() => this.logger.debug("write", "modify→encrypt", { path: file.path, ms: Date.now() - t0 }))
-          .catch((err) => {
-            console.error(`[ShadowVault:event] modify ${file.path} failed:`, err);
-            void this.reportError("write.modify", err, { path: file.path }, { silent: true });
-          })
-      );
+      try {
+        if (isConfigPath(file.path)) return;
+        if (!(file instanceof TFile)) return;
+        const sm = this.liveShadowManager(`modify ${file.path}`);
+        if (!sm) return;
+        console.debug(`[ShadowVault:event] modify ${file.path}`);
+        // КРИТИЧНО: promise регистрируется в pendingWrites, иначе последняя правка
+        // могла потеряться, если onunload удалит shadow до завершения encryptOne.
+        const t0 = Date.now();
+        void sm.trackPending(
+          sm.encryptOne(file.path)
+            .then(() => this.logger.debug("write", "modify→encrypt", { path: file.path, ms: Date.now() - t0 }))
+            .catch((err) => {
+              console.error(`[ShadowVault:event] modify ${file.path} failed:`, err);
+              void this.reportError("write.modify", err, { path: file.path }, { silent: true });
+            })
+        );
+      } catch (err) {
+        console.error(`[ShadowVault:event] modify handler ${file.path}:`, err);
+        void this.reportError("write.modify.handler", err, { path: file.path }, { silent: true });
+      }
     }));
 
     this.registerEvent(this.app.vault.on("delete", (file) => {
-      if (isConfigPath(file.path)) return;
-      console.debug(`[ShadowVault:event] delete ${file.path}`);
-      void this.shadowManager!.trackPending(this.handleDelete(file));
+      try {
+        if (isConfigPath(file.path)) return;
+        const sm = this.liveShadowManager(`delete ${file.path}`);
+        if (!sm) return;
+        console.debug(`[ShadowVault:event] delete ${file.path}`);
+        void sm.trackPending(this.handleDelete(file));
+      } catch (err) {
+        console.error(`[ShadowVault:event] delete handler ${file.path}:`, err);
+        void this.reportError("write.delete.handler", err, { path: file.path }, { silent: true });
+      }
     }));
 
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
-      if (isConfigPath(file.path) || isConfigPath(oldPath)) return;
-      console.debug(`[ShadowVault:event] rename ${oldPath} → ${file.path}`);
-      void this.shadowManager!.trackPending(this.handleRename(file, oldPath));
+      try {
+        if (isConfigPath(file.path) || isConfigPath(oldPath)) return;
+        const sm = this.liveShadowManager(`rename ${oldPath} → ${file.path}`);
+        if (!sm) return;
+        console.debug(`[ShadowVault:event] rename ${oldPath} → ${file.path}`);
+        void sm.trackPending(this.handleRename(file, oldPath));
+      } catch (err) {
+        console.error(`[ShadowVault:event] rename handler ${oldPath} → ${file.path}:`, err);
+        void this.reportError("write.rename.handler", err, { from: oldPath, to: file.path }, { silent: true });
+      }
     }));
 
     console.info("[ShadowVault] vault event handlers подписаны");
@@ -1301,10 +1433,12 @@ export default class ShadowVaultPlugin extends Plugin {
 
   private async handleCreate(file: TAbstractFile): Promise<void> {
     try {
+      const sm = this.liveShadowManager(`handleCreate ${file.path}`);
+      if (!sm) return;
       if (file instanceof TFile) {
-        await this.shadowManager!.encryptOne(file.path);
+        await sm.encryptOne(file.path);
       } else if (file instanceof TFolder) {
-        await this.shadowManager!.mkdirOriginal(file.path);
+        await sm.mkdirOriginal(file.path);
       }
       this.logger.debug("write", "create→encrypt", { path: file.path });
     } catch (err) {
@@ -1315,10 +1449,12 @@ export default class ShadowVaultPlugin extends Plugin {
 
   private async handleDelete(file: TAbstractFile): Promise<void> {
     try {
+      const sm = this.liveShadowManager(`handleDelete ${file.path}`);
+      if (!sm) return;
       if (file instanceof TFile) {
-        await this.shadowManager!.unlinkEnc(file.path);
+        await sm.unlinkEnc(file.path);
       } else if (file instanceof TFolder) {
-        await this.shadowManager!.rmdirOriginal(file.path);
+        await sm.rmdirOriginal(file.path);
       }
       this.logger.debug("write", "delete→unlink", { path: file.path });
     } catch (err) {
@@ -1329,19 +1465,21 @@ export default class ShadowVaultPlugin extends Plugin {
 
   private async handleRename(file: TAbstractFile, oldPath: string): Promise<void> {
     try {
+      const sm = this.liveShadowManager(`handleRename ${oldPath} → ${file.path}`);
+      if (!sm) return;
       if (file instanceof TFile) {
-        await this.shadowManager!.renameEnc(oldPath, file.path);
+        await sm.renameEnc(oldPath, file.path);
       } else if (file instanceof TFolder) {
         // Папка: переименовать в оригинале (там тоже структура с .enc).
         // КРИТИЧНО: сначала дренируем in-flight write-through, иначе
         // fsp.rename каталога мог унести .enc «из-под» ещё пишущегося encryptOne
         // (несогласованное состояние). drainPending гарантирует, что все
         // незавершённые шифрования под старым путём завершены.
-        await this.shadowManager!.drainPending();
+        await sm.drainPending();
         const nodePath = npath();
         const fsp = nfsp();
-        const oldOrig = nodePath.join(this.shadowManager!.originalRoot, ...oldPath.split("/"));
-        const newOrig = nodePath.join(this.shadowManager!.originalRoot, ...file.path.split("/"));
+        const oldOrig = nodePath.join(sm.originalRoot, ...oldPath.split("/"));
+        const newOrig = nodePath.join(sm.originalRoot, ...file.path.split("/"));
         await fsp.mkdir(nodePath.dirname(newOrig), { recursive: true });
         await fsp.rename(oldOrig, newOrig);
       }
@@ -1446,6 +1584,12 @@ export default class ShadowVaultPlugin extends Plugin {
    */
   async shutdown(): Promise<void> {
     if (!this.sessionActive) return;
+    // Взводим гейт ДО любых действий: новые vault-события (autosave/flush) с
+    // этого момента игнорируются обработчиками (liveShadowManager вернёт null),
+    // чтобы они не дереференсили вот-вот обнуляемый shadowManager. При этом все
+    // ранее зарегистрированные правки уже в pendingWrites и будут дренированы
+    // ниже — дошифровка последней правки не теряется.
+    this.shuttingDown = true;
     this.sessionActive = false;
 
     this.logger.info("shutdown", "завершение сессии: старт");
@@ -1515,6 +1659,10 @@ export default class ShadowVaultPlugin extends Plugin {
       this.sessionManager = null;
     }
 
+    // Сбрасываем гейт: сессия полностью завершена, менеджер обнулён. Следующий
+    // unlock (например после lockVault) стартует с чистого состояния.
+    this.shuttingDown = false;
+
     this.logger.info("shutdown", "сессия завершена");
     console.debug("[ShadowVault] Сессия завершена.");
   }
@@ -1525,6 +1673,7 @@ export default class ShadowVaultPlugin extends Plugin {
   private syncCleanupMobile(): void {
     console.info("[ShadowVault] syncCleanupMobile: старт");
 
+    this.shuttingDown = true;
     this.sessionActive = false;
 
     // 1. Снимаем патч с адаптера
@@ -1716,7 +1865,10 @@ export default class ShadowVaultPlugin extends Plugin {
         // Файлы из decryptAllToShadow.failed[] есть в .enc, но не в shadow —
         // если их зарегистрировать, любой клик пользователя приведёт к
         // ENOENT при native readFile/lstat.
-        const shadowAbs = this.shadowManager!.shadowAbs(filePath);
+        // notifyFilesCreated вызывается в awaited-фазе unlock, где менеджер уже
+        // создан; но на всякий случай проверяем, чтобы не дереференсить null.
+        if (!this.shadowManager) break;
+        const shadowAbs = this.shadowManager.shadowAbs(filePath);
         const fsp = nfsp();
         try {
           await fsp.access(shadowAbs);
@@ -1778,6 +1930,7 @@ export default class ShadowVaultPlugin extends Plugin {
       console.debug("[ShadowVault] syncCleanup: сессия не активна, пропускаем");
       return;
     }
+    this.shuttingDown = true;
     this.sessionActive = false;
 
     const adapter = this.app.vault.adapter as unknown as IDataAdapter;
