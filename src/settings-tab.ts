@@ -7,12 +7,13 @@
  *   - Зону опасных действий: расшифровать хранилище / сброс конфигурации
  */
 
-import { App, Notice, PluginSettingTab, Setting } from "obsidian";
+import { App, Notice, Platform, PluginSettingTab, Setting } from "obsidian";
 import type ShadowVaultPlugin from "./main";
 import { ChangeCredentialsModal } from "./change-password-modal";
 import { ConfirmModal } from "./confirm-modal";
 import { SetPinModal } from "./set-pin-modal";
 import { PinStore } from "./pin-store";
+import { LogLevel } from "./logger";
 
 export class ShadowVaultSettingTab extends PluginSettingTab {
   constructor(app: App, private readonly plugin: ShadowVaultPlugin) {
@@ -164,6 +165,9 @@ export class ShadowVaultSettingTab extends PluginSettingTab {
           });
       });
 
+    // ── Диагностика / Логи ─────────────────────────────────────────────
+    this.renderDiagnostics(containerEl);
+
     // ── Опасная зона ───────────────────────────────────────────────────
     new Setting(containerEl).setName("Опасная зона").setHeading();
 
@@ -213,5 +217,112 @@ export class ShadowVaultSettingTab extends PluginSettingTab {
             ).open();
           });
       });
+  }
+
+  /**
+   * Секция «Диагностика / Логи»: уровень логирования, работа с папкой логов
+   * и баг-репортами. Кросс-платформенно: на desktop пытаемся открыть папку
+   * в файловом менеджере, на mobile показываем путь.
+   */
+  private renderDiagnostics(containerEl: HTMLElement): void {
+    const plugin = this.plugin;
+    if (!plugin.logger) return;
+
+    new Setting(containerEl).setName("Диагностика / Логи").setHeading();
+
+    // Тумблер подробного логирования (DEBUG).
+    new Setting(containerEl)
+      .setName("Подробное логирование (debug)")
+      .setDesc(
+        "Включает детальные debug-логи всех операций. Логи и баг-репорты " +
+        "сохраняются локально в папке плагина. Секреты (пароль/PIN/ключи/" +
+        "содержимое файлов) НЕ логируются."
+      )
+      .addToggle((tg) => {
+        tg
+          .setValue(plugin.logger.getMinLevel() <= LogLevel.DEBUG)
+          .onChange((v) => {
+            plugin.logger.setMinLevel(v ? LogLevel.DEBUG : LogLevel.INFO);
+            new Notice(v ? "Подробное логирование включено." : "Логирование: только важные события.", 3000);
+          });
+      });
+
+    // Открыть папку логов.
+    new Setting(containerEl)
+      .setName("Папка логов и баг-репортов")
+      .setDesc(plugin.logger.logDir)
+      .addButton((btn) => {
+        btn.setButtonText("Открыть папку").onClick(() => {
+          void this.openLogFolder();
+        });
+      });
+
+    // Показать последние баг-репорты.
+    new Setting(containerEl)
+      .setName("Баг-репорты")
+      .setDesc("Показать список сохранённых баг-репортов (создаются автоматически при ошибках).")
+      .addButton((btn) => {
+        btn.setButtonText("Показать последние").onClick(() => {
+          void this.showBugReports();
+        });
+      });
+
+    // Очистить логи и репорты.
+    new Setting(containerEl)
+      .setName("Очистить логи и баг-репорты")
+      .setDesc("Удалить все файлы логов и сохранённые баг-репорты с устройства.")
+      .addButton((btn) => {
+        btn
+          .setButtonText("Очистить")
+          .setWarning()
+          .onClick(() => {
+            new ConfirmModal(
+              this.app,
+              "Удалить все логи и баг-репорты? Действие необратимо.",
+              (confirmed) => {
+                if (!confirmed) return;
+                void Promise.all([plugin.logger.clear(), plugin.bugReporter.clear()]).then(() => {
+                  new Notice("Логи и баг-репорты очищены.", 4000);
+                });
+              }
+            ).open();
+          });
+      });
+  }
+
+  /** Открывает папку логов: desktop — в файловом менеджере, mobile — Notice. */
+  private async openLogFolder(): Promise<void> {
+    const dir = this.plugin.logger.logDir;
+    if (Platform.isDesktopApp) {
+      try {
+        // Ленивый доступ к node:path только в desktop-ветке.
+        const { npath } = await import("./node-fs");
+        const basePath = (this.app.vault.adapter as unknown as { getBasePath?: () => string }).getBasePath?.();
+        const abs = basePath ? npath().join(basePath, dir) : dir;
+        const electron = (globalThis as unknown as { require?: (m: string) => unknown }).require?.("electron") as
+          | { shell?: { openPath: (p: string) => Promise<string> } }
+          | undefined;
+        if (electron?.shell) {
+          await electron.shell.openPath(abs);
+          return;
+        }
+        new Notice(`Папка логов:\n${abs}`, 8000);
+      } catch {
+        new Notice(`Папка логов:\n${dir}`, 8000);
+      }
+    } else {
+      new Notice(`Папка логов (внутри хранилища):\n${dir}`, 8000);
+    }
+  }
+
+  /** Показывает список последних баг-репортов через Notice. */
+  private async showBugReports(): Promise<void> {
+    const reports = await this.plugin.bugReporter.list();
+    if (reports.length === 0) {
+      new Notice("Баг-репортов нет.", 4000);
+      return;
+    }
+    const head = reports.slice(0, 10).map((p) => "• " + p.split("/").pop()).join("\n");
+    new Notice(`Последние баг-репорты (${reports.length}):\n${head}`, 12000);
   }
 }
