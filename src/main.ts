@@ -807,7 +807,7 @@ export default class ShadowVaultPlugin extends Plugin {
         `❌ Shadow Vault: ошибка при запуске.\n${err instanceof Error ? err.message : String(err)}`,
         10000
       );
-      this.rollbackInitialization(engine);
+      await this.rollbackInitialization(engine);
     }
   }
 
@@ -840,7 +840,11 @@ export default class ShadowVaultPlugin extends Plugin {
         this.settings.formatVersion = FORMAT_VERSION;
         await this.saveSettings();
       }
-      await this.ensureVerificationBlobDesktop();
+      // Самовосстановление блоба для v2-хранилища без verificationBlob.
+      // ВАЖНО: блоб создаём ТОЛЬКО после проверки пароля по реальному v2-файлу.
+      // Иначе неверный пароль создал бы «валидный» блоб для НЕВЕРНОГО ключа и
+      // навсегда сломал бы вход (точно этот баг и наблюдался у пользователя).
+      await this.recoverVerificationBlobDesktop(password);
       return;
     }
 
@@ -855,23 +859,33 @@ export default class ShadowVaultPlugin extends Plugin {
     }
 
     // ── Проверка пароля через trial-decrypt первого legacy-файла ──────────
-    const sample = await this.shadowManager.firstEncBuffer();
-    if (sample) {
-      const ok = await probeLegacyPassword(sample, password);
-      this.logger.info("auth", "проверка legacy-пароля (desktop)", { success: ok });
-      if (!ok) {
-        // Неверный пароль: НЕ начинаем разрушительную миграцию.
-        // AuthService мог только что записать v2-блоб на "первом запуске"
-        // (legacy-хранилище без блоба) — он соответствует НЕВЕРНОМУ ключу.
-        // Сбрасываем его, чтобы следующий вход снова проверялся через legacy.
-        if (this.settings.verificationBlob) {
-          this.settings.verificationBlob = null;
-          await this.saveSettings();
-        }
+    // hasLegacy уже true: ищем первый РЕАЛЬНЫЙ legacy-образец (v2/пустые
+    // firstEncBuffer мог бы вернуть — поэтому пробуем все, пока не получим
+    // явный legacy-исход).
+    const encFiles = await this.shadowManager.scanEncryptedFiles();
+    let decided = false;
+    for (const rel of encFiles) {
+      let sample: Uint8Array;
+      try {
+        sample = new Uint8Array(await this.shadowManager.readEncFull(rel));
+      } catch {
+        continue;
+      }
+      const probe = await probeLegacyPassword(sample, password);
+      if (probe.status === "NOT_LEGACY") continue; // v2/пустой — не образец для проверки
+      decided = true;
+      this.logger.info("auth", "проверка legacy-пароля (desktop)", { success: probe.status === "LEGACY_OK" });
+      if (probe.status === "LEGACY_WRONG_PASSWORD") {
+        // ТОЛЬКО реальный legacy-файл, который не дешифруется → неверный пароль.
+        // НЕ трогаем verificationBlob (если он валиден для v2-файлов — он нужен).
         throw new Error(
           "Неверный пароль для хранилища старого формата — миграция отменена, файлы не тронуты."
         );
       }
+      break; // LEGACY_OK — пароль верный, идём мигрировать
+    }
+    if (!decided) {
+      this.logger.warn("auth", "legacy-проверка: образцов legacy не найдено (все v2/пустые)");
     }
 
     // ── Миграция пофайлово, атомарно, с прогрессом ────────────────────────
@@ -914,8 +928,10 @@ export default class ShadowVaultPlugin extends Plugin {
   }
 
   /**
-   * Гарантирует наличие v2 verificationBlob в настройках (для legacy-хранилищ,
-   * у которых его не было). Шифрует маркер текущим v2-движком.
+   * Гарантирует наличие v2 verificationBlob в настройках. Шифрует маркер
+   * текущим v2-движком. Вызывается ПОСЛЕ того, как ключ уже доказанно верен
+   * (успешная legacy-миграция). Для случая «v2-хранилище без блоба» использовать
+   * recoverVerificationBlobDesktop (там пароль ещё надо проверить).
    */
   private async ensureVerificationBlobDesktop(): Promise<void> {
     if (this.settings.verificationBlob || !this.shadowManager) return;
@@ -925,10 +941,43 @@ export default class ShadowVaultPlugin extends Plugin {
       this.settings.verificationBlob = Buffer.from(blob).toString("hex");
       this.settings.formatVersion = FORMAT_VERSION;
       await this.saveSettings();
-      console.info("[ShadowVault] Создан v2 verificationBlob для legacy-хранилища.");
+      console.info("[ShadowVault] Создан v2 verificationBlob.");
     } catch (err) {
       console.error("[ShadowVault] Не удалось создать verificationBlob:", err);
     }
+  }
+
+  /**
+   * Самовосстановление verificationBlob для v2-хранилища без блоба (desktop).
+   *
+   * Сценарий: data.json потерян/повреждён (verificationBlob=null), но .enc
+   * уже в формате v2. AuthService счёл это «первым запуском» и НЕ проверил
+   * пароль. Здесь мы:
+   *   1. Если блоб уже есть — ничего не делаем (verifyPassword отработал ранее).
+   *   2. Пытаемся расшифровать первый ВАЛИДНЫЙ v2 .enc текущим ключом:
+   *        - успех  → пароль верный → создаём блоб заново и сохраняем;
+   *        - провал → это РЕАЛЬНО неверный пароль → бросаем ошибку, .enc и блоб
+   *                   НЕ трогаем (данные целы);
+   *        - валидных v2-файлов нет (пустое/новое хранилище) → first-run-подобный
+   *          случай: создаём блоб текущим ключом и продолжаем.
+   */
+  private async recoverVerificationBlobDesktop(password: string | null): Promise<void> {
+    if (this.settings.verificationBlob || !this.shadowManager) return;
+
+    const valid = await this.shadowManager.validateV2Password();
+    this.logger.info("auth", "самовосстановление блоба (desktop)", {
+      v2Check: valid === null ? "no-v2-files" : valid ? "ok" : "wrong-password",
+      viaPin: password === null,
+    });
+
+    if (valid === false) {
+      // Реальный v2-файл не расшифровался текущим ключом → неверный пароль.
+      // Ничего не трогаем: .enc целы, блоб не создаём.
+      throw new Error("Неверный пароль для хранилища.");
+    }
+    // valid === true (пароль верен) ИЛИ valid === null (нет v2-файлов, новое
+    // хранилище) → создаём блоб текущим (проверенным/новым) ключом.
+    await this.ensureVerificationBlobDesktop();
   }
 
   /**
@@ -1020,7 +1069,7 @@ export default class ShadowVaultPlugin extends Plugin {
         `❌ Shadow Vault: ошибка при запуске.\n${err instanceof Error ? err.message : String(err)}`,
         10000
       );
-      this.rollbackInitialization(engine);
+      await this.rollbackInitialization(engine);
     }
   }
 
@@ -1040,7 +1089,9 @@ export default class ShadowVaultPlugin extends Plugin {
         this.settings.formatVersion = FORMAT_VERSION;
         await this.saveSettings();
       }
-      await this.ensureVerificationBlobMobile();
+      // Самовосстановление блоба для v2-хранилища без verificationBlob (mobile).
+      // Блоб создаётся ТОЛЬКО после проверки пароля по реальному v2-файлу.
+      await this.recoverVerificationBlobMobile(configDir, password);
       return;
     }
 
@@ -1054,17 +1105,17 @@ export default class ShadowVaultPlugin extends Plugin {
     }
 
     // Проверка пароля через trial-decrypt (хранилище без verificationBlob).
-    const ok = await vsm.probePassword(configDir, password);
-    this.logger.info("auth", "проверка legacy-пароля (mobile)", { success: ok });
-    if (!ok) {
-      if (this.settings.verificationBlob) {
-        this.settings.verificationBlob = null;
-        await this.saveSettings();
-      }
+    const probe = await vsm.probePassword(configDir, password);
+    this.logger.info("auth", "проверка legacy-пароля (mobile)", { status: probe });
+    if (probe === "LEGACY_WRONG_PASSWORD") {
+      // ТОЛЬКО реальный legacy-файл не дешифровался → неверный пароль.
+      // verificationBlob НЕ трогаем.
       throw new Error(
         "Неверный пароль для хранилища старого формата — миграция отменена, файлы не тронуты."
       );
     }
+    // probe === "NOT_LEGACY" (несмотря на hasLegacy: маловероятно, но безопасно)
+    // или "LEGACY_OK" → продолжаем миграцию.
 
     const migNotice = new Notice("🔄 Shadow Vault: миграция хранилища в новый формат...", 0);
     let result;
@@ -1094,6 +1145,32 @@ export default class ShadowVaultPlugin extends Plugin {
       new Notice(`✅ Shadow Vault: миграция завершена (${result.migrated} файлов).`, 4000);
       this.settings.formatVersion = FORMAT_VERSION;
       await this.saveSettings();
+    }
+    await this.ensureVerificationBlobMobile();
+  }
+
+  /**
+   * Самовосстановление verificationBlob для v2-хранилища без блоба (mobile).
+   * Зеркалит recoverVerificationBlobDesktop: проверяет пароль по реальному v2
+   * .enc через VirtualShadowManager.validateV2Password, и только при успехе
+   * (или отсутствии v2-файлов) создаёт блоб.
+   */
+  private async recoverVerificationBlobMobile(
+    configDir: string,
+    password: string | null
+  ): Promise<void> {
+    if (this.settings.verificationBlob) return;
+    const vsm = this.virtualShadowManager;
+    if (!vsm) return;
+
+    const valid = await vsm.validateV2Password(configDir);
+    this.logger.info("auth", "самовосстановление блоба (mobile)", {
+      v2Check: valid === null ? "no-v2-files" : valid ? "ok" : "wrong-password",
+      viaPin: password === null,
+    });
+
+    if (valid === false) {
+      throw new Error("Неверный пароль для хранилища.");
     }
     await this.ensureVerificationBlobMobile();
   }
@@ -1291,9 +1368,27 @@ export default class ShadowVaultPlugin extends Plugin {
 
   // setupQueue() удалён: bulk decrypt в setupShadow покрывает весь vault единоразово.
 
-  /** Освобождает частично созданное состояние при ошибке инициализации. */
-  private rollbackInitialization(engine: CryptoEngine | WebCryptoEngine): void {
+  /**
+   * Освобождает частично созданное состояние при ошибке инициализации.
+   *
+   * sessionActive здесь остаётся false, поэтому onunload/syncCleanup НЕ
+   * подчистят теневой каталог и session.lock — делаем это ЯВНО тут, иначе
+   * после ошибки init на диске остаётся осиротевший .shadow-vault-<hash> и
+   * session.lock (при следующем входе ложно сработает crash-recovery).
+   *
+   * Безопасность: на этапе init в shadow ещё НЕТ несохранённых пользовательских
+   * правок (mount/события не подключены или сессия не стартовала), поэтому
+   * удаление пустого/только-что-расшифрованного shadow данные не теряет.
+   * Чужой непустой shadow с реальными изменениями не трогаем.
+   */
+  private async rollbackInitialization(
+    engine: CryptoEngine | WebCryptoEngine
+  ): Promise<void> {
     engine.destroy();
+
+    // Захватываем путь shadow ДО обнуления менеджера (desktop).
+    const shadowRoot = this.isDesktop ? this.shadowManager?.shadowRoot ?? null : null;
+
     if (this.shadowManager) {
       const adapter = this.app.vault.adapter as unknown as IDataAdapter;
       this.shadowManager.unpatch(adapter);
@@ -1301,6 +1396,36 @@ export default class ShadowVaultPlugin extends Plugin {
       this.shadowManager = null;
     }
     this.sessionManager = null;
+
+    // Desktop: удаляем осиротевший shadow + session.lock (лениво через node-fs).
+    if (this.isDesktop) {
+      try {
+        await this.cleanupOrphanShadow(shadowRoot);
+      } catch (err) {
+        console.error("[ShadowVault] rollback cleanup:", err);
+      }
+    }
+  }
+
+  /**
+   * Удаляет свежесозданный теневой каталог и session.lock после неудачной
+   * инициализации (desktop-only, node лениво). Не вызывается на mobile.
+   */
+  private async cleanupOrphanShadow(shadowRoot: string | null): Promise<void> {
+    const fs = nfs();
+    // session.lock в папке плагина — удаляем безусловно (его пишет startSession).
+    const basePath = this.getVaultBasePath();
+    if (basePath) {
+      const lock = npath().join(this.getPluginDirAbs(basePath), "session.lock");
+      try { fs.rmSync(lock, { force: true }); } catch { /* нет — ок */ }
+    }
+    if (!shadowRoot) return;
+    try {
+      fs.rmSync(shadowRoot, { recursive: true, force: true });
+      console.info("[ShadowVault] rollback: удалён осиротевший shadow:", shadowRoot);
+    } catch (err) {
+      console.error("[ShadowVault] rollback: не удалось удалить shadow:", err);
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════

@@ -1264,3 +1264,126 @@ describe("ShadowVaultManager — reEncryptAll (смена ключа)", () => {
     } finally { env.cleanup(); }
   });
 });
+
+// ─────────────────────────────────────────────
+// Регресс: каскад детекта legacy / самовосстановление блоба / пустые .enc
+// ─────────────────────────────────────────────
+
+import * as nodeCrypto from "crypto";
+import {
+  LEGACY_SALT_DOMAIN,
+  LEGACY_PBKDF2_ITERATIONS_NODE,
+} from "../src/crypto/constants";
+import { detectFormat } from "../src/crypto/format";
+
+/** Пишет 0-байтный .enc (старый артефакт пустого файла) в originalRoot. */
+async function writeEmptyEnc(env: TestEnv, relPath: string): Promise<void> {
+  const encPath = nodePath.join(env.origRoot, ...relPath.split("/")) + ".enc";
+  await fsp.mkdir(nodePath.dirname(encPath), { recursive: true });
+  await fsp.writeFile(encPath, Buffer.alloc(0));
+}
+
+/** Пишет настоящий legacy-node .enc ([IV][tag][ct], 310000 итераций). */
+async function writeLegacyEnc(env: TestEnv, relPath: string): Promise<void> {
+  const key = nodeCrypto.pbkdf2Sync(
+    "test-password",
+    Buffer.from(LEGACY_SALT_DOMAIN, "utf8"),
+    LEGACY_PBKDF2_ITERATIONS_NODE,
+    32,
+    "sha512"
+  );
+  const iv = nodeCrypto.randomBytes(12);
+  const cipher = nodeCrypto.createCipheriv("aes-256-gcm", key, iv);
+  const enc = Buffer.concat([cipher.update(Buffer.from("legacy data")), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  const buf = Buffer.concat([iv, tag, enc]); // legacy-node layout
+  const encPath = nodePath.join(env.origRoot, ...relPath.split("/")) + ".enc";
+  await fsp.mkdir(nodePath.dirname(encPath), { recursive: true });
+  await fsp.writeFile(encPath, buf);
+}
+
+describe("hasLegacyFiles — позитивный детект legacy (не !== v2)", () => {
+  it("v2-файлы + один пустой (0 байт) .enc → НЕ legacy (false)", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "a.md", "v2 content");
+      await writeEmptyEnc(env, "empty.md");
+      expect(await env.manager.hasLegacyFiles()).toBe(false);
+    } finally { env.cleanup(); }
+  });
+
+  it("только v2-файлы → НЕ legacy", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "a.md", "x");
+      await writeEncrypted(env, "b/c.md", "y");
+      expect(await env.manager.hasLegacyFiles()).toBe(false);
+    } finally { env.cleanup(); }
+  });
+
+  it("настоящий legacy-файл → legacy (true)", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "a.md", "v2");
+      await writeLegacyEnc(env, "old.md");
+      expect(await env.manager.hasLegacyFiles()).toBe(true);
+    } finally { env.cleanup(); }
+  });
+});
+
+describe("validateV2Password — самовосстановление блоба при v2 + blob=null", () => {
+  it("верный пароль (тот же движок) → true", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "a.md", "secret");
+      await writeEmptyEnc(env, "empty.md"); // пустые игнорируются
+      expect(await env.manager.validateV2Password()).toBe(true);
+    } finally { env.cleanup(); }
+  });
+
+  it("неверный пароль (другой движок) → false, файлы целы", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "a.md", "secret");
+      const before = await fsp.readFile(nodePath.join(env.origRoot, "a.md.enc"));
+
+      // Менеджер с НЕВЕРНЫМ ключом над теми же .enc.
+      const wrongEngine = new CryptoEngine();
+      await wrongEngine.deriveKey("test@test.local", "WRONG-password");
+      const wrongMgr = new ShadowVaultManager(wrongEngine, env.origRoot, env.shadowRoot + "-w");
+      await wrongMgr.initialize();
+
+      expect(await wrongMgr.validateV2Password()).toBe(false);
+      // .enc не тронут
+      const after = await fsp.readFile(nodePath.join(env.origRoot, "a.md.enc"));
+      expect(after.equals(before)).toBe(true);
+      wrongEngine.destroy();
+    } finally { env.cleanup(); }
+  });
+
+  it("нет валидных v2-файлов (только пустые) → null", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEmptyEnc(env, "empty.md");
+      expect(await env.manager.validateV2Password()).toBeNull();
+    } finally { env.cleanup(); }
+  });
+});
+
+describe("Пустой plaintext → валидный v2-контейнер (не 0 байт)", () => {
+  it("encryptOne для пустого файла даёт v2-контейнер, round-trip в пустоту", async () => {
+    const env = await makeEnv();
+    try {
+      const shadowAbs = env.manager.shadowAbs("empty.md");
+      await fsp.mkdir(nodePath.dirname(shadowAbs), { recursive: true });
+      await fsp.writeFile(shadowAbs, Buffer.alloc(0));
+      await env.manager.encryptOne("empty.md");
+
+      const encBuf = await fsp.readFile(nodePath.join(env.origRoot, "empty.md.enc"));
+      expect(encBuf.length).toBeGreaterThan(0);
+      expect(detectFormat(new Uint8Array(encBuf))).toBe("v2");
+      const back = env.engine.decryptBuffer(encBuf);
+      expect(back.length).toBe(0);
+    } finally { env.cleanup(); }
+  });
+});
