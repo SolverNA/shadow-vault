@@ -5,7 +5,6 @@
  */
 
 import { Vault, normalizePath } from "obsidian";
-import { nfsp, npath } from "./node-fs";
 
 export interface PlatformAdapter {
   readBinary(path: string): Promise<ArrayBuffer>;
@@ -15,95 +14,6 @@ export interface PlatformAdapter {
   list(path: string): Promise<{ files: string[]; folders: string[] }>;
   mkdir(path: string): Promise<void>;
   stat(path: string): Promise<{ size: number; mtime: number } | null>;
-}
-
-/**
- * Десктопная реализация через Node.js fs
- */
-export class DesktopAdapter implements PlatformAdapter {
-  constructor(private basePath: string) {}
-
-  async readBinary(path: string): Promise<ArrayBuffer> {
-    const fullPath = npath().join(this.basePath, path);
-    const buf = await nfsp().readFile(fullPath);
-    return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
-  }
-
-  async writeBinary(path: string, data: ArrayBuffer): Promise<void> {
-    const nodePath = npath();
-    const fsp = nfsp();
-    const fullPath = nodePath.join(this.basePath, path);
-    await fsp.mkdir(nodePath.dirname(fullPath), { recursive: true });
-    await fsp.writeFile(fullPath, Buffer.from(data));
-  }
-
-  async exists(path: string): Promise<boolean> {
-    const fullPath = npath().join(this.basePath, path);
-    try {
-      await nfsp().access(fullPath);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  async remove(path: string): Promise<void> {
-    const fsp = nfsp();
-    const fullPath = npath().join(this.basePath, path);
-    try {
-      const stat = await fsp.stat(fullPath);
-      if (stat.isDirectory()) {
-        await fsp.rm(fullPath, { recursive: true, force: true });
-      } else {
-        await fsp.unlink(fullPath);
-      }
-    } catch (err: any) {
-      if (err.code !== "ENOENT") throw err;
-    }
-  }
-
-  async list(path: string): Promise<{ files: string[]; folders: string[] }> {
-    const nodePath = npath();
-    const fullPath = nodePath.join(this.basePath, path);
-    try {
-      const entries = await nfsp().readdir(fullPath, { withFileTypes: true });
-      const files: string[] = [];
-      const folders: string[] = [];
-
-      for (const entry of entries) {
-        const relativePath = nodePath.join(path, entry.name);
-        if (entry.isDirectory()) {
-          folders.push(relativePath);
-        } else {
-          files.push(relativePath);
-        }
-      }
-
-      return { files, folders };
-    } catch (err: any) {
-      if (err.code === "ENOENT") return { files: [], folders: [] };
-      throw err;
-    }
-  }
-
-  async mkdir(path: string): Promise<void> {
-    const fullPath = npath().join(this.basePath, path);
-    await nfsp().mkdir(fullPath, { recursive: true });
-  }
-
-  async stat(path: string): Promise<{ size: number; mtime: number } | null> {
-    const fullPath = npath().join(this.basePath, path);
-    try {
-      const stat = await nfsp().stat(fullPath);
-      return {
-        size: stat.size,
-        mtime: stat.mtimeMs,
-      };
-    } catch (err: any) {
-      if (err.code === "ENOENT") return null;
-      throw err;
-    }
-  }
 }
 
 /**

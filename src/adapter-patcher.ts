@@ -220,11 +220,4 @@ export class AdapterPatcher {
 
     return false;
   }
-
-  /**
-   * Проверяет, запатчен ли адаптер
-   */
-  isPatched(): boolean {
-    return this.patched;
-  }
 }

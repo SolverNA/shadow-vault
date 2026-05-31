@@ -1139,20 +1139,6 @@ export class ShadowVaultManager {
     }
   }
 
-  /**
-   * Возвращает первый .enc файл хранилища (для probe пароля при отсутствии
-   * verificationBlob). null если хранилище пустое.
-   */
-  async firstEncBuffer(): Promise<Uint8Array | null> {
-    const encFiles = await this.scanEncryptedFiles();
-    if (encFiles.length === 0) return null;
-    try {
-      return new Uint8Array(await fsp.readFile(this.originalEncAbs(encFiles[0])));
-    } catch {
-      return null;
-    }
-  }
-
   /** Читает .enc целиком по normalizedPath (для probe/диагностики). */
   async readEncFull(normalizedPath: string): Promise<Buffer> {
     return fsp.readFile(this.originalEncAbs(normalizedPath));

@@ -91,8 +91,6 @@ export async function migrateBuffer(
  *   - LEGACY_OK           — образец legacy и расшифровался данным паролем;
  *   - LEGACY_WRONG_PASSWORD — образец legacy, но legacy-decrypt упал (неверный пароль).
  */
-export type ProbeStatus = "NOT_LEGACY" | "LEGACY_OK" | "LEGACY_WRONG_PASSWORD";
-
 export type ProbeResult =
   | { status: "NOT_LEGACY" }
   | { status: "LEGACY_OK"; variant: LegacyVariant }

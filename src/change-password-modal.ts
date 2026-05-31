@@ -181,6 +181,3 @@ export class ChangeCredentialsModal extends Modal {
     this.errorEl.addClass("sv-hidden");
   }
 }
-
-/** @deprecated старое имя — оставлено для совместимости. */
-export const ChangePasswordModal = ChangeCredentialsModal;

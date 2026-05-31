@@ -181,31 +181,6 @@ export class VirtualShadowManager {
     this.cache.clear();
   }
 
-  /**
-   * Получает размер кэша в байтах
-   */
-  getCacheSize(): number {
-    let size = 0;
-    for (const buffer of this.cache.values()) {
-      size += buffer.byteLength;
-    }
-    return size;
-  }
-
-  /**
-   * Получает количество файлов в кэше
-   */
-  getCacheCount(): number {
-    return this.cache.size;
-  }
-
-  /**
-   * Проверяет, есть ли файл в кэше
-   */
-  isInCache(normalizedPath: string): boolean {
-    return this.cache.has(normalizedPath);
-  }
-
   // ═══════════════════════════════════════════════════════════════════════
   // ФАЗА 4: миграция legacy → v2 (mobile, последовательно через Vault API)
   // ═══════════════════════════════════════════════════════════════════════
