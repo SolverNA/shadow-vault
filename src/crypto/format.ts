@@ -192,6 +192,42 @@ export function detectFormat(buf: Uint8Array): EncryptedFormat {
   return "unknown";
 }
 
+/**
+ * Оценивает размер plaintext по полному буферу .enc БЕЗ расшифровки.
+ *   - v2 (0x02): plaintext = длина − (HEADER+IV+tag) = длина − 33.
+ *   - v2-chunked (0x03): Σ(segLen − IV − tag) по префиксам длин сегментов.
+ *   - 0 байт (legacy-артефакт пустого файла): 0.
+ *   - legacy/unknown: точного overhead нет — возвращаем длину буфера как есть
+ *     (без грубого искажения).
+ * Используется в stat() на mobile и desktop для согласованного размера.
+ */
+export function plaintextSizeFromContainer(buf: Uint8Array): number {
+  if (buf.length === 0) return 0;
+  const fmt = detectFormat(buf);
+
+  if (fmt === "v2") {
+    const overhead = HEADER_LENGTH + IV_LENGTH + GCM_TAG_LENGTH; // 33
+    return buf.length >= overhead ? buf.length - overhead : buf.length;
+  }
+
+  if (fmt === "v2-chunked") {
+    const segOverhead = IV_LENGTH + GCM_TAG_LENGTH;
+    let off = CHUNKED_HEADER_LENGTH;
+    let plaintext = 0;
+    while (off + SEGMENT_LEN_PREFIX <= buf.length) {
+      const segLen =
+        (buf[off] | (buf[off + 1] << 8) | (buf[off + 2] << 16) | (buf[off + 3] << 24)) >>> 0;
+      if (segLen < segOverhead) break; // битый заголовок — прекращаем
+      plaintext += segLen - segOverhead;
+      off += SEGMENT_LEN_PREFIX + segLen;
+    }
+    return plaintext;
+  }
+
+  // legacy/unknown — не искажаем грубо.
+  return buf.length;
+}
+
 /** Возвращает true, если буфер — цельный контейнер v2 (0x02). */
 export function isV2(buf: Uint8Array): boolean {
   return hasV2Header(buf);

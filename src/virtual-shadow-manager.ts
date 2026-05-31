@@ -5,7 +5,7 @@
 
 import { WebCryptoEngine } from "./web-crypto-engine";
 import { PlatformAdapter } from "./platform-adapter";
-import { detectFormat } from "./crypto/format";
+import { detectFormat, plaintextSizeFromContainer } from "./crypto/format";
 import { migrateBuffer, probeLegacyPassword } from "./crypto/migration";
 import type { LegacyVariant } from "./crypto/legacy";
 
@@ -25,9 +25,10 @@ export class VirtualShadowManager {
    * @returns расшифрованные данные
    */
   async read(normalizedPath: string): Promise<ArrayBuffer> {
-    // 1. Проверяем кэш
+    // 1. Проверяем кэш — возвращаем КОПИЮ, чтобы мутация потребителем не
+    //    портила кэшированный буфер (рассинхрон с .enc).
     if (this.cache.has(normalizedPath)) {
-      return this.cache.get(normalizedPath)!;
+      return this.cache.get(normalizedPath)!.slice(0);
     }
 
     // 2. Читаем .enc из хранилища
@@ -37,10 +38,10 @@ export class VirtualShadowManager {
     // 3. Расшифровываем
     const decrypted = await this.engine.decryptBuffer(encrypted);
 
-    // 4. Кэшируем
+    // 4. Кэшируем (свой экземпляр) и отдаём отдельную КОПИЮ наружу.
     this.cache.set(normalizedPath, decrypted);
 
-    return decrypted;
+    return decrypted.slice(0);
   }
 
   /**
@@ -49,10 +50,11 @@ export class VirtualShadowManager {
    * @param data - данные для записи
    */
   async write(normalizedPath: string, data: ArrayBuffer): Promise<void> {
-    // 1. Сохраняем в кэш
-    this.cache.set(normalizedPath, data);
+    // 1. Сохраняем в кэш КОПИЮ — иначе последующая мутация переданного буфера
+    //    потребителем испортит кэш и приведёт к рассинхрону с .enc.
+    this.cache.set(normalizedPath, data.slice(0));
 
-    // 2. Шифруем
+    // 2. Шифруем (из исходного буфера — он уже зафиксирован)
     const encrypted = await this.engine.encryptBuffer(data);
 
     // 3. Пишем .enc в хранилище
@@ -136,7 +138,24 @@ export class VirtualShadowManager {
    */
   async stat(normalizedPath: string): Promise<{ size: number; mtime: number } | null> {
     const encPath = normalizedPath + ".enc";
-    return await this.adapter.stat(encPath);
+    const s = await this.adapter.stat(encPath);
+    if (!s) return null;
+
+    // Размер plaintext, а не .enc. Если файл в кэше — точный размер из кэша.
+    if (this.cache.has(normalizedPath)) {
+      return { size: this.cache.get(normalizedPath)!.byteLength, mtime: s.mtime };
+    }
+
+    // Иначе оцениваем по содержимому .enc без расшифровки (для chunked — по
+    // префиксам длин сегментов). Mobile-адаптер читает файл целиком, но для
+    // согласованности размера это допустимо (файлы обычно небольшие).
+    try {
+      const buf = new Uint8Array(await this.adapter.readBinary(encPath));
+      return { size: plaintextSizeFromContainer(buf), mtime: s.mtime };
+    } catch {
+      // Не удалось прочитать .enc — отдаём сырой размер (лучше, чем ничего).
+      return { size: s.size, mtime: s.mtime };
+    }
   }
 
   /**
@@ -329,6 +348,12 @@ export class VirtualShadowManager {
       const encPath = encFiles[i];
       const buf = new Uint8Array(await this.adapter.readBinary(encPath));
       if (buf.length === 0) {
+        // Legacy 0-байтный .enc → пустой plaintext. Пере-шифруем в ВАЛИДНЫЙ
+        // v2-контейнер новым ключом (единый контракт пустых файлов), а не
+        // оставляем 0 байт.
+        const reencEmpty = await newEngine.encryptBuffer(new Uint8Array(0));
+        await this.adapter.writeBinary(encPath, reencEmpty);
+        this.cache.delete(encPath.slice(0, -4));
         onProgress?.(i + 1, total);
         continue;
       }

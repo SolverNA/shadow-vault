@@ -144,11 +144,77 @@ describe("VirtualShadowManager (mobile write-through)", () => {
     expect(res.files.sort()).toEqual(["n1.md", "n2.md"]);
   });
 
-  it("stat возвращает размер зашифрованного .enc", async () => {
-    await vsm.write("s.md", bytes("size me"));
+  it("stat возвращает размер plaintext (а не .enc) — из кэша", async () => {
+    const data = bytes("size me"); // 7 байт
+    await vsm.write("s.md", data);
     const st = await vsm.stat("s.md");
     expect(st).not.toBeNull();
-    expect(st!.size).toBe(adapter.files.get("s.md.enc")!.byteLength);
+    // Размер = plaintext (7), а не .enc (33 overhead + 7).
+    expect(st!.size).toBe(data.byteLength);
+    expect(st!.size).not.toBe(adapter.files.get("s.md.enc")!.byteLength);
+  });
+
+  it("stat возвращает размер plaintext при пустом кэше (по содержимому .enc)", async () => {
+    const data = bytes("hello world"); // 11 байт
+    await vsm.write("s2.md", data);
+    // Свежий менеджер — кэша нет, размер считается по .enc без расшифровки.
+    const fresh = new VirtualShadowManager(engine, adapter);
+    const st = await fresh.stat("s2.md");
+    expect(st).not.toBeNull();
+    expect(st!.size).toBe(data.byteLength);
+  });
+
+  // ── H5: защита кэша от мутации по ссылке ───────────────────────────────
+  it("мутация буфера, возвращённого read, НЕ портит кэш/последующие чтения", async () => {
+    await vsm.write("m.md", bytes("original"));
+    const first = new Uint8Array(await vsm.read("m.md"));
+    // Портим возвращённый буфер
+    first.fill(0);
+    // Повторное чтение должно вернуть исходные данные
+    const second = await vsm.read("m.md");
+    expect(text(second)).toBe("original");
+  });
+
+  it("мутация буфера, переданного во write, НЕ портит кэш", async () => {
+    const data = new TextEncoder().encode("payload");
+    await vsm.write("w.md", data.buffer);
+    // Мутируем исходный буфер после записи
+    data.fill(0);
+    const out = await vsm.read("w.md");
+    expect(text(out)).toBe("payload");
+  });
+
+  // ── C2/H7: единый контракт пустых файлов ───────────────────────────────
+  it("пустой plaintext → валидный v2-контейнер (не 0 байт)", async () => {
+    await vsm.write("empty.md", new ArrayBuffer(0));
+    const enc = adapter.files.get("empty.md.enc")!;
+    expect(enc.byteLength).toBeGreaterThan(0);
+    expect(isV2(new Uint8Array(enc))).toBe(true);
+    // round-trip пустого
+    const fresh = new VirtualShadowManager(engine, adapter);
+    expect((await fresh.read("empty.md")).byteLength).toBe(0);
+  });
+
+  it("legacy 0-байтный .enc читается как пустой plaintext (без ошибки)", async () => {
+    // Эмулируем legacy-артефакт: 0-байтный .enc на адаптере
+    adapter.files.set("legacy.md.enc", new ArrayBuffer(0));
+    const fresh = new VirtualShadowManager(engine, adapter);
+    const out = await fresh.read("legacy.md");
+    expect(out.byteLength).toBe(0);
+    // stat тоже не падает и даёт 0
+    const st = await fresh.stat("legacy.md");
+    expect(st!.size).toBe(0);
+  });
+
+  it("reEncryptAll конвертит legacy 0-байтный .enc в валидный v2", async () => {
+    adapter.files.set("z.md.enc", new ArrayBuffer(0));
+    const newEngine = new WebCryptoEngine();
+    await newEngine.deriveKey(STUB_EMAIL, "new password here");
+    await vsm.reEncryptAll(".obsidian", newEngine);
+    const enc = adapter.files.get("z.md.enc")!;
+    expect(enc.byteLength).toBeGreaterThan(0);
+    expect(isV2(new Uint8Array(enc))).toBe(true);
+    expect((await newEngine.decryptBuffer(enc)).byteLength).toBe(0);
   });
 });
 
