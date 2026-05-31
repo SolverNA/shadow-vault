@@ -82,23 +82,44 @@ export async function migrateBuffer(
 }
 
 /**
- * Проверяет, что введённый пароль верен для legacy-хранилища, пробуя
+ * Различимый результат probeLegacyPassword. Раньше функция возвращала ОДИН
+ * `null` на два несовместимых смысла — «уже v2, миграция не нужна» и «legacy,
+ * но пароль неверный». Из-за этой перегрузки вызывающий код (main.ts) ошибочно
+ * трактовал v2-хранилище как «неверный пароль», обнулял verificationBlob и
+ * бросал ошибку. Теперь три явных исхода:
+ *   - NOT_LEGACY          — образец v2/v2-chunked/пустой/битый → миграция не нужна;
+ *   - LEGACY_OK           — образец legacy и расшифровался данным паролем;
+ *   - LEGACY_WRONG_PASSWORD — образец legacy, но legacy-decrypt упал (неверный пароль).
+ */
+export type ProbeStatus = "NOT_LEGACY" | "LEGACY_OK" | "LEGACY_WRONG_PASSWORD";
+
+export type ProbeResult =
+  | { status: "NOT_LEGACY" }
+  | { status: "LEGACY_OK"; variant: LegacyVariant }
+  | { status: "LEGACY_WRONG_PASSWORD" };
+
+/**
+ * Проверяет, что введённый пароль верен для LEGACY-хранилища, пробуя
  * trial-decrypt одного образца .enc. Используется когда verificationBlob
  * отсутствует (старое хранилище без блоба).
  *
- * @returns распознанный legacy-вариант (можно использовать как hint),
- *          либо null если sample пустой/не дешифруется этим паролем.
+ * ВАЖНО: распознаёт legacy ТОЛЬКО позитивно (detectFormat === legacy-node/web).
+ * Форматы "v2", "v2-chunked", а также пустые (0 байт) и слишком короткие
+ * ("unknown") образцы → NOT_LEGACY (это не legacy, проверять нечего).
  */
 export async function probeLegacyPassword(
   sampleEnc: Uint8Array,
   password: string
-): Promise<LegacyVariant | null> {
-  // v2-образец означает, что хранилище уже мигрировано — не legacy.
-  if (detectFormat(sampleEnc) === "v2") return null;
+): Promise<ProbeResult> {
+  const fmt = detectFormat(sampleEnc);
+  // Только реальный legacy-layout считаем legacy. Всё прочее — не legacy.
+  if (fmt !== "legacy-node" && fmt !== "legacy-web") {
+    return { status: "NOT_LEGACY" };
+  }
   try {
     const { variant } = await legacyDecrypt(sampleEnc, password);
-    return variant;
+    return { status: "LEGACY_OK", variant };
   } catch {
-    return null;
+    return { status: "LEGACY_WRONG_PASSWORD" };
   }
 }

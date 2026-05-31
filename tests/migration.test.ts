@@ -170,23 +170,37 @@ describe("migrateBuffer: legacy → v2 с round-trip verify", () => {
   });
 });
 
-describe("probeLegacyPassword", () => {
-  it("верный пароль → возвращает вариант", async () => {
+describe("probeLegacyPassword (три различимых исхода)", () => {
+  it("legacy + верный пароль → LEGACY_OK с вариантом", async () => {
     const buf = makeLegacyWeb(Buffer.from("проба"));
-    const v = await probeLegacyPassword(new Uint8Array(buf), PASSWORD);
-    expect(v).toBe("legacy-web");
+    const res = await probeLegacyPassword(new Uint8Array(buf), PASSWORD);
+    expect(res.status).toBe("LEGACY_OK");
+    if (res.status !== "LEGACY_OK") throw new Error("unreachable");
+    expect(res.variant).toBe("legacy-web");
   });
 
-  it("неверный пароль → null", async () => {
+  it("legacy + неверный пароль → LEGACY_WRONG_PASSWORD", async () => {
     const buf = makeLegacyNode(Buffer.from("проба"));
-    const v = await probeLegacyPassword(new Uint8Array(buf), "nope");
-    expect(v).toBeNull();
+    const res = await probeLegacyPassword(new Uint8Array(buf), "nope");
+    expect(res.status).toBe("LEGACY_WRONG_PASSWORD");
   });
 
-  it("v2-образец → null (уже мигрировано)", async () => {
+  it("v2-образец → NOT_LEGACY (уже мигрировано, миграция не нужна)", async () => {
     const engine = await v2Engine();
     const v2 = engine.encryptBuffer(Buffer.from("x"));
-    const v = await probeLegacyPassword(new Uint8Array(v2), PASSWORD);
-    expect(v).toBeNull();
+    const res = await probeLegacyPassword(new Uint8Array(v2), PASSWORD);
+    expect(res.status).toBe("NOT_LEGACY");
+  });
+
+  it("пустой (0 байт) образец → NOT_LEGACY (не legacy)", async () => {
+    const res = await probeLegacyPassword(new Uint8Array(0), PASSWORD);
+    expect(res.status).toBe("NOT_LEGACY");
+  });
+
+  it("v2-образец с НЕВЕРНЫМ паролем тоже NOT_LEGACY (не путаем с wrong-password)", async () => {
+    const engine = await v2Engine();
+    const v2 = engine.encryptBuffer(Buffer.from("y"));
+    const res = await probeLegacyPassword(new Uint8Array(v2), "totally-wrong");
+    expect(res.status).toBe("NOT_LEGACY");
   });
 });

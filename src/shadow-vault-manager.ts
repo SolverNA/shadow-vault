@@ -394,7 +394,7 @@ export class ShadowVaultManager {
           fs.mkdirSync(nodePath.dirname(encAbs), { recursive: true });
           const enc =
             sStat.size === 0
-              ? Buffer.alloc(0)
+              ? this.engine.encryptBuffer(Buffer.alloc(0)) // валидный v2, не 0 байт
               : this.engine.encryptBuffer(fs.readFileSync(abs));
           const unique = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
           const tmp = `${encAbs}.${unique}.shadowtmp`;
@@ -448,7 +448,10 @@ export class ShadowVaultManager {
     const stat = await fsp.stat(shadowAbs);
 
     if (stat.size === 0) {
-      await atomicWrite(encAbs, Buffer.alloc(0));
+      // Пустой по содержимому файл шифруем в ВАЛИДНЫЙ v2-контейнер (~33 байта:
+      // MAGIC+ver+IV+tag), а НЕ в 0 байт. 0-байтный .enc — артефакт-аномалия,
+      // который ломал детект формата (см. hasLegacyFiles/probe).
+      await atomicWrite(encAbs, this.engine.encryptBuffer(Buffer.alloc(0)));
     } else if (stat.size > 4 * 1024 * 1024) {
       // encryptStream сам пишет в encAbs + ".tmp" + rename, своя атомарность
       await this.engine.encryptStream(shadowAbs, encAbs);
@@ -982,8 +985,8 @@ export class ShadowVaultManager {
         const stat = await fsp.stat(origPath);
 
         if (stat.size === 0) {
-          // Пустой файл: создаём пустой .enc и удаляем оригинал
-          await fsp.writeFile(encPath, Buffer.alloc(0));
+          // Пустой файл: шифруем в валидный v2-контейнер (не 0 байт).
+          await atomicWrite(encPath, this.engine.encryptBuffer(Buffer.alloc(0)));
         } else if (stat.size > 1024 * 1024) {
           // Большой файл: потоковое шифрование
           await this.engine.encryptStream(origPath, encPath);
@@ -1093,7 +1096,17 @@ export class ShadowVaultManager {
     const encFiles = await this.scanEncryptedFiles();
     for (const p of encFiles) {
       const head = await this.readEncHead(this.originalEncAbs(p));
-      if (head && detectFormat(head) !== "v2") return true;
+      if (!head) continue;
+      const fmt = detectFormat(head);
+      // Legacy определяем ТОЛЬКО позитивно. "v2"/"v2-chunked" — новый формат;
+      // "unknown" (пустой 0-байтный или слишком короткий/битый .enc) НЕ legacy
+      // и не должен заставлять плагин запускать миграцию.
+      if (fmt === "legacy-node" || fmt === "legacy-web") return true;
+      if (fmt === "unknown" && head.length > 0) {
+        console.warn(
+          `[ShadowVault] подозрительный .enc (нераспознан, ${head.length}B): ${p}`
+        );
+      }
     }
     return false;
   }
@@ -1128,6 +1141,43 @@ export class ShadowVaultManager {
     } catch {
       return null;
     }
+  }
+
+  /** Читает .enc целиком по normalizedPath (для probe/диагностики). */
+  async readEncFull(normalizedPath: string): Promise<Buffer> {
+    return fsp.readFile(this.originalEncAbs(normalizedPath));
+  }
+
+  /**
+   * Самовосстановление блоба для v2-хранилища без verificationBlob (desktop).
+   * Пытается расшифровать первый ВАЛИДНЫЙ v2/v2-chunked .enc текущим движком
+   * (ключ выведен из email+password). Успех → пароль верный, провал (GCM auth)
+   * → неверный. Пустые (0 байт)/legacy/битые .enc пропускаются.
+   *
+   * @returns true — пароль верный; false — неверный; null — валидных v2 нет
+   *          (пустое/новое хранилище — нечего проверять).
+   */
+  async validateV2Password(): Promise<boolean | null> {
+    const encFiles = await this.scanEncryptedFiles();
+    for (const p of encFiles) {
+      const abs = this.originalEncAbs(p);
+      let buf: Buffer;
+      try {
+        buf = await fsp.readFile(abs);
+      } catch {
+        continue; // нечитаемый — к следующему
+      }
+      const fmt = detectFormat(new Uint8Array(buf));
+      if (fmt !== "v2" && fmt !== "v2-chunked") continue; // пропускаем пустые/legacy/битые
+      try {
+        // Для v2-chunked буферный decryptBuffer тоже валиден (читает заголовок 0x03).
+        this.engine.decryptBuffer(buf);
+        return true; // расшифровалось → пароль верный
+      } catch {
+        return false; // GCM auth fail → неверный пароль
+      }
+    }
+    return null; // валидных v2-файлов нет
   }
 
   /**
@@ -1223,7 +1273,7 @@ export class ShadowVaultManager {
    * Сканирует оригинальное хранилище и возвращает normalizedPath
    * для всех зашифрованных файлов (.enc).
    */
-  private async scanEncryptedFiles(): Promise<string[]> {
+  async scanEncryptedFiles(): Promise<string[]> {
     const result: string[] = [];
     await walkDir(this.originalRoot, (e) => {
       if (e.name.startsWith(".")) return "skip";

@@ -220,7 +220,9 @@ export class VirtualShadowManager {
     for (const p of enc) {
       try {
         const buf = new Uint8Array(await this.adapter.readBinary(p));
-        if (buf.length > 0 && detectFormat(buf) !== "v2") return true;
+        // Legacy — ТОЛЬКО позитивно. v2/v2-chunked и пустые/битые (unknown) — нет.
+        const fmt = detectFormat(buf);
+        if (fmt === "legacy-node" || fmt === "legacy-web") return true;
       } catch {
         // нечитаемый файл — пропускаем
       }
@@ -229,24 +231,60 @@ export class VirtualShadowManager {
   }
 
   /**
-   * Проверяет пароль через trial-decrypt первого legacy .enc (для хранилищ
-   * без verificationBlob). Возвращает true если пароль подошёл хотя бы к одному
-   * legacy-файлу, либо если legacy-файлов нет (нечего проверять).
+   * Проверяет пароль через trial-decrypt первого LEGACY .enc (для хранилищ
+   * без verificationBlob). Возвращает:
+   *   - "LEGACY_OK"             — нашёлся legacy-файл и пароль к нему подошёл;
+   *   - "LEGACY_WRONG_PASSWORD" — нашёлся legacy-файл, но пароль не подошёл;
+   *   - "NOT_LEGACY"            — legacy-файлов нет (всё v2/пусто) → проверять нечего.
+   * Пустые (0 байт) и v2/v2-chunked файлы пропускаются — не legacy.
    */
-  async probePassword(configDir: string, password: string): Promise<boolean> {
+  async probePassword(
+    configDir: string,
+    password: string
+  ): Promise<"NOT_LEGACY" | "LEGACY_OK" | "LEGACY_WRONG_PASSWORD"> {
     const enc = await this.scanEncFiles(configDir);
     for (const p of enc) {
       try {
         const buf = new Uint8Array(await this.adapter.readBinary(p));
-        if (buf.length === 0 || detectFormat(buf) === "v2") continue;
-        const variant = await probeLegacyPassword(buf, password);
-        if (variant) return true;
-        return false; // первый legacy-файл не дешифруется → неверный пароль
+        const fmt = detectFormat(buf);
+        if (fmt !== "legacy-node" && fmt !== "legacy-web") continue;
+        const res = await probeLegacyPassword(buf, password);
+        // probe для legacy-образца вернёт LEGACY_OK или LEGACY_WRONG_PASSWORD.
+        return res.status === "LEGACY_OK" ? "LEGACY_OK" : "LEGACY_WRONG_PASSWORD";
       } catch {
         // продолжаем к следующему
       }
     }
-    return true; // legacy-файлов нет
+    return "NOT_LEGACY"; // legacy-файлов нет
+  }
+
+  /**
+   * Самовосстановление блоба для v2-хранилища без verificationBlob (mobile).
+   * Пытается расшифровать первый ВАЛИДНЫЙ v2/v2-chunked .enc текущим движком
+   * (ключ уже выведен из email+password). Успех → пароль верный. Провал
+   * (GCM auth) → неверный пароль. Если валидных v2-файлов нет — null
+   * (пустое/новое хранилище, проверять нечего).
+   *
+   * @returns true — пароль верный; false — неверный; null — нет v2-файлов.
+   */
+  async validateV2Password(configDir: string): Promise<boolean | null> {
+    const enc = await this.scanEncFiles(configDir);
+    for (const p of enc) {
+      try {
+        const buf = new Uint8Array(await this.adapter.readBinary(p));
+        const fmt = detectFormat(buf);
+        if (fmt !== "v2" && fmt !== "v2-chunked") continue; // пропускаем пустые/legacy/битые
+        try {
+          await this.engine.decryptBuffer(buf);
+          return true; // расшифровалось текущим ключом → пароль верный
+        } catch {
+          return false; // GCM auth fail → неверный пароль
+        }
+      } catch {
+        // нечитаемый файл — к следующему
+      }
+    }
+    return null; // валидных v2-файлов нет
   }
 
   /**
