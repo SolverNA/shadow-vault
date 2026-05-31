@@ -32,6 +32,9 @@
     "testEnvironment": "node",
     "testMatch": [
       "**/tests/**/*.test.ts"
-    ]
+    ],
+    "moduleNameMapper": {
+      "^obsidian$": "<rootDir>/tests/__mocks__/obsidian.ts"
+    }
   }
 }
