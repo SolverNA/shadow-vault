@@ -28,7 +28,8 @@ import * as nodePath from "path";
 import * as crypto from "crypto";
 import * as os from "os";
 import { CryptoEngine } from "./crypto-engine";
-import { detectFormat } from "./crypto/format";
+import { detectFormat, CHUNKED_HEADER_LENGTH, SEGMENT_LEN_PREFIX } from "./crypto/format";
+import { IV_LENGTH, GCM_TAG_LENGTH } from "./crypto/constants";
 import { migrateBuffer } from "./crypto/migration";
 import type { LegacyVariant } from "./crypto/legacy";
 import { IDataAdapter, AdapterStat, DataWriteOptions, ListedFiles } from "./adapter-types";
@@ -752,9 +753,13 @@ export class ShadowVaultManager {
     await fsp.mkdir(nodePath.dirname(encAbsPath), { recursive: true });
 
     // 1. Шифруем shadow → .enc.new
+    // ЕДИНЫЙ КОНТРАКТ ПУСТЫХ ФАЙЛОВ: пустой plaintext ВСЕГДА шифруется в
+    // валидный v2-контейнер (~33 байта), а НЕ в 0 байт. Так детект формата и
+    // все читающие пути работают единообразно.
     const stat = await fsp.stat(shadowAbsPath);
     if (stat.size === 0) {
-      await fsp.writeFile(encNewPath, Buffer.alloc(0));
+      const enc = this.engine.encryptBuffer(Buffer.alloc(0));
+      await fsp.writeFile(encNewPath, enc);
     } else if (stat.size > 4 * 1024 * 1024) {
       await this.engine.encryptStream(shadowAbsPath, encNewPath);
     } else {
@@ -766,9 +771,12 @@ export class ShadowVaultManager {
     // 2. Верификация: decrypt(.enc.new) === shadow?
     try {
       if (stat.size === 0) {
-        const verifyStat = await fsp.stat(encNewPath);
-        if (verifyStat.size !== 0) {
-          throw new Error("Размер .enc.new для пустого файла не равен 0");
+        // .enc.new — валидный v2-контейнер пустого plaintext; проверяем что
+        // он расшифровывается в пустоту.
+        await this.engine.decryptStream(encNewPath, verifyTmpPath);
+        const ok = await filesEqual(shadowAbsPath, verifyTmpPath);
+        if (!ok) {
+          throw new Error("Verify failed: decrypt(.enc.new) != shadow (пустой файл)");
         }
       } else {
         await this.engine.decryptStream(encNewPath, verifyTmpPath);
@@ -1046,7 +1054,9 @@ export class ShadowVaultManager {
         const stat = await fsp.stat(encPath);
 
         if (stat.size === 0) {
-          await fsp.writeFile(newEncPath, Buffer.alloc(0));
+          // Legacy 0-байтный .enc трактуем как пустой plaintext и пере-шифруем
+          // в ВАЛИДНЫЙ v2-контейнер новым ключом (единый контракт пустых файлов).
+          await fsp.writeFile(newEncPath, newEngine.encryptBuffer(Buffer.alloc(0)));
         } else if (stat.size > LARGE) {
           // Потоковый подход для больших файлов чтобы не грузить RAM целиком
           const tmpDec = encPath + ".retmp";
@@ -1363,11 +1373,13 @@ export class ShadowVaultManager {
     await fsp.mkdir(nodePath.dirname(shadowPath),  { recursive: true });
     await fsp.mkdir(nodePath.dirname(origEncPath), { recursive: true });
 
-    // 1. Открытый текст → теневое хранилище
-    await fsp.writeFile(shadowPath, data, "utf8");
-
-    // 2. Зашифровано → оригинальное хранилище (атомарно)
+    // 1. СНАЧАЛА шифруем в память. Если шифрование падает — НЕ трогаем shadow,
+    //    пробрасываем ошибку (Obsidian узнает о неуспехе записи), и .enc/shadow
+    //    остаются в прежнем согласованном состоянии.
     const encrypted = this.engine.encryptBuffer(Buffer.from(data, "utf8"));
+
+    // 2. Только при успешном шифровании пишем И shadow, И .enc (атомарно).
+    await fsp.writeFile(shadowPath, data, "utf8");
     await atomicWrite(origEncPath, encrypted);
   }
 
@@ -1387,16 +1399,17 @@ export class ShadowVaultManager {
     await fsp.mkdir(nodePath.dirname(shadowPath),  { recursive: true });
     await fsp.mkdir(nodePath.dirname(origEncPath), { recursive: true });
 
-    // Открытые байты → теневое хранилище
-    await fsp.writeFile(shadowPath, buf);
-
     // Зашифровано → оригинальное хранилище
     if (buf.length > 1024 * 1024) {
-      // > 1 МБ: потоковое шифрование shadow → origEnc
-      // Временный файл encryptStream будет origEncPath + ".tmp" — отфильтрован из patchedList
+      // > 1 МБ: потоковое шифрование shadow → origEnc (читает из shadow,
+      // поэтому shadow пишем первым). Своя атомарность через .tmp + rename.
+      await fsp.writeFile(shadowPath, buf);
       await this.engine.encryptStream(shadowPath, origEncPath);
     } else {
+      // Малый файл: СНАЧАЛА шифруем в память; при ошибке shadow не трогаем
+      // (как в patchedWrite — без рассинхрона shadow/.enc).
       const encrypted = this.engine.encryptBuffer(buf);
+      await fsp.writeFile(shadowPath, buf);
       await atomicWrite(origEncPath, encrypted);
     }
   }
@@ -1455,6 +1468,65 @@ export class ShadowVaultManager {
     );
   }
 
+  /**
+   * Вычисляет размер plaintext по .enc-файлу БЕЗ полной расшифровки.
+   *   - v2 (0x02): plaintext = размер_файла − CRYPTO_HEADER_SIZE (33).
+   *   - v2-chunked (0x03): читаем только префиксы длин сегментов и суммируем
+   *     plaintext-длины: Σ(segLen − IV − tag). Файл целиком не читаем.
+   *   - 0 байт (legacy-артефакт пустого файла): plaintext = 0.
+   *   - прочее/нераспознанное: грубо не искажаем — отдаём размер файла как есть.
+   * @param encAbs абсолютный путь к .enc
+   * @param fileSize размер .enc из stat (чтобы не делать повторный stat)
+   */
+  private async plaintextSizeOfEnc(encAbs: string, fileSize: number): Promise<number> {
+    if (fileSize === 0) return 0;
+
+    let fh: import("fs/promises").FileHandle;
+    try {
+      fh = await fsp.open(encAbs, "r");
+    } catch {
+      return fileSize;
+    }
+    try {
+      // Читаем заголовок для детекта формата.
+      const head = Buffer.alloc(CHUNKED_HEADER_LENGTH);
+      const { bytesRead } = await fh.read(head, 0, CHUNKED_HEADER_LENGTH, 0);
+      const fmt = detectFormat(head.subarray(0, bytesRead));
+
+      if (fmt === "v2") {
+        // Цельный контейнер: фиксированный overhead 33 байта.
+        return fileSize >= CRYPTO_HEADER_SIZE ? fileSize - CRYPTO_HEADER_SIZE : fileSize;
+      }
+
+      if (fmt === "v2-chunked") {
+        // Суммируем plaintext-длины сегментов по их u32-префиксам, читая
+        // только 4 байта на сегмент (тело файла не читаем).
+        const SEG_OVERHEAD = IV_LENGTH + GCM_TAG_LENGTH; // IV + GCM-tag на сегмент
+        let off = CHUNKED_HEADER_LENGTH;
+        let plaintext = 0;
+        const lenBuf = Buffer.alloc(SEGMENT_LEN_PREFIX);
+        for (;;) {
+          if (off + SEGMENT_LEN_PREFIX > fileSize) break;
+          const r = await fh.read(lenBuf, 0, SEGMENT_LEN_PREFIX, off);
+          if (r.bytesRead < SEGMENT_LEN_PREFIX) break;
+          const segLen =
+            (lenBuf[0] | (lenBuf[1] << 8) | (lenBuf[2] << 16) | (lenBuf[3] << 24)) >>> 0;
+          if (segLen < SEG_OVERHEAD) break; // защита от битого заголовка
+          plaintext += segLen - SEG_OVERHEAD;
+          off += SEGMENT_LEN_PREFIX + segLen;
+        }
+        return plaintext;
+      }
+
+      // legacy/unknown — точного overhead не знаем; не искажаем грубо.
+      return fileSize;
+    } catch {
+      return fileSize;
+    } finally {
+      await fh.close().catch(() => undefined);
+    }
+  }
+
   private async patchedStat(normalizedPath: string): Promise<AdapterStat | null> {
     if (this.isBypassPath(normalizedPath)) {
       return this.originalMethods.stat!(normalizedPath);
@@ -1469,9 +1541,10 @@ export class ShadowVaultManager {
     try {
       const s     = await fsp.stat(statPath);
       const isDir = s.isDirectory();
-      // Вычитаем заголовок шифрования если читаем размер из .enc файла
-      const size = (!isDir && statPath === origEncPath && s.size >= CRYPTO_HEADER_SIZE)
-        ? s.size - CRYPTO_HEADER_SIZE
+      // Размер plaintext: для shadow — как есть; для .enc — компенсируем overhead
+      // с учётом формата (v2 / v2-chunked), без грубого искажения для chunked.
+      const size = (!isDir && statPath === origEncPath)
+        ? await this.plaintextSizeOfEnc(origEncPath, s.size)
         : s.size;
 
       return {

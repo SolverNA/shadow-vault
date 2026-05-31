@@ -313,6 +313,33 @@ describe("ShadowVaultManager — write()", () => {
       expect(fs.existsSync(tmpPath)).toBe(false);
     } finally { env.cleanup(); }
   });
+
+  it("H1: ошибка шифрования при write НЕ перезаписывает shadow и пробрасывается", async () => {
+    const env = await makeEnv();
+    try {
+      // Первичная успешная запись
+      await env.adapter.write("guard.md", "GOOD");
+      const shadowPath = nodePath.join(env.shadowRoot, "guard.md");
+      expect(await fsp.readFile(shadowPath, "utf8")).toBe("GOOD");
+
+      // Ломаем шифрование: encryptBuffer бросит (assertUnlocked)
+      const orig = env.engine.encryptBuffer.bind(env.engine);
+      (env.engine as unknown as { encryptBuffer: () => never }).encryptBuffer = () => {
+        throw new Error("simulated encrypt failure");
+      };
+
+      await expect(env.adapter.write("guard.md", "BAD")).rejects.toThrow(
+        "simulated encrypt failure"
+      );
+
+      // shadow НЕ перезаписан новыми данными
+      expect(await fsp.readFile(shadowPath, "utf8")).toBe("GOOD");
+      // .enc тоже остался старым
+      const enc = await fsp.readFile(nodePath.join(env.origRoot, "guard.md.enc"));
+      (env.engine as unknown as { encryptBuffer: typeof orig }).encryptBuffer = orig;
+      expect(env.engine.decryptBuffer(enc).toString("utf8")).toBe("GOOD");
+    } finally { env.cleanup(); }
+  });
 });
 
 // ─────────────────────────────────────────────
@@ -401,6 +428,23 @@ describe("ShadowVaultManager — exists() и stat()", () => {
       const stat = await env.adapter.stat("sized.md");
       // Размер должен быть 5 (без 33 байт служебных данных контейнера v2)
       expect(stat!.size).toBe(5);
+    } finally { env.cleanup(); }
+  });
+
+  it("stat() для chunked .enc даёт корректный размер plaintext (не искажён)", async () => {
+    const env = await makeEnv();
+    try {
+      // Создаём plaintext > 4 МБ → encryptStream пишет chunked (0x03)
+      const plainSize = 5 * 1024 * 1024 + 123;
+      const srcPlain = nodePath.join(env.origRoot, "big.src");
+      await fsp.writeFile(srcPlain, Buffer.alloc(plainSize, 0x61));
+      const encPath = nodePath.join(env.origRoot, "big.md.enc");
+      await env.engine.encryptStream(srcPlain, encPath);
+      await fsp.unlink(srcPlain);
+
+      const stat = await env.adapter.stat("big.md");
+      // Точный размер plaintext (а не грубо .enc − 33)
+      expect(stat!.size).toBe(plainSize);
     } finally { env.cleanup(); }
   });
 });
