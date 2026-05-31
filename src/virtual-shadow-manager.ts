@@ -8,15 +8,19 @@ import { PlatformAdapter } from "./platform-adapter";
 import { detectFormat, plaintextSizeFromContainer } from "./crypto/format";
 import { migrateBuffer, probeLegacyPassword } from "./crypto/migration";
 import type { LegacyVariant } from "./crypto/legacy";
+import type { Logger } from "./logger";
 
 export class VirtualShadowManager {
   private cache: Map<string, ArrayBuffer> = new Map();
   private engine: WebCryptoEngine;
   private adapter: PlatformAdapter;
+  /** Опциональный структурный логгер (DI из main); тесты передают undefined. */
+  private logger?: Logger;
 
-  constructor(engine: WebCryptoEngine, adapter: PlatformAdapter) {
+  constructor(engine: WebCryptoEngine, adapter: PlatformAdapter, logger?: Logger) {
     this.engine = engine;
     this.adapter = adapter;
+    this.logger = logger;
   }
 
   /**
@@ -388,7 +392,10 @@ export class VirtualShadowManager {
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[VirtualShadow] Миграция "${encPath}" не удалась:`, err);
+        this.logger?.error("vshadow", `миграция файла не удалась: ${encPath}`, {
+          path: encPath,
+          error: msg,
+        });
         failed.push({ path: encPath, error: msg });
       }
       done++;

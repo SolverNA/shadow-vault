@@ -127,8 +127,6 @@ export default class ShadowVaultPlugin extends Plugin {
       pluginVersion: this.manifest.version,
     });
 
-    console.info(`[ShadowVault] Platform: desktop=${this.isDesktop}, mobile=${isMobile}`);
-
     // Вкладка настроек появляется всегда, в т.ч. в спящем режиме
     this.addSettingTab(new ShadowVaultSettingTab(this.app, this));
 
@@ -136,7 +134,6 @@ export default class ShadowVaultPlugin extends Plugin {
     // в работу Obsidian — файлы в оригинале plaintext, теневое не монтируем.
     if (this.settings.encryptionDisabled) {
       this.logger.info("main", "encryption disabled — спящий режим");
-      console.info("[ShadowVault] encryption disabled — спящий режим");
       return;
     }
 
@@ -162,7 +159,6 @@ export default class ShadowVaultPlugin extends Plugin {
     });
 
     this.logger.debug("main", "onload: завершён, ожидаем пароль");
-    console.debug("[ShadowVault] Плагин загружен, ожидаем пароль.");
   }
 
   onunload(): void {
@@ -686,8 +682,7 @@ export default class ShadowVaultPlugin extends Plugin {
 
     const t0 = Date.now();
     try {
-      this.logger.info("unlock", "onUnlockDesktop: старт", { firstRun: isFirstRun, viaPin: password === null });
-      console.info("[ShadowVault] onUnlockDesktop: старт, basePath =", basePath);
+      this.logger.info("unlock", "onUnlockDesktop: старт", { firstRun: isFirstRun, viaPin: password === null, basePath });
 
       // Ленивая загрузка desktop-only модулей. Их top-level node-импорты
       // выполнятся только здесь (Node runtime гарантирован), на mobile этот
@@ -702,7 +697,8 @@ export default class ShadowVaultPlugin extends Plugin {
         engine,
         basePath,
         undefined,
-        this.app.vault.configDir
+        this.app.vault.configDir,
+        this.logger
       );
       await this.shadowManager.initialize();
 
@@ -718,7 +714,7 @@ export default class ShadowVaultPlugin extends Plugin {
       // в .enc. Это ДО reset/decrypt — иначе мы потеряли бы недосохранённые
       // изменения с прошлой сессии.
       this.sessionManager = new SessionManager(
-        engine, basePath, this.shadowManager.shadowRoot, this.getPluginDirAbs(basePath)
+        engine, basePath, this.shadowManager.shadowRoot, this.getPluginDirAbs(basePath), this.logger
       );
       const sessionResult = await this.sessionManager.startSession();
       this.logger.info("recovery", "startSession", { hadCrash: sessionResult.hadCrash });
@@ -818,12 +814,12 @@ export default class ShadowVaultPlugin extends Plugin {
         new Notice("🔓 Shadow Vault: хранилище разблокировано.", 2500);
       }
 
-      this.logger.info("unlock", "desktop-сессия запущена", { ms: Date.now() - t0 });
-      console.info(
-        `[ShadowVault] Сессия запущена. shadowRoot=${this.shadowManager.shadowRoot}, originalRoot=${basePath}`
-      );
+      this.logger.info("unlock", "desktop-сессия запущена", {
+        ms: Date.now() - t0,
+        shadowRoot: this.shadowManager.shadowRoot,
+        originalRoot: basePath,
+      });
     } catch (err) {
-      console.error("[ShadowVault] Ошибка инициализации:", err);
       await this.reportError("unlock.desktop", err, { firstRun: isFirstRun, ms: Date.now() - t0 });
       new Notice(
         `❌ Shadow Vault: ошибка при запуске.\n${err instanceof Error ? err.message : String(err)}`,
@@ -1013,7 +1009,6 @@ export default class ShadowVaultPlugin extends Plugin {
     const t0 = Date.now();
     try {
       this.logger.info("unlock", "onUnlockMobile: старт", { firstRun: isFirstRun, viaPin: !!creds.rawKey });
-      console.info("[ShadowVault] onUnlockMobile: старт");
 
       // ── Phase 1: создаём Web Crypto engine ────────────────────────────
       const webEngine = new WebCryptoEngine();
@@ -1035,7 +1030,8 @@ export default class ShadowVaultPlugin extends Plugin {
       // ── Phase 3: создаём virtual shadow manager ───────────────────────
       this.virtualShadowManager = new VirtualShadowManager(
         webEngine,
-        this.platformAdapter
+        this.platformAdapter,
+        this.logger
       );
 
       // ── Phase 3.5: миграция legacy → v2 (ФАЗА 4) ──────────────────────
@@ -1084,9 +1080,7 @@ export default class ShadowVaultPlugin extends Plugin {
       }
 
       this.logger.info("unlock", "mobile-сессия запущена", { ms: Date.now() - t0 });
-      console.info("[ShadowVault] Мобильная сессия запущена");
     } catch (err) {
-      console.error("[ShadowVault] Ошибка мобильной инициализации:", err);
       await this.reportError("unlock.mobile", err, { firstRun: isFirstRun, ms: Date.now() - t0 });
       new Notice(
         `❌ Shadow Vault: ошибка при запуске.\n${err instanceof Error ? err.message : String(err)}`,

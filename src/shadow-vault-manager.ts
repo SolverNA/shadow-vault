@@ -47,6 +47,7 @@ import {
   removeSymlink,
   walkDir,
 } from "./fs-utils";
+import type { Logger } from "./logger";
 
 /**
  * Параллелизм bulk-операций.
@@ -78,10 +79,14 @@ export class ShadowVaultManager {
   /** true пока shadow примонтирован как basePath адаптера */
   private mounted = false;
 
-  constructor(engine: CryptoEngine, originalRoot: string, shadowRoot?: string, configDir = ".obsidian") {
+  /** Опциональный структурный логгер (DI из main); тесты передают undefined. */
+  private readonly logger?: Logger;
+
+  constructor(engine: CryptoEngine, originalRoot: string, shadowRoot?: string, configDir = ".obsidian", logger?: Logger) {
     this.engine = engine;
     this.originalRoot = nodePath.normalize(originalRoot);
     this.configDir = configDir;
+    this.logger = logger;
 
     if (shadowRoot) {
       this.shadowRoot = nodePath.normalize(shadowRoot);
@@ -124,7 +129,7 @@ export class ShadowVaultManager {
    */
   mount(adapter: IDataAdapter): void {
     if (this.mounted) {
-      console.warn("[ShadowVault] mount: уже примонтирован, пропускаем");
+      this.logger?.warn("shadow", "mount: уже примонтирован, пропускаем");
       return;
     }
 
@@ -134,9 +139,10 @@ export class ShadowVaultManager {
     this.originalGetBasePath = adapter.getBasePath.bind(adapter);
     this.originalGetResourcePath = adapter.getResourcePath.bind(adapter);
 
-    console.info(
-      `[ShadowVault] mount: basePath ${this.originalBasePath} → ${this.shadowRoot}`
-    );
+    this.logger?.info("shadow", "mount", {
+      from: this.originalBasePath,
+      to: this.shadowRoot,
+    });
 
     // Подменяем basePath на shadow — все нативные fs-операции внутри адаптера
     // (которые используют this.basePath) будут работать с shadow.
@@ -163,9 +169,10 @@ export class ShadowVaultManager {
     if (!this.mounted) return;
 
     const adapterAny = adapter as unknown as { basePath?: string };
-    console.info(
-      `[ShadowVault] unmount: basePath ${this.shadowRoot} → ${this.originalBasePath}`
-    );
+    this.logger?.info("shadow", "unmount", {
+      from: this.shadowRoot,
+      to: this.originalBasePath,
+    });
 
     if (this.originalBasePath !== null) {
       adapterAny.basePath = this.originalBasePath;
@@ -220,7 +227,7 @@ export class ShadowVaultManager {
    * расшифровать с нуля — это гарантирует чистое состояние без stale-файлов.
    */
   async resetShadow(): Promise<void> {
-    console.info(`[ShadowVault] resetShadow: rm ${this.shadowRoot}`);
+    this.logger?.info("shadow", "resetShadow: rm", { path: this.shadowRoot });
     await fsp.rm(this.shadowRoot, { recursive: true, force: true });
     await fsp.mkdir(this.shadowRoot, { recursive: true });
   }
@@ -280,10 +287,10 @@ export class ShadowVaultManager {
       if (inflight.length === 0) return;
       await Promise.allSettled(inflight);
     }
-    console.warn(
-      `[ShadowVault] drainPending: лимит проходов исчерпан, осталось ` +
-      `${this.pendingWrites.size} pending / ${this.encryptLocks.size} locks`
-    );
+    this.logger?.warn("shadow", "drainPending: лимит проходов исчерпан", {
+      pending: this.pendingWrites.size,
+      locks: this.encryptLocks.size,
+    });
   }
 
   /**
@@ -404,7 +411,10 @@ export class ShadowVaultManager {
           fs.renameSync(tmp, encAbs);
           encrypted++;
         } catch (err) {
-          console.error(`[ShadowVault] sync encrypt-back "${rel}":`, err);
+          this.logger?.error("shadow", "sync encrypt-back не удался", {
+            path: rel,
+            error: err instanceof Error ? err.message : String(err),
+          });
           failed.push(rel);
         }
       }
@@ -442,7 +452,7 @@ export class ShadowVaultManager {
     const encAbs = this.originalEncAbs(normalizedPath);
 
     if (!(await fileExists(shadowAbs))) {
-      console.warn(`[ShadowVault:encryptOne] ${normalizedPath}: нет файла в shadow, пропускаем`);
+      this.logger?.warn("shadow", "encryptOne: нет файла в shadow, пропускаем", { path: normalizedPath });
       return;
     }
 
@@ -463,7 +473,7 @@ export class ShadowVaultManager {
       await atomicWrite(encAbs, enc);
     }
 
-    console.debug(`[ShadowVault:encryptOne] ${normalizedPath} → .enc (${stat.size}B)`);
+    this.logger?.debug("shadow", "encryptOne → .enc", { path: normalizedPath, bytes: stat.size });
   }
 
   /** Удаляет .enc файл в оригинале (вызывается из vault.on("delete")) */
@@ -471,11 +481,14 @@ export class ShadowVaultManager {
     const encAbs = this.originalEncAbs(normalizedPath);
     try {
       await fsp.unlink(encAbs);
-      console.debug(`[ShadowVault:unlinkEnc] ${normalizedPath}`);
+      this.logger?.debug("shadow", "unlinkEnc", { path: normalizedPath });
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code !== "ENOENT") {
-        console.error(`[ShadowVault:unlinkEnc] ${normalizedPath}:`, err);
+        this.logger?.error("shadow", "unlinkEnc не удался", {
+          path: normalizedPath,
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
     }
   }
@@ -489,10 +502,10 @@ export class ShadowVaultManager {
 
     if (await fileExists(oldEnc)) {
       await fsp.rename(oldEnc, newEnc);
-      console.debug(`[ShadowVault:renameEnc] ${oldPath} → ${newPath}`);
+      this.logger?.debug("shadow", "renameEnc", { from: oldPath, to: newPath });
     } else {
       // Старого .enc нет (мог не успеть зашифроваться) — шифруем новый
-      console.warn(`[ShadowVault:renameEnc] oldEnc ${oldEnc} не найден, шифруем новый из shadow`);
+      this.logger?.warn("shadow", "renameEnc: oldEnc не найден, шифруем новый из shadow", { path: oldEnc });
       await this.encryptOne(newPath);
     }
   }
@@ -501,7 +514,7 @@ export class ShadowVaultManager {
   async mkdirOriginal(normalizedPath: string): Promise<void> {
     const orig = this.originalAbs(normalizedPath);
     await fsp.mkdir(orig, { recursive: true });
-    console.debug(`[ShadowVault:mkdirOriginal] ${normalizedPath}`);
+    this.logger?.debug("shadow", "mkdirOriginal", { path: normalizedPath });
   }
 
   /** Удаляет пустую папку в оригинале (зеркалирует rmdir в shadow) */
@@ -509,13 +522,16 @@ export class ShadowVaultManager {
     const orig = this.originalAbs(normalizedPath);
     try {
       await fsp.rmdir(orig);
-      console.debug(`[ShadowVault:rmdirOriginal] ${normalizedPath}`);
+      this.logger?.debug("shadow", "rmdirOriginal", { path: normalizedPath });
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       // ENOTEMPTY → папка не пуста (Obsidian мог удалить только часть детей).
       // ENOENT → уже удалена. Оба — ок.
       if (code !== "ENOENT" && code !== "ENOTEMPTY") {
-        console.error(`[ShadowVault:rmdirOriginal] ${normalizedPath}:`, err);
+        this.logger?.error("shadow", "rmdirOriginal не удался", {
+          path: normalizedPath,
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
     }
   }
@@ -542,20 +558,19 @@ export class ShadowVaultManager {
     // получит ENOENT — папки в shadow нет, хотя в дереве она отображается
     // (vault.fileMap её знает по первичному скану через patchListEarly).
     const folders = await this.replicateFolderStructure();
-    console.info(`[ShadowVault] Зеркало папок: ${folders} директорий из original → shadow`);
+    this.logger?.info("shadow", "зеркало папок original → shadow", { folders });
 
     const encFiles = await this.scanEncryptedFiles();
     const decrypted: string[] = [];
     const failed: Array<{ path: string; error: string }> = [];
     const concurrency = bulkConcurrency();
 
-    console.info(
-      `[ShadowVault] Bulk decrypt: ${encFiles.length} файлов из ${this.originalRoot} → ${this.shadowRoot}, ` +
-      `concurrency=${concurrency}`
-    );
-    if (encFiles.length > 0 && encFiles.length <= 50) {
-      console.debug("[ShadowVault] Файлы для decrypt:", encFiles);
-    }
+    this.logger?.info("shadow", "bulk decrypt", {
+      files: encFiles.length,
+      from: this.originalRoot,
+      to: this.shadowRoot,
+      concurrency,
+    });
 
     let done = 0;
     await parallelMap(
@@ -567,7 +582,10 @@ export class ShadowVaultManager {
           return { ok: true };
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          console.error(`[ShadowVault] decryptAllToShadow: "${normalizedPath}" failed:`, err);
+          this.logger?.error("shadow", "decryptAllToShadow: файл не расшифрован", {
+            path: normalizedPath,
+            error: msg,
+          });
           return { ok: false, error: msg };
         }
       },
@@ -581,7 +599,10 @@ export class ShadowVaultManager {
     );
 
     onProgress?.(encFiles.length, encFiles.length, "");
-    console.debug(`[ShadowVault] Bulk decrypt done: ${decrypted.length} ok, ${failed.length} failed`);
+    this.logger?.debug("shadow", "bulk decrypt завершён", {
+      ok: decrypted.length,
+      failed: failed.length,
+    });
     return { decrypted, failed };
   }
 
@@ -609,7 +630,7 @@ export class ShadowVaultManager {
 
     const shadowFiles = await this.scanShadowFilesForSync();
     const concurrency = bulkConcurrency();
-    console.debug(`[ShadowVault] encrypt-back: ${shadowFiles.length} файлов, concurrency=${concurrency}`);
+    this.logger?.debug("shadow", "encrypt-back", { files: shadowFiles.length, concurrency });
 
     let done = 0;
     await parallelMap(
@@ -623,7 +644,10 @@ export class ShadowVaultManager {
           return "encrypted";
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          console.error(`[ShadowVault] encrypt-back: "${normalizedPath}" failed:`, err);
+          this.logger?.error("shadow", "encrypt-back: файл не зашифрован", {
+            path: normalizedPath,
+            error: msg,
+          });
           return { failed: msg };
         }
       },
@@ -637,7 +661,10 @@ export class ShadowVaultManager {
     );
 
     onProgress?.(shadowFiles.length, shadowFiles.length, "");
-    console.debug(`[ShadowVault] encrypt-back done: ${encrypted.length} encrypted, ${failed.length} failed`);
+    this.logger?.debug("shadow", "encrypt-back завершён", {
+      encrypted: encrypted.length,
+      failed: failed.length,
+    });
     return { encrypted, failed };
   }
 
@@ -670,7 +697,7 @@ export class ShadowVaultManager {
 
     const shadowFiles = await this.scanShadowFilesForSync();
     const total = shadowFiles.length;
-    console.info(`[ShadowVault] export shadow→original: ${total} файлов (фаза 1: экспорт+verify)`);
+    this.logger?.info("shadow", "export shadow→original (фаза 1: экспорт+verify)", { files: total });
 
     // ── ФАЗА 1: экспортируем и верифицируем ВСЕ файлы, .enc не трогаем ──
     for (let i = 0; i < total; i++) {
@@ -694,7 +721,7 @@ export class ShadowVaultManager {
         exported.push(rel);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[ShadowVault] export "${rel}":`, err);
+        this.logger?.error("shadow", "export файла не удался", { path: rel, error: msg });
         failed.push({ path: rel, error: msg });
       }
       onProgress?.(i + 1, total, rel);
@@ -704,15 +731,14 @@ export class ShadowVaultManager {
     // .enc. Возвращаем failed: вызывающий (disableEncryption) откатится с
     // понятной ошибкой, .enc нетронуты, plaintext не потерян.
     if (failed.length > 0) {
-      console.error(
-        `[ShadowVault] export: ${failed.length} файл(ов) не удалось — ` +
-        `.enc НЕ удаляем, шифрование остаётся включённым (идемпотентный повтор безопасен).`
-      );
+      this.logger?.error("shadow", "export: часть файлов не удалась — .enc НЕ удаляем, шифрование остаётся включённым", {
+        failed: failed.length,
+      });
       return { exported, failed };
     }
 
     // ── ФАЗА 2: все экспорты успешны → удаляем .enc батчем в конце ──
-    console.info(`[ShadowVault] export фаза 2: удаление .enc (${exported.length} экспортировано)`);
+    this.logger?.info("shadow", "export фаза 2: удаление .enc", { exported: exported.length });
     const encToRemove = new Set<string>(exported);
     // Добавляем orphan .enc (есть в оригинале, но не было в shadow —
     // например после неудачного decrypt); plaintext для них уже есть/нет,
@@ -727,12 +753,15 @@ export class ShadowVaultManager {
         if (code !== "ENOENT") {
           // Удаление .enc не удалось, но plaintext уже на месте и проверен —
           // данные не потеряны. Логируем; повторный disableEncryption до-удалит.
-          console.error(`[ShadowVault] export: не удалось удалить .enc "${rel}":`, err);
+          this.logger?.error("shadow", "export: не удалось удалить .enc", {
+            path: rel,
+            error: err instanceof Error ? err.message : String(err),
+          });
         }
       }
     }
 
-    console.info(`[ShadowVault] export done: ${exported.length} файлов, ${failed.length} ошибок`);
+    this.logger?.info("shadow", "export завершён", { files: exported.length, errors: failed.length });
     return { exported, failed };
   }
 
@@ -979,7 +1008,7 @@ export class ShadowVaultManager {
     const plainFiles = await this.scanPlaintextFiles();
     let done = 0;
 
-    console.debug(`[ShadowVault] Миграция: обнаружено ${plainFiles.length} незашифрованных файлов.`);
+    this.logger?.debug("shadow", "миграция: обнаружены незашифрованные файлы", { files: plainFiles.length });
 
     for (const normalizedPath of plainFiles) {
       const origPath   = this.originalAbs(normalizedPath);
@@ -1006,14 +1035,17 @@ export class ShadowVaultManager {
         await fsp.unlink(origPath);
         done++;
         onProgress?.(done, plainFiles.length);
-        console.debug(`[ShadowVault] Зашифрован: "${normalizedPath}"`);
+        this.logger?.debug("shadow", "зашифрован", { path: normalizedPath });
       } catch (err) {
-        console.error(`[ShadowVault] Ошибка шифрования "${normalizedPath}":`, err);
+        this.logger?.error("shadow", "ошибка шифрования файла", {
+          path: normalizedPath,
+          error: err instanceof Error ? err.message : String(err),
+        });
         // Продолжаем с остальными файлами
       }
     }
 
-    console.debug(`[ShadowVault] Миграция завершена: ${done}/${plainFiles.length}`);
+    this.logger?.debug("shadow", "миграция завершена", { done, total: plainFiles.length });
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -1038,7 +1070,7 @@ export class ShadowVaultManager {
     const encFiles = await this.scanEncryptedFiles();
     const total = encFiles.length;
 
-    console.debug(`[ShadowVault] Пере-шифровка: ${total} файлов.`);
+    this.logger?.debug("shadow", "пере-шифровка: старт", { files: total });
 
     // ── Фаза 1: создаём .enc.new ──────────────────────────────────────────
     const LARGE = 4 * 1024 * 1024; // 4 МБ
@@ -1087,7 +1119,7 @@ export class ShadowVaultManager {
       onProgress?.(total + i + 1, total * 2);
     }
 
-    console.debug(`[ShadowVault] Пере-шифровка завершена: ${total} файлов.`);
+    this.logger?.debug("shadow", "пере-шифровка завершена", { files: total });
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -1110,9 +1142,10 @@ export class ShadowVaultManager {
       // и не должен заставлять плагин запускать миграцию.
       if (fmt === "legacy-node" || fmt === "legacy-web") return true;
       if (fmt === "unknown" && head.length > 0) {
-        console.warn(
-          `[ShadowVault] подозрительный .enc (нераспознан, ${head.length}B): ${p}`
-        );
+        this.logger?.warn("shadow", "подозрительный .enc (нераспознан)", {
+          path: p,
+          headBytes: head.length,
+        });
       }
     }
     return false;
@@ -1202,7 +1235,7 @@ export class ShadowVaultManager {
     // hint: первый успешный legacy-вариант обычно общий для всего хранилища.
     let hint: LegacyVariant | undefined;
 
-    console.info(`[ShadowVault] Миграция legacy → v2: проверяем ${encFiles.length} файлов.`);
+    this.logger?.info("shadow", "миграция legacy → v2: старт", { files: encFiles.length });
 
     for (const normalizedPath of encFiles) {
       const encPath    = this.originalEncAbs(normalizedPath);
@@ -1222,7 +1255,7 @@ export class ShadowVaultManager {
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[ShadowVault] Миграция "${normalizedPath}" не удалась:`, err);
+        this.logger?.error("shadow", "миграция файла не удалась", { path: normalizedPath, error: msg });
         failed.push({ path: normalizedPath, error: msg });
         // Подчищаем возможный недописанный .new (atomicWrite уже чистит свой tmp,
         // но rename мог не успеть — удаляем .new если остался).
@@ -1232,10 +1265,11 @@ export class ShadowVaultManager {
       onProgress?.(done, encFiles.length, normalizedPath);
     }
 
-    console.info(
-      `[ShadowVault] Миграция legacy → v2 завершена: ${migrated.length} мигрировано, ` +
-      `${skipped} уже v2, ${failed.length} ошибок.`
-    );
+    this.logger?.info("shadow", "миграция legacy → v2 завершена", {
+      migrated: migrated.length,
+      skipped,
+      failed: failed.length,
+    });
     return { migrated, skipped, failed };
   }
 
@@ -1344,14 +1378,14 @@ export class ShadowVaultManager {
     options?: DataWriteOptions
   ): Promise<void> {
     if (this.isBypassPath(normalizedPath)) {
-      console.debug(`[ShadowVault:write] bypass → ${normalizedPath}`);
+      this.logger?.debug("shadow", "write: bypass", { path: normalizedPath });
       return this.originalMethods.write!(normalizedPath, data, options);
     }
 
     const shadowPath  = this.shadowAbs(normalizedPath);
     const origEncPath = this.originalEncAbs(normalizedPath);
 
-    console.debug(`[ShadowVault:write] ${normalizedPath} (${data.length} chars) → shadow + .enc`);
+    this.logger?.debug("shadow", "write → shadow + .enc", { path: normalizedPath, chars: data.length });
 
     await fsp.mkdir(nodePath.dirname(shadowPath),  { recursive: true });
     await fsp.mkdir(nodePath.dirname(origEncPath), { recursive: true });
@@ -1559,10 +1593,10 @@ export class ShadowVaultManager {
 
   private async patchedMkdir(normalizedPath: string): Promise<void> {
     if (this.isBypassPath(normalizedPath)) {
-      console.debug(`[ShadowVault:mkdir] bypass ${normalizedPath}`);
+      this.logger?.debug("shadow", "mkdir: bypass", { path: normalizedPath });
       return this.originalMethods.mkdir!(normalizedPath);
     }
-    console.debug(`[ShadowVault:mkdir] ${normalizedPath} → shadow + original`);
+    this.logger?.debug("shadow", "mkdir → shadow + original", { path: normalizedPath });
     await Promise.all([
       fsp.mkdir(this.shadowAbs(normalizedPath),   { recursive: true }),
       fsp.mkdir(this.originalAbs(normalizedPath), { recursive: true }),
@@ -1571,10 +1605,10 @@ export class ShadowVaultManager {
 
   private async patchedRemove(normalizedPath: string): Promise<void> {
     if (this.isBypassPath(normalizedPath)) {
-      console.debug(`[ShadowVault:remove] bypass ${normalizedPath}`);
+      this.logger?.debug("shadow", "remove: bypass", { path: normalizedPath });
       return this.originalMethods.remove!(normalizedPath);
     }
-    console.debug(`[ShadowVault:remove] ${normalizedPath} → shadow + .enc`);
+    this.logger?.debug("shadow", "remove → shadow + .enc", { path: normalizedPath });
     await Promise.allSettled([
       fsp.unlink(this.shadowAbs(normalizedPath)),
       fsp.unlink(this.originalEncAbs(normalizedPath)),
@@ -1586,7 +1620,7 @@ export class ShadowVaultManager {
     newNormalizedPath: string
   ): Promise<void> {
     if (this.isBypassPath(normalizedPath)) {
-      console.debug(`[ShadowVault:rename] bypass ${normalizedPath} → ${newNormalizedPath}`);
+      this.logger?.debug("shadow", "rename: bypass", { from: normalizedPath, to: newNormalizedPath });
       return this.originalMethods.rename!(normalizedPath, newNormalizedPath);
     }
 
@@ -1595,27 +1629,25 @@ export class ShadowVaultManager {
     const oldShadow   = this.shadowAbs(normalizedPath);
     const oldOrigEnc  = this.originalEncAbs(normalizedPath);
 
-    console.debug(`[ShadowVault:rename] ${normalizedPath} → ${newNormalizedPath}`);
+    this.logger?.debug("shadow", "rename", { from: normalizedPath, to: newNormalizedPath });
 
     await fsp.mkdir(nodePath.dirname(newShadow),  { recursive: true });
     await fsp.mkdir(nodePath.dirname(newOrigEnc), { recursive: true });
 
     const shadowExists = await fileExists(oldShadow);
     const encExists = await fileExists(oldOrigEnc);
-    console.debug(
-      `[ShadowVault:rename] oldShadow exists=${shadowExists}, oldEnc exists=${encExists}`
-    );
+    this.logger?.debug("shadow", "rename: проверка источников", { shadowExists, encExists });
 
     if (shadowExists) {
       await fsp.rename(oldShadow, newShadow);
     } else {
-      console.warn(`[ShadowVault:rename] oldShadow ${oldShadow} НЕ НАЙДЕН — пропускаем shadow rename`);
+      this.logger?.warn("shadow", "rename: oldShadow НЕ НАЙДЕН — пропускаем shadow rename", { path: oldShadow });
     }
 
     if (encExists) {
       await fsp.rename(oldOrigEnc, newOrigEnc);
     } else {
-      console.warn(`[ShadowVault:rename] oldEnc ${oldOrigEnc} НЕ НАЙДЕН — пропускаем .enc rename`);
+      this.logger?.warn("shadow", "rename: oldEnc НЕ НАЙДЕН — пропускаем .enc rename", { path: oldOrigEnc });
     }
   }
 

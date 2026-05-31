@@ -26,6 +26,7 @@ import * as os from "os";
 import { CryptoEngine } from "./crypto-engine";
 import { atomicWrite, fileExists } from "./fs-utils";
 import { checkFileIntegrity, compareSemantic } from "./integrity-check";
+import type { Logger } from "./logger";
 
 /**
  * Имя файла-индикатора активной сессии.
@@ -65,14 +66,19 @@ export class SessionManager {
   /** Старый путь — проверяется и удаляется при обнаружении (миграция) */
   private readonly legacySessionFilePath: string;
 
+  /** Опциональный структурный логгер (DI из main); тесты передают undefined. */
+  private readonly logger?: Logger;
+
   constructor(
     private readonly engine:       CryptoEngine,
     private readonly originalRoot: string,
     private readonly shadowRoot:   string,
-    pluginDirAbs:                  string
+    pluginDirAbs:                  string,
+    logger?:                       Logger
   ) {
     this.sessionFilePath = nodePath.join(pluginDirAbs, SESSION_FILE);
     this.legacySessionFilePath = nodePath.join(originalRoot, LEGACY_SESSION_FILE);
+    this.logger = logger;
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -98,14 +104,14 @@ export class SessionManager {
     // ── Миграция: убираем старый .session_active из оригинала ──────────────
     if (await fileExists(this.legacySessionFilePath)) {
       hadCrash = true;
-      console.warn("[SessionManager] Найден legacy .session_active в оригинале — миграция и recovery");
+      this.logger?.warn("session", "найден legacy .session_active в оригинале — миграция и recovery");
       await fsp.unlink(this.legacySessionFilePath).catch(() => undefined);
     }
 
     // ── Текущий session.lock (в папке плагина) ─────────────────────────────
     if (await fileExists(this.sessionFilePath)) {
       hadCrash = true;
-      console.warn("[SessionManager] session.lock существует — предыдущая сессия не завершилась");
+      this.logger?.warn("session", "session.lock существует — предыдущая сессия не завершилась");
     }
 
     // ── Дополнительный сигнал: shadow vault существует и не пуст ───────────
@@ -113,15 +119,16 @@ export class SessionManager {
     // присутствие shadow с файлами — однозначный признак незавершённой сессии.
     if (!hadCrash && (await this.shadowHasFiles())) {
       hadCrash = true;
-      console.warn("[SessionManager] shadow vault не пуст — обнаружен краш без lock-файла");
+      this.logger?.warn("session", "shadow vault не пуст — обнаружен краш без lock-файла");
     }
 
     if (hadCrash) {
       recovery = await this.recoverFromCrash();
-      console.debug(
-        `[SessionManager] Recovery: ${recovery.recoveredFiles.length} ok, ` +
-        `${recovery.corruptedShadow.length} corrupted, ${recovery.failedFiles.length} failed`
-      );
+      this.logger?.info("session", "recovery завершён", {
+        ok: recovery.recoveredFiles.length,
+        corrupted: recovery.corruptedShadow.length,
+        failed: recovery.failedFiles.length,
+      });
     }
 
     await this.createSessionFile();
@@ -169,19 +176,16 @@ export class SessionManager {
       await this.deleteShadowVault();
       shadowDeleted = true;
     } catch (err) {
-      console.error(
-        "[SessionManager] Не удалось полностью удалить Теневое хранилище:",
-        err
-      );
+      this.logger?.error("session", "не удалось полностью удалить теневое хранилище", {
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
 
     if (shadowDeleted) {
       // Только после успешного удаления shadow снимаем флаг сессии
       await this.removeSessionFile();
     } else {
-      console.warn(
-        "[SessionManager] .session_active НЕ удалён — при следующем запуске будет recovery."
-      );
+      this.logger?.warn("session", "session.lock НЕ удалён — при следующем запуске будет recovery");
     }
 
     // Ключ обнуляется в любом случае
@@ -245,10 +249,10 @@ export class SessionManager {
         const integrity = checkFileIntegrity(normalizedPath, shadowBuf);
         if (!integrity.ok) {
           corruptedShadow.push(normalizedPath);
-          console.warn(
-            `[SessionManager] Recovery: shadow "${normalizedPath}" повреждён (${integrity.reason}), ` +
-            `оригинал не трогаем`
-          );
+          this.logger?.warn("session", "recovery: shadow повреждён, оригинал не трогаем", {
+            path: normalizedPath,
+            reason: integrity.reason,
+          });
           continue;
         }
 
@@ -257,13 +261,16 @@ export class SessionManager {
         await atomicWrite(originalEncAbs, encrypted, ".sessiontmp");
 
         recoveredFiles.push(normalizedPath);
-        console.debug(
-          `[SessionManager] Recovery: "${normalizedPath}" восстановлен ` +
-          `(${semantic.kind === "different" ? semantic.reason : semantic.kind})`
-        );
+        this.logger?.debug("session", "recovery: файл восстановлен", {
+          path: normalizedPath,
+          reason: semantic.kind === "different" ? semantic.reason : semantic.kind,
+        });
       } catch (err) {
         failedFiles.push(normalizedPath);
-        console.error(`[SessionManager] Recovery для "${normalizedPath}":`, err);
+        this.logger?.error("session", "recovery файла не удался", {
+          path: normalizedPath,
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
     }
 
@@ -289,7 +296,10 @@ export class SessionManager {
       await this.engine.decryptStream(encAbsPath, tmpPath);
       return await fsp.readFile(tmpPath);
     } catch (err) {
-      console.warn(`[SessionManager] Recovery: оригинал "${encAbsPath}" не расшифровался:`, err);
+      this.logger?.warn("session", "recovery: оригинал не расшифровался", {
+        path: encAbsPath,
+        error: err instanceof Error ? err.message : String(err),
+      });
       return null;
     } finally {
       await fsp.unlink(tmpPath).catch(() => undefined);
