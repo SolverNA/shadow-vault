@@ -49,6 +49,7 @@ import { ENCRYPTED_EXT, listEncryptedDir } from "./fs-utils";
 import { bytesToHex } from "./hex";
 import { Logger, LogLevel, LogAdapter } from "./logger";
 import { BugReporter, VaultStats } from "./bug-report";
+import { DiagnosticsController } from "./diagnostics-controller";
 
 interface AdapterWithInternals extends IDataAdapter {
   files?: Record<string, { type: string; realpath: string; ctime?: number; mtime?: number; size?: number }>;
@@ -80,15 +81,11 @@ export default class ShadowVaultPlugin extends Plugin {
   private globalErrorHandlers: Array<() => void> = [];
 
   /**
-   * Дедупликация баг-репортов: сигнатура ошибки → ts последнего репорта.
-   * Идентичная ошибка (operation + name + первая строка stack/message) в
-   * пределах окна REPORT_DEDUP_MS НЕ создаёт новый файл-репорт. Устраняет
-   * лавину одинаковых баг-репортов (напр. при закрытии Obsidian одно и то же
-   * событие срабатывало 9 раз → 9 идентичных файлов). Первая ошибка каждого
-   * типа репортится всегда.
+   * Контроллер диагностики: централизованная обработка ошибок ключевых
+   * операций + дедупликация баг-репортов. Создаётся в initDiagnostics после
+   * Logger/BugReporter. Публичный plugin.reportError делегирует сюда.
    */
-  private readonly recentReports = new Map<string, number>();
-  private static readonly REPORT_DEDUP_MS = 10_000;
+  private diagnostics!: DiagnosticsController;
 
   /** true только пока сессия активна (между onUnlock и shutdown) */
   private sessionActive = false;
@@ -236,6 +233,15 @@ export default class ShadowVaultPlugin extends Plugin {
       () => this.logger.tail(200),
     );
 
+    // Контроллер диагностики получает узкий контекст (НЕ весь Plugin):
+    // логгер, баг-репортер, колбэк сбора статистик и колбэк показа Notice.
+    this.diagnostics = new DiagnosticsController({
+      logger: this.logger,
+      bugReporter: this.bugReporter,
+      collectStats: () => this.collectVaultStats().catch(() => undefined),
+      showNotice: (message, timeoutMs) => { new Notice(message, timeoutMs); },
+    });
+
     // Глобальные перехватчики — пока плагин активен. Не роняем приложение,
     // лишь логируем и пишем баг-репорт. Отписка в onunload.
     const onError = (ev: ErrorEvent) => {
@@ -280,73 +286,9 @@ export default class ShadowVaultPlugin extends Plugin {
     context?: Record<string, unknown>,
     opts?: { silent?: boolean },
   ): Promise<string | null> {
-    const msg = error instanceof Error ? error.message : String(error);
-    this.logger?.error("error", `ошибка в операции «${operation}»: ${msg}`, {
-      operation,
-      ...(context ?? {}),
-    });
-
-    // Дедупликация: идентичная ошибка в окне REPORT_DEDUP_MS не плодит файлы.
-    // Логируем всегда (см. выше), но баг-репорт пишем не чаще одного на сигнатуру.
-    const signature = this.errorSignature(operation, error);
-    const now = Date.now();
-    const last = this.recentReports.get(signature);
-    if (last !== undefined && now - last < ShadowVaultPlugin.REPORT_DEDUP_MS) {
-      this.logger?.debug("error", "баг-репорт подавлен дедупликацией", {
-        operation,
-        sinceMs: now - last,
-      });
-      return null;
-    }
-    this.recentReports.set(signature, now);
-    this.pruneRecentReports(now);
-
-    let path: string | null = null;
-    try {
-      const stats = await this.collectVaultStats().catch(() => undefined);
-      path = await this.bugReporter.report({ operation, error, context, stats });
-    } catch (e) {
-      console.error("[ShadowVault] reportError: не удалось создать баг-репорт:", e);
-    }
-    if (!opts?.silent) {
-      if (path) {
-        new Notice(`⚠️ Произошла ошибка, создан баг-репорт:\n${path}`, 10000);
-      } else {
-        new Notice("⚠️ Произошла ошибка (баг-репорт сохранить не удалось).", 8000);
-      }
-    }
-    return path;
-  }
-
-  /**
-   * Сигнатура ошибки для дедупликации: operation + name + первая значимая
-   * строка stack (или message). Намеренно грубая — идентичные по сути ошибки
-   * (одно и то же место кода) дают одну сигнатуру независимо от ts/произвольных
-   * чисел в сообщении.
-   */
-  private errorSignature(operation: string, error: unknown): string {
-    let name = "Error";
-    let head = "";
-    if (error instanceof Error) {
-      name = error.name || "Error";
-      const firstStackLine = (error.stack ?? "")
-        .split("\n")
-        .map((l) => l.trim())
-        .find((l) => l.startsWith("at "));
-      head = firstStackLine ?? error.message ?? "";
-    } else {
-      head = String(error);
-    }
-    return `${operation}|${name}|${head}`;
-  }
-
-  /** Удаляет из карты дедупликации записи старше окна — не даём ей расти. */
-  private pruneRecentReports(now: number): void {
-    for (const [sig, ts] of this.recentReports) {
-      if (now - ts >= ShadowVaultPlugin.REPORT_DEDUP_MS) {
-        this.recentReports.delete(sig);
-      }
-    }
+    // Тонкая обёртка: вся логика (лог + дедуп + баг-репорт + Notice) в
+    // DiagnosticsController. main отвечает лишь за жизненный цикл.
+    return this.diagnostics.reportError(operation, error, context, opts);
   }
 
   /**
