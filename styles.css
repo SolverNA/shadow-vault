@@ -4,10 +4,37 @@
 
 /* ── Модальное окно ─────────────────────────────────────────────────── */
 
-.shadow-vault-modal .modal-content {
-  padding: 32px;
-  max-width: 420px;
+/*
+ * Ширину задаём на самом .modal (это блок, который Obsidian центрирует на
+ * экране через свой flex-контейнер .modal-container). Если ограничивать
+ * только .modal-content, внешний .modal сохраняет дефолтную ширину и узкий
+ * контент «прилипает» к левому краю — окно выглядит смещённым.
+ *
+ * width: 100% + max-width позволяет окну сжиматься на узких (mobile) экранах,
+ * не ломая нативное центрирование. box-sizing — чтобы padding не раздувал блок.
+ */
+.shadow-vault-modal.modal {
   width: 100%;
+  max-width: 420px;
+  box-sizing: border-box;
+}
+
+.shadow-vault-modal .modal-content {
+  padding: 28px;
+  width: 100%;
+  box-sizing: border-box;
+  /* Контент тянется на всю ширину окна, выравнивание задаётся внутри блоков. */
+  margin: 0;
+}
+
+/* На узких (mobile) экранах окно занимает почти всю ширину viewport. */
+@media (max-width: 480px) {
+  .shadow-vault-modal.modal {
+    max-width: 94vw;
+  }
+  .shadow-vault-modal .modal-content {
+    padding: 20px;
+  }
 }
 
 /* ── Шапка ──────────────────────────────────────────────────────────── */
@@ -97,6 +124,34 @@
   font-family: var(--font-text);
 }
 
+/*
+ * Голые input'ы внутри .sv-field, не обёрнутые в .sv-input-row (email, PIN).
+ * Без этих правил они рендерятся как браузерные дефолтные поля и выбиваются
+ * из общего стиля формы. Стилизуем их под единый вид с .sv-input-row.
+ */
+.sv-field > input {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--background-modifier-form-field);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  padding: 8px 10px;
+  font-size: 0.95em;
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+
+.sv-field > input:focus {
+  border-color: var(--interactive-accent);
+}
+
+.sv-field > input::placeholder {
+  color: var(--text-faint);
+  font-family: var(--font-text);
+}
+
 /* ── Кнопка показа пароля ───────────────────────────────────────────── */
 
 .sv-toggle-password {
@@ -126,7 +181,8 @@
   color: var(--text-error);
   font-size: 0.85em;
   line-height: 1.45;
-  border: 1px solid var(--background-modifier-error-rgb);
+  border: 1px solid var(--background-modifier-error);
+  text-align: left;
 }
 
 /* ── Индикатор загрузки (деривация ключа ~300 мс) ───────────────────── */
