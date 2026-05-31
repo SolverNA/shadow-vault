@@ -46,6 +46,8 @@ import { ShadowVaultSettingTab } from "./settings-tab";
 import { DEFAULT_SETTINGS, PluginSettings, VERIFICATION_PLAINTEXT } from "./types";
 import { IDataAdapter, ListedFiles } from "./adapter-types";
 import { ENCRYPTED_EXT, listEncryptedDir } from "./fs-utils";
+import { Logger, LogLevel, LogAdapter } from "./logger";
+import { BugReporter, VaultStats } from "./bug-report";
 
 interface AdapterWithInternals extends IDataAdapter {
   files?: Record<string, { type: string; realpath: string; ctime?: number; mtime?: number; size?: number }>;
@@ -69,6 +71,13 @@ export default class ShadowVaultPlugin extends Plugin {
   /** Флаг платформы: true = десктоп (Node.js), false = мобильные (Web APIs) */
   private isDesktop = false;
 
+  /** Подробное логирование (debug + ротация в каталог плагина). */
+  logger!: Logger;
+  /** Обязательный баг-репорт при любой пойманной ошибке ключевых операций. */
+  bugReporter!: BugReporter;
+  /** Подписки на window error/unhandledrejection (снимаются в onunload). */
+  private globalErrorHandlers: Array<() => void> = [];
+
   /** true только пока сессия активна (между onUnlock и shutdown) */
   private sessionActive = false;
 
@@ -90,6 +99,15 @@ export default class ShadowVaultPlugin extends Plugin {
     this.isDesktop = Platform.isDesktopApp;
     const isMobile = Platform.isMobile;
 
+    // Диагностика (логгер + баг-репортер) инициализируется ПЕРВОЙ —
+    // чтобы зафиксировать весь жизненный цикл, включая спящий режим и ошибки.
+    this.initDiagnostics();
+    this.logger.info("main", "onload: старт", {
+      desktop: this.isDesktop,
+      mobile: isMobile,
+      pluginVersion: this.manifest.version,
+    });
+
     console.info(`[ShadowVault] Platform: desktop=${this.isDesktop}, mobile=${isMobile}`);
 
     // Вкладка настроек появляется всегда, в т.ч. в спящем режиме
@@ -98,6 +116,7 @@ export default class ShadowVaultPlugin extends Plugin {
     // Спящий режим: пользователь отключил шифрование. Плагин не вмешивается
     // в работу Obsidian — файлы в оригинале plaintext, теневое не монтируем.
     if (this.settings.encryptionDisabled) {
+      this.logger.info("main", "encryption disabled — спящий режим");
       console.info("[ShadowVault] encryption disabled — спящий режим");
       return;
     }
@@ -123,10 +142,17 @@ export default class ShadowVaultPlugin extends Plugin {
       this.openInitModal();
     });
 
+    this.logger.debug("main", "onload: завершён, ожидаем пароль");
     console.debug("[ShadowVault] Плагин загружен, ожидаем пароль.");
   }
 
   onunload(): void {
+    this.logger?.info("main", "onunload: старт", { sessionActive: this.sessionActive });
+    // Снимаем глобальные обработчики ошибок.
+    for (const off of this.globalErrorHandlers) {
+      try { off(); } catch { /* ignore */ }
+    }
+    this.globalErrorHandlers = [];
     // Obsidian закрывается агрессивно и НЕ ждёт async-shutdown — поэтому
     // используем sync-версию очистки. Write-through уже сохранил все
     // изменения в оригинал на каждый save, на shutdown остаётся только
@@ -140,6 +166,141 @@ export default class ShadowVaultPlugin extends Plugin {
         this.syncCleanupMobile();
       }
     }
+    // Финальный флаш логов (best-effort, async — Obsidian не ждёт).
+    void this.logger?.close();
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Диагностика: логгер + обязательный баг-репорт
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Инициализирует логгер и баг-репортер. Запись идёт через Obsidian adapter
+   * (кросс-платформенно desktop+mobile), без top-level node:fs. Каталоги —
+   * внутри папки данных плагина: <configDir>/plugins/<id>/{logs,bug-reports}.
+   */
+  private initDiagnostics(): void {
+    const adapter = this.app.vault.adapter as unknown as LogAdapter;
+    const pluginDir = `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
+    const logDir = `${pluginDir}/logs`;
+    const reportDir = `${pluginDir}/bug-reports`;
+
+    // По умолчанию подробное логирование (пользователь просил «подробнейшее»).
+    const minLevel = LogLevel.DEBUG;
+
+    this.logger = new Logger(adapter, {
+      logDir,
+      minLevel,
+      ringSize: 1500,
+      maxFileBytes: 512 * 1024,
+      maxFiles: 3,
+      flushIntervalMs: 1500,
+      mirrorConsole: true,
+    });
+
+    this.bugReporter = new BugReporter(
+      adapter,
+      reportDir,
+      {
+        pluginVersion: this.manifest.version,
+        platform: this.isDesktop ? "desktop" : "mobile",
+        isDesktop: this.isDesktop,
+        obsidianVersion: this.getObsidianVersion(),
+      },
+      () => this.logger.tail(200),
+    );
+
+    // Глобальные перехватчики — пока плагин активен. Не роняем приложение,
+    // лишь логируем и пишем баг-репорт. Отписка в onunload.
+    const onError = (ev: ErrorEvent) => {
+      void this.reportError("window.error", ev.error ?? new Error(ev.message), {
+        filename: ev.filename,
+        lineno: ev.lineno,
+      }, { silent: true });
+    };
+    const onRejection = (ev: PromiseRejectionEvent) => {
+      void this.reportError("window.unhandledrejection", ev.reason, undefined, { silent: true });
+    };
+    try {
+      window.addEventListener("error", onError);
+      window.addEventListener("unhandledrejection", onRejection);
+      this.globalErrorHandlers.push(
+        () => window.removeEventListener("error", onError),
+        () => window.removeEventListener("unhandledrejection", onRejection),
+      );
+    } catch { /* среды без window (тесты) — пропускаем */ }
+  }
+
+  /** Версия Obsidian, если доступна через глобальный apiVersion. */
+  private getObsidianVersion(): string | undefined {
+    try {
+      const g = globalThis as unknown as { apiVersion?: string };
+      return g.apiVersion;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Централизованный обработчик ошибок ключевых операций: (а) логирует error,
+   * (б) пишет баг-репорт в каталог плагина, (в) показывает пользователю Notice
+   * с путём к репорту. Не глотает данные и не роняет приложение молча.
+   *
+   * @returns путь к сохранённому баг-репорту (или null).
+   */
+  async reportError(
+    operation: string,
+    error: unknown,
+    context?: Record<string, unknown>,
+    opts?: { silent?: boolean },
+  ): Promise<string | null> {
+    const msg = error instanceof Error ? error.message : String(error);
+    this.logger?.error("error", `ошибка в операции «${operation}»: ${msg}`, {
+      operation,
+      ...(context ?? {}),
+    });
+    let path: string | null = null;
+    try {
+      const stats = await this.collectVaultStats().catch(() => undefined);
+      path = await this.bugReporter.report({ operation, error, context, stats });
+    } catch (e) {
+      console.error("[ShadowVault] reportError: не удалось создать баг-репорт:", e);
+    }
+    if (!opts?.silent) {
+      if (path) {
+        new Notice(`⚠️ Произошла ошибка, создан баг-репорт:\n${path}`, 10000);
+      } else {
+        new Notice("⚠️ Произошла ошибка (баг-репорт сохранить не удалось).", 8000);
+      }
+    }
+    return path;
+  }
+
+  /**
+   * Безопасные статистики хранилища для баг-репорта: только числа, без
+   * содержимого файлов. Считаем .enc в корне оригинала (поверхностно).
+   */
+  private async collectVaultStats(): Promise<VaultStats> {
+    const stats: VaultStats = { formatVersion: this.settings.formatVersion };
+    try {
+      const adapter = this.app.vault.adapter as unknown as IDataAdapter;
+      const configDir = this.app.vault.configDir;
+      const listed = await adapter.list("");
+      let total = 0;
+      let enc = 0;
+      let bytes = 0;
+      for (const f of listed.files) {
+        if (f === configDir || f.startsWith(configDir + "/")) continue;
+        total++;
+        if (f.endsWith(ENCRYPTED_EXT)) enc++;
+        const st = await adapter.stat(f).catch(() => null);
+        if (st?.size) bytes += st.size;
+      }
+      stats.totalFiles = total;
+      stats.encFiles = enc;
+      stats.totalBytes = bytes;
+    } catch { /* статистика опциональна */ }
+    return stats;
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -206,6 +367,11 @@ export default class ShadowVaultPlugin extends Plugin {
     const targetEmail = (newEmail || oldEmail).trim();
     const targetPassword = newPassword || oldPassword;
 
+    this.logger.info("credentials", "смена учётных данных: старт", {
+      emailChanged: targetEmail !== oldEmail,
+      desktop: this.isDesktop,
+    });
+
     // 1. Верифицируем ТЕКУЩИЙ пароль (старый email + старый пароль) независимо
     //    от активной сессии — защита от смены на разблокированном чужом
     //    устройстве. До этой точки ничего не меняем.
@@ -219,9 +385,15 @@ export default class ShadowVaultPlugin extends Plugin {
 
       // 3. Пере-шифровка всех .enc (двухфазно, атомарно: .enc.new → .enc).
       try {
-        await this.shadowManager!.reEncryptAll(newEngine, onProgress);
+        await this.shadowManager!.reEncryptAll(newEngine, (done, total) => {
+          if (total > 0 && (done === total || done % 25 === 0)) {
+            this.logger.debug("reEncrypt", "прогресс (desktop)", { done, total });
+          }
+          onProgress(done, total);
+        });
       } catch (err) {
         newEngine.destroy();
+        await this.reportError("reEncrypt.desktop", err);
         throw err;
       }
 
@@ -240,11 +412,16 @@ export default class ShadowVaultPlugin extends Plugin {
       const newEngine = new WebCryptoEngine();
       await newEngine.deriveKey(targetEmail, targetPassword);
 
-      await this.virtualShadowManager!.reEncryptAll(
-        this.app.vault.configDir,
-        newEngine,
-        onProgress
-      );
+      try {
+        await this.virtualShadowManager!.reEncryptAll(
+          this.app.vault.configDir,
+          newEngine,
+          onProgress
+        );
+      } catch (err) {
+        await this.reportError("reEncrypt.mobile", err);
+        throw err;
+      }
 
       const blob = await newEngine.encryptBuffer(
         new TextEncoder().encode(VERIFICATION_PLAINTEXT)
@@ -260,6 +437,8 @@ export default class ShadowVaultPlugin extends Plugin {
 
     // PIN привязан к старому masterKey → после смены ключа он невалиден.
     new PinStore().clearPin();
+
+    this.logger.info("credentials", "смена учётных данных завершена");
 
     // Блокируем — при следующем входе используется новый email/пароль.
     await this.lockVault();
@@ -294,6 +473,10 @@ export default class ShadowVaultPlugin extends Plugin {
     const masterKey = await deriveMasterKey(email, password);
     try {
       await new PinStore().enablePin(pin, masterKey);
+      this.logger.info("pin", "PIN установлен");
+    } catch (err) {
+      await this.reportError("pin.setup", err);
+      throw err;
     } finally {
       masterKey.fill(0);
     }
@@ -480,7 +663,9 @@ export default class ShadowVaultPlugin extends Plugin {
       return;
     }
 
+    const t0 = Date.now();
     try {
+      this.logger.info("unlock", "onUnlockDesktop: старт", { firstRun: isFirstRun, viaPin: password === null });
       console.info("[ShadowVault] onUnlockDesktop: старт, basePath =", basePath);
 
       // Ленивая загрузка desktop-only модулей. Их top-level node-импорты
@@ -515,7 +700,16 @@ export default class ShadowVaultPlugin extends Plugin {
         engine, basePath, this.shadowManager.shadowRoot, this.getPluginDirAbs(basePath)
       );
       const sessionResult = await this.sessionManager.startSession();
-      if (sessionResult.hadCrash) this.notifyCrashRecovery(sessionResult.recovery!);
+      this.logger.info("recovery", "startSession", { hadCrash: sessionResult.hadCrash });
+      if (sessionResult.hadCrash) {
+        const rec = sessionResult.recovery!;
+        this.logger.warn("recovery", "обнаружен краш прошлой сессии", {
+          recovered: rec.recoveredFiles.length,
+          failed: rec.failedFiles.length,
+          corruptedShadow: rec.corruptedShadow.length,
+        });
+        this.notifyCrashRecovery(rec);
+      }
 
       // ── Phase 4: reset shadow если был краш ───────────────────────────
       // После recovery .enc актуальные. Старый shadow чистим и расшифруем
@@ -551,7 +745,14 @@ export default class ShadowVaultPlugin extends Plugin {
       } finally {
         progressNotice.hide();
       }
+      this.logger.info("decrypt", "decryptAllToShadow завершён", {
+        decrypted: decResult.decrypted.length,
+        failed: decResult.failed.length,
+      });
       if (decResult.failed.length > 0) {
+        this.logger.warn("decrypt", "часть файлов не расшифрована", {
+          failedPaths: decResult.failed.map((f) => f.path),
+        });
         new Notice(
           `⚠️ Shadow Vault: ${decResult.failed.length} файл(ов) не удалось расшифровать. См. консоль.`,
           10000
@@ -595,11 +796,13 @@ export default class ShadowVaultPlugin extends Plugin {
         new Notice("🔓 Shadow Vault: хранилище разблокировано.", 2500);
       }
 
+      this.logger.info("unlock", "desktop-сессия запущена", { ms: Date.now() - t0 });
       console.info(
         `[ShadowVault] Сессия запущена. shadowRoot=${this.shadowManager.shadowRoot}, originalRoot=${basePath}`
       );
     } catch (err) {
       console.error("[ShadowVault] Ошибка инициализации:", err);
+      await this.reportError("unlock.desktop", err, { firstRun: isFirstRun, ms: Date.now() - t0 });
       new Notice(
         `❌ Shadow Vault: ошибка при запуске.\n${err instanceof Error ? err.message : String(err)}`,
         10000
@@ -627,6 +830,7 @@ export default class ShadowVaultPlugin extends Plugin {
     const { probeLegacyPassword } = await import("./crypto/migration");
 
     const hasLegacy = await this.shadowManager.hasLegacyFiles();
+    this.logger.debug("migration", "проверка legacy (desktop)", { hasLegacy, viaPin: password === null });
 
     // Гарантируем verificationBlob даже для пустых/уже-v2 legacy-хранилищ:
     // старые data.json его не имеют. Если blob уже есть (AuthService создал
@@ -654,6 +858,7 @@ export default class ShadowVaultPlugin extends Plugin {
     const sample = await this.shadowManager.firstEncBuffer();
     if (sample) {
       const ok = await probeLegacyPassword(sample, password);
+      this.logger.info("auth", "проверка legacy-пароля (desktop)", { success: ok });
       if (!ok) {
         // Неверный пароль: НЕ начинаем разрушительную миграцию.
         // AuthService мог только что записать v2-блоб на "первом запуске"
@@ -681,7 +886,14 @@ export default class ShadowVaultPlugin extends Plugin {
       migNotice.hide();
     }
 
+    this.logger.info("migration", "миграция legacy→v2 (desktop) завершена", {
+      migrated: result.migrated.length,
+      failed: result.failed.length,
+    });
     if (result.failed.length > 0) {
+      this.logger.warn("migration", "часть файлов не мигрирована", {
+        failedPaths: result.failed.map((f) => (typeof f === "string" ? f : f.path)),
+      });
       new Notice(
         `⚠️ Shadow Vault: ${result.failed.length} файл(ов) не мигрировано (см. консоль). ` +
         "Остальные переведены в новый формат.",
@@ -727,7 +939,9 @@ export default class ShadowVaultPlugin extends Plugin {
     creds: { password: string | null; email: string; rawKey?: Uint8Array },
     isFirstRun: boolean
   ): Promise<void> {
+    const t0 = Date.now();
     try {
+      this.logger.info("unlock", "onUnlockMobile: старт", { firstRun: isFirstRun, viaPin: !!creds.rawKey });
       console.info("[ShadowVault] onUnlockMobile: старт");
 
       // ── Phase 1: создаём Web Crypto engine ────────────────────────────
@@ -797,9 +1011,11 @@ export default class ShadowVaultPlugin extends Plugin {
         new Notice("🔓 Shadow Vault: хранилище разблокировано.", 2500);
       }
 
+      this.logger.info("unlock", "mobile-сессия запущена", { ms: Date.now() - t0 });
       console.info("[ShadowVault] Мобильная сессия запущена");
     } catch (err) {
       console.error("[ShadowVault] Ошибка мобильной инициализации:", err);
+      await this.reportError("unlock.mobile", err, { firstRun: isFirstRun, ms: Date.now() - t0 });
       new Notice(
         `❌ Shadow Vault: ошибка при запуске.\n${err instanceof Error ? err.message : String(err)}`,
         10000
@@ -818,6 +1034,7 @@ export default class ShadowVaultPlugin extends Plugin {
     const configDir = this.app.vault.configDir;
 
     const hasLegacy = await vsm.hasLegacyFiles(configDir);
+    this.logger.debug("migration", "проверка legacy (mobile)", { hasLegacy, viaPin: password === null });
     if (!hasLegacy) {
       if (this.settings.formatVersion !== FORMAT_VERSION) {
         this.settings.formatVersion = FORMAT_VERSION;
@@ -838,6 +1055,7 @@ export default class ShadowVaultPlugin extends Plugin {
 
     // Проверка пароля через trial-decrypt (хранилище без verificationBlob).
     const ok = await vsm.probePassword(configDir, password);
+    this.logger.info("auth", "проверка legacy-пароля (mobile)", { success: ok });
     if (!ok) {
       if (this.settings.verificationBlob) {
         this.settings.verificationBlob = null;
@@ -859,7 +1077,15 @@ export default class ShadowVaultPlugin extends Plugin {
       migNotice.hide();
     }
 
+    this.logger.info("migration", "миграция legacy→v2 (mobile) завершена", {
+      migrated: result.migrated,
+      skipped: result.skipped,
+      failed: result.failed.length,
+    });
     if (result.failed.length > 0) {
+      this.logger.warn("migration", "часть файлов не мигрирована (mobile)", {
+        failedPaths: result.failed.map((f) => f.path),
+      });
       new Notice(
         `⚠️ Shadow Vault: ${result.failed.length} файл(ов) не мигрировано (см. консоль).`,
         10000
@@ -970,10 +1196,14 @@ export default class ShadowVaultPlugin extends Plugin {
       console.debug(`[ShadowVault:event] modify ${file.path}`);
       // КРИТИЧНО: promise регистрируется в pendingWrites, иначе последняя правка
       // могла потеряться, если onunload удалит shadow до завершения encryptOne.
+      const t0 = Date.now();
       void this.shadowManager!.trackPending(
-        this.shadowManager!.encryptOne(file.path).catch((err) =>
-          console.error(`[ShadowVault:event] modify ${file.path} failed:`, err)
-        )
+        this.shadowManager!.encryptOne(file.path)
+          .then(() => this.logger.debug("write", "modify→encrypt", { path: file.path, ms: Date.now() - t0 }))
+          .catch((err) => {
+            console.error(`[ShadowVault:event] modify ${file.path} failed:`, err);
+            void this.reportError("write.modify", err, { path: file.path }, { silent: true });
+          })
       );
     }));
 
@@ -999,8 +1229,10 @@ export default class ShadowVaultPlugin extends Plugin {
       } else if (file instanceof TFolder) {
         await this.shadowManager!.mkdirOriginal(file.path);
       }
+      this.logger.debug("write", "create→encrypt", { path: file.path });
     } catch (err) {
       console.error(`[ShadowVault:event] create ${file.path}:`, err);
+      void this.reportError("write.create", err, { path: file.path }, { silent: true });
     }
   }
 
@@ -1011,8 +1243,10 @@ export default class ShadowVaultPlugin extends Plugin {
       } else if (file instanceof TFolder) {
         await this.shadowManager!.rmdirOriginal(file.path);
       }
+      this.logger.debug("write", "delete→unlink", { path: file.path });
     } catch (err) {
       console.error(`[ShadowVault:event] delete ${file.path}:`, err);
+      void this.reportError("write.delete", err, { path: file.path }, { silent: true });
     }
   }
 
@@ -1034,8 +1268,10 @@ export default class ShadowVaultPlugin extends Plugin {
         await fsp.mkdir(nodePath.dirname(newOrig), { recursive: true });
         await fsp.rename(oldOrig, newOrig);
       }
+      this.logger.debug("write", "rename", { from: oldPath, to: file.path });
     } catch (err) {
       console.error(`[ShadowVault:event] rename ${oldPath} → ${file.path}:`, err);
+      void this.reportError("write.rename", err, { from: oldPath, to: file.path }, { silent: true });
     }
   }
 
@@ -1087,6 +1323,7 @@ export default class ShadowVaultPlugin extends Plugin {
     if (!this.sessionActive) return;
     this.sessionActive = false;
 
+    this.logger.info("shutdown", "завершение сессии: старт");
     console.debug("[ShadowVault] Завершение сессии...");
 
     // 0. Дренаж in-flight write-through: дожидаемся завершения всех
@@ -1106,10 +1343,17 @@ export default class ShadowVaultPlugin extends Plugin {
     if (this.shadowManager) {
       try {
         const r = await this.shadowManager.encryptShadowChangesToOriginal();
+        this.logger.info("shutdown", "финальный encrypt-back", {
+          encrypted: r.encrypted.length,
+          failed: r.failed.length,
+        });
         if (r.encrypted.length > 0) {
           console.debug(`[ShadowVault] shutdown encrypt-back: ${r.encrypted.length} файлов синхронизировано`);
         }
         if (r.failed.length > 0) {
+          this.logger.warn("shutdown", "shadow сохранён для recovery (есть незашифрованные)", {
+            failed: r.failed.length,
+          });
           console.error("[ShadowVault] shutdown encrypt-back: failed:", r.failed);
           new Notice(
             `⚠️ Shadow Vault: не удалось зашифровать ${r.failed.length} файл(ов) при выходе. ` +
@@ -1119,6 +1363,7 @@ export default class ShadowVaultPlugin extends Plugin {
         }
       } catch (err) {
         console.error("[ShadowVault] shutdown encrypt-back ошибка:", err);
+        await this.reportError("shutdown.encryptBack", err);
       }
     }
 
@@ -1145,6 +1390,7 @@ export default class ShadowVaultPlugin extends Plugin {
       this.sessionManager = null;
     }
 
+    this.logger.info("shutdown", "сессия завершена");
     console.debug("[ShadowVault] Сессия завершена.");
   }
 
