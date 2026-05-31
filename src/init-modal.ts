@@ -222,7 +222,8 @@ export class InitModal extends Modal {
     });
 
     this.renderSharedControls(form);
-    this.btnSubmit!.textContent = "Восстановить";
+    if (!this.btnSubmit) return;
+    this.btnSubmit.textContent = "Восстановить";
 
     this.inputPassword.addEventListener("keydown", (e) => {
       if (e.key === "Enter") void this.handleSubmit();
@@ -260,7 +261,8 @@ export class InitModal extends Modal {
     });
 
     this.renderSharedControls(form);
-    this.btnSubmit!.textContent = "Создать хранилище";
+    if (!this.btnSubmit) return;
+    this.btnSubmit.textContent = "Создать хранилище";
 
     this.inputPassword.addEventListener("keydown", (e) => {
       if (e.key === "Enter") void this.handleSubmit();
@@ -299,7 +301,8 @@ export class InitModal extends Modal {
     });
 
     this.renderSharedControls(form);
-    this.btnSubmit!.textContent = "Разблокировать";
+    if (!this.btnSubmit) return;
+    this.btnSubmit.textContent = "Разблокировать";
 
     this.inputPassword.addEventListener("keydown", (e) => {
       if (e.key === "Enter") void this.handleSubmit();
@@ -337,13 +340,14 @@ export class InitModal extends Modal {
     });
 
     this.renderSharedControls(form);
-    this.btnSubmit!.textContent = "Войти";
+    if (!this.btnSubmit) return;
+    this.btnSubmit.textContent = "Войти";
 
     this.inputPin.addEventListener("keydown", (e) => {
       if (e.key === "Enter") void this.handlePinSubmit();
     });
     // Перенаправляем submit-кнопку на PIN-обработчик.
-    this.btnSubmit!.onclick = () => { void this.handlePinSubmit(); };
+    this.btnSubmit.onclick = () => { void this.handlePinSubmit(); };
 
     const pwdLink = form.createEl("button", {
       cls: "shadow-vault-btn sv-btn-back",
