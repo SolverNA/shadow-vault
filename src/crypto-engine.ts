@@ -116,6 +116,12 @@ export class NodeCryptoEngine {
     this.assertUnlocked();
     const container = Buffer.isBuffer(input) ? input : Buffer.from(input);
 
+    // Legacy 0-байтный .enc — артефакт старых версий. По единому контракту
+    // пустых файлов трактуем его как пустой plaintext, а не как ошибку формата.
+    if (container.length === 0) {
+      return Buffer.alloc(0);
+    }
+
     const fmt = detectFormat(container);
     if (fmt === "v2-chunked") {
       return this.decryptChunkedBuffer(container);

@@ -98,6 +98,18 @@ describe("CryptoEngine — encryptBuffer() / decryptBuffer()", () => {
     expect(dec.length).toBe(0);
   });
 
+  it("пустой plaintext → валидный v2-контейнер (не 0 байт)", () => {
+    const enc = engine.encryptBuffer(Buffer.alloc(0));
+    // 33 байта: MAGIC+ver(5)+IV(12)+tag(16)
+    expect(enc.length).toBe(HEADER_LENGTH + IV_LENGTH + GCM_TAG_LENGTH);
+    expect(enc.subarray(0, 4).toString("ascii")).toBe("SVLT");
+  });
+
+  it("legacy 0-байтный .enc трактуется как пустой plaintext (не ошибка)", () => {
+    const dec = engine.decryptBuffer(Buffer.alloc(0));
+    expect(dec.length).toBe(0);
+  });
+
   it("шифрует и расшифровывает короткую строку", () => {
     const original = Buffer.from("Hello, ShadowVault!");
     const enc = engine.encryptBuffer(original);

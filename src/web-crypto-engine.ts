@@ -83,6 +83,12 @@ export class WebCryptoEngine {
     const buf =
       container instanceof Uint8Array ? container : new Uint8Array(container);
 
+    // Legacy 0-байтный .enc — артефакт старых версий. По единому контракту
+    // пустых файлов трактуем его как пустой plaintext, а не как ошибку формата.
+    if (buf.length === 0) {
+      return new Uint8Array(0).buffer;
+    }
+
     if (detectFormat(buf) === "v2-chunked") {
       return await this.decryptChunked(buf);
     }
