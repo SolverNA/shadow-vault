@@ -682,18 +682,28 @@ export class ShadowVaultManager {
    *     ещё живым .enc — повторный вызов идемпотентно перезапишет plaintext
    *     и в этот раз сможет удалить .enc).
    *   ФАЗА 2 — удаление .enc батчем В КОНЦЕ:
-   *     только если ВСЕ экспорты прошли, удаляем .enc файлы (включая orphan,
-   *     которых не было в shadow). Сбой здесь не теряет данные: plaintext уже
-   *     на месте и проверен, а повторный вызов до-удалит оставшиеся .enc.
+   *     только если ВСЕ экспорты прошли, удаляем .enc файлы — но СТРОГО те,
+   *     чей plaintext был экспортирован в фазе 1. Orphan .enc (есть в
+   *     оригинале, но не было в shadow — например не расшифровались при
+   *     unlock из-за повреждения или чужого ключа) НЕ удаляются: их plaintext
+   *     не экспортирован, и .enc — единственная копия данных. Они возвращаются
+   *     в skippedOrphans, чтобы вызывающий предупредил пользователя.
+   *     Сбой здесь не теряет данные: plaintext уже на месте и проверен,
+   *     а повторный вызов до-удалит оставшиеся .enc.
    *
    * Идемпотентность: повторный вызов после частичного успеха безопасен —
    * фаза 1 перезапишет plaintext (verify пройдёт), фаза 2 удалит .enc.
    */
   async exportShadowToOriginal(
     onProgress?: (done: number, total: number, current: string) => void
-  ): Promise<{ exported: string[]; failed: Array<{ path: string; error: string }> }> {
+  ): Promise<{
+    exported: string[];
+    failed: Array<{ path: string; error: string }>;
+    skippedOrphans: string[];
+  }> {
     const exported: string[] = [];
     const failed: Array<{ path: string; error: string }> = [];
+    const skippedOrphans: string[] = [];
 
     const shadowFiles = await this.scanShadowFilesForSync();
     const total = shadowFiles.length;
@@ -734,16 +744,25 @@ export class ShadowVaultManager {
       this.logger?.error("shadow", "export: часть файлов не удалась — .enc НЕ удаляем, шифрование остаётся включённым", {
         failed: failed.length,
       });
-      return { exported, failed };
+      return { exported, failed, skippedOrphans };
     }
 
     // ── ФАЗА 2: все экспорты успешны → удаляем .enc батчем в конце ──
     this.logger?.info("shadow", "export фаза 2: удаление .enc", { exported: exported.length });
+    // Удаляем СТРОГО те .enc, чей plaintext экспортирован в фазе 1.
+    // Orphan .enc (есть в оригинале, но не было в shadow — например не
+    // расшифровались при unlock: повреждены или зашифрованы другим ключом)
+    // НЕ трогаем: их plaintext не экспортирован, .enc — единственная копия.
     const encToRemove = new Set<string>(exported);
-    // Добавляем orphan .enc (есть в оригинале, но не было в shadow —
-    // например после неудачного decrypt); plaintext для них уже есть/нет,
-    // но сами .enc больше не нужны после отключения шифрования.
-    for (const rel of await this.scanEncryptedFiles()) encToRemove.add(rel);
+    for (const rel of await this.scanEncryptedFiles()) {
+      if (!encToRemove.has(rel)) skippedOrphans.push(rel);
+    }
+    if (skippedOrphans.length > 0) {
+      this.logger?.warn("shadow", "export: orphan .enc без экспортированного plaintext — оставлены на диске", {
+        count: skippedOrphans.length,
+        files: skippedOrphans,
+      });
+    }
 
     for (const rel of encToRemove) {
       try {
@@ -761,8 +780,12 @@ export class ShadowVaultManager {
       }
     }
 
-    this.logger?.info("shadow", "export завершён", { files: exported.length, errors: failed.length });
-    return { exported, failed };
+    this.logger?.info("shadow", "export завершён", {
+      files: exported.length,
+      errors: failed.length,
+      skippedOrphans: skippedOrphans.length,
+    });
+    return { exported, failed, skippedOrphans };
   }
 
   /**

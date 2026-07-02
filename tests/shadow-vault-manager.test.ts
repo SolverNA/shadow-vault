@@ -1136,6 +1136,33 @@ describe("ShadowVaultManager — exportShadowToOriginal (безопасный о
       expect(fs.readFileSync(nodePath.join(env.origRoot, "doc.md"), "utf8")).toBe("content");
     } finally { env.cleanup(); }
   });
+
+  it("orphan .enc (не расшифрован при unlock) НЕ удаляется и попадает в skippedOrphans", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "good.md", "ok");
+      // Битый .enc (мусор вместо шифртекста) — при unlock не расшифруется
+      // и в shadow не попадёт; его plaintext никогда не экспортируется.
+      const garbage = Buffer.from("это не валидный шифртекст вообще");
+      await writeRawEnc(env, "broken.md", garbage);
+
+      const dec = await env.manager.decryptAllToShadow();
+      expect(dec.failed.map(f => f.path)).toContain("broken.md");
+
+      const res = await env.manager.exportShadowToOriginal();
+      expect(res.failed).toHaveLength(0);
+      expect(res.exported).toEqual(["good.md"]);
+      expect(res.skippedOrphans).toEqual(["broken.md"]);
+
+      // Экспортированный .enc удалён, plaintext на месте
+      expect(fs.readFileSync(nodePath.join(env.origRoot, "good.md"), "utf8")).toBe("ok");
+      expect(fs.existsSync(nodePath.join(env.origRoot, "good.md.enc"))).toBe(false);
+      // КРИТИЧНО: orphan .enc — единственная копия данных — НЕ удалён
+      const brokenEnc = nodePath.join(env.origRoot, "broken.md.enc");
+      expect(fs.existsSync(brokenEnc)).toBe(true);
+      expect(fs.readFileSync(brokenEnc).equals(garbage)).toBe(true);
+    } finally { env.cleanup(); }
+  });
 });
 
 // ─────────────────────────────────────────────
