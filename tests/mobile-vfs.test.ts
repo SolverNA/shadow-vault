@@ -15,7 +15,8 @@
 import { describe, it, expect, beforeEach } from "@jest/globals";
 import { WebCryptoEngine } from "../src/web-crypto-engine";
 import { VirtualShadowManager } from "../src/virtual-shadow-manager";
-import { PlatformAdapter } from "../src/platform-adapter";
+import { MobileAdapter, PlatformAdapter } from "../src/platform-adapter";
+import { AdapterPatcher } from "../src/adapter-patcher";
 import { isV2 } from "../src/crypto/format";
 
 const STUB_EMAIL = "test@shadow-vault.local";
@@ -248,5 +249,196 @@ describe("VirtualShadowManager.reEncryptAll (mobile смена ключа)", () 
     await newEngine.deriveKey(STUB_EMAIL, "totally different password 123");
     await vsm.reEncryptAll("", newEngine, () => {});
     expect(text(await vsm.read("c.md"))).toBe("payload C");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Интеграция РЕАЛЬНОЙ связки AdapterPatcher + MobileAdapter + VSM
+// (регрессия: до фикса MobileAdapter звал патченные методы адаптера →
+//  бесконечная рекурсия / stack overflow на любом read/list)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Fake Obsidian DataAdapter: один и тот же объект — и цель патча
+ * (AdapterPatcher.patch), и источник оригинальных методов для MobileAdapter,
+ * ровно как реальный vault.adapter на mobile.
+ */
+class FakeDataAdapter {
+  files = new Map<string, ArrayBuffer>();
+  dirs = new Set<string>();
+
+  async read(path: string): Promise<string> {
+    return text(await this.readBinary(path));
+  }
+  async readBinary(path: string): Promise<ArrayBuffer> {
+    const v = this.files.get(path);
+    if (!v) throw Object.assign(new Error("ENOENT: " + path), { code: "ENOENT" });
+    return v;
+  }
+  async write(path: string, data: string): Promise<void> {
+    await this.writeBinary(path, bytes(data));
+  }
+  async writeBinary(path: string, data: ArrayBuffer): Promise<void> {
+    this.files.set(path, data);
+  }
+  async exists(path: string): Promise<boolean> {
+    return this.files.has(path) || this.dirs.has(path);
+  }
+  async remove(path: string): Promise<void> {
+    if (!this.files.delete(path)) {
+      throw Object.assign(new Error("ENOENT: " + path), { code: "ENOENT" });
+    }
+  }
+  async rmdir(path: string, _recursive: boolean): Promise<void> {
+    this.dirs.delete(path);
+    for (const k of [...this.files.keys()]) {
+      if (k.startsWith(path + "/")) this.files.delete(k);
+    }
+  }
+  async rename(oldPath: string, newPath: string): Promise<void> {
+    const v = this.files.get(oldPath);
+    if (!v) throw Object.assign(new Error("ENOENT: " + oldPath), { code: "ENOENT" });
+    this.files.delete(oldPath);
+    this.files.set(newPath, v);
+  }
+  async copy(src: string, dst: string): Promise<void> {
+    const v = this.files.get(src);
+    if (!v) throw Object.assign(new Error("ENOENT: " + src), { code: "ENOENT" });
+    this.files.set(dst, v.slice(0));
+  }
+  async mkdir(path: string): Promise<void> {
+    this.dirs.add(path);
+  }
+  async stat(
+    path: string
+  ): Promise<{ type: "file" | "folder"; ctime: number; mtime: number; size: number } | null> {
+    const v = this.files.get(path);
+    if (v) return { type: "file", ctime: 1000, mtime: 1000, size: v.byteLength };
+    if (this.dirs.has(path)) return { type: "folder", ctime: 1000, mtime: 1000, size: 0 };
+    return null;
+  }
+  async list(path: string): Promise<{ files: string[]; folders: string[] }> {
+    const prefix = path ? path + "/" : "";
+    const files: string[] = [];
+    const folders = new Set<string>();
+    for (const key of this.files.keys()) {
+      if (!key.startsWith(prefix)) continue;
+      const rest = key.slice(prefix.length);
+      const slash = rest.indexOf("/");
+      if (slash === -1) files.push(key);
+      else folders.add(prefix + rest.slice(0, slash));
+    }
+    for (const d of this.dirs) {
+      if (d !== path && d.startsWith(prefix) && !d.slice(prefix.length).includes("/")) {
+        folders.add(d);
+      }
+    }
+    return { files, folders: [...folders] };
+  }
+}
+
+describe("Интеграция AdapterPatcher + MobileAdapter + VSM (без рекурсии)", () => {
+  let fake: FakeDataAdapter;
+  let mobile: MobileAdapter;
+  let ivsm: VirtualShadowManager;
+  let patcher: AdapterPatcher;
+
+  beforeEach(() => {
+    fake = new FakeDataAdapter();
+    // Порядок как в main.onUnlockMobile: MobileAdapter создаётся ДО patch()
+    // и захватывает ОРИГИНАЛЬНЫЕ методы адаптера в конструкторе.
+    mobile = new MobileAdapter({ adapter: fake } as any);
+    ivsm = new VirtualShadowManager(engine, mobile);
+    patcher = new AdapterPatcher(ivsm, ".obsidian");
+    patcher.patch(fake as any);
+  });
+
+  it("write/read через патченный адаптер: .enc (v2) на диске, plaintext читается", async () => {
+    await fake.write("notes/note.md", "hello mobile");
+
+    // На «диске» — только .enc в формате v2, plaintext-файла нет
+    expect(fake.files.has("notes/note.md")).toBe(false);
+    const enc = fake.files.get("notes/note.md.enc");
+    expect(enc).toBeTruthy();
+    expect(isV2(new Uint8Array(enc!))).toBe(true);
+
+    // Патченный read расшифровывает обратно (до фикса — stack overflow)
+    expect(await fake.read("notes/note.md")).toBe("hello mobile");
+  });
+
+  it("read холодного файла (пустой кэш) идёт в оригинальный readBinary", async () => {
+    await fake.write("cold.md", "cold data");
+    ivsm.clearCache(); // имитация перезапуска: чтение строго из .enc
+    expect(await fake.read("cold.md")).toBe("cold data");
+  });
+
+  it("list через патченный адаптер не рекурсирует и убирает .enc из имён", async () => {
+    await fake.write("notes/a.md", "A");
+    await fake.write("notes/b.md", "B");
+    // До фикса: patchedList → vsm.list → mobile.list → patchedList → ∞
+    const res = await fake.list("notes");
+    expect(res.files.sort()).toEqual(["notes/a.md", "notes/b.md"]);
+  });
+
+  it("exists/stat/remove/rename работают сквозь связку", async () => {
+    await fake.write("f.md", "payload");
+    expect(await fake.exists("f.md")).toBe(true);
+
+    const st = await fake.stat("f.md");
+    expect(st).not.toBeNull();
+    expect(st!.size).toBe("payload".length); // размер plaintext, не .enc
+
+    await fake.rename("f.md", "g.md");
+    expect(fake.files.has("f.md.enc")).toBe(false);
+    expect(await fake.read("g.md")).toBe("payload");
+
+    await fake.remove("g.md");
+    expect(await fake.exists("g.md")).toBe(false);
+    expect(fake.files.has("g.md.enc")).toBe(false);
+  });
+
+  it("bypass: .obsidian идёт напрямую без шифрования", async () => {
+    await fake.write(".obsidian/app.json", "{}");
+    expect(text(fake.files.get(".obsidian/app.json")!)).toBe("{}");
+    expect(fake.files.has(".obsidian/app.json.enc")).toBe(false);
+    expect(await fake.read(".obsidian/app.json")).toBe("{}");
+  });
+
+  it("unpatch возвращает адаптер в исходное поведение", async () => {
+    patcher.unpatch(fake as any);
+    await fake.write("plain.md", "raw");
+    expect(text(fake.files.get("plain.md")!)).toBe("raw");
+    expect(fake.files.has("plain.md.enc")).toBe(false);
+  });
+
+  it("цикл lock/unlock (unpatch → новая связка → patch) не наслаивает патчи", async () => {
+    await fake.write("n.md", "v1");
+    patcher.unpatch(fake as any);
+
+    // Новая сессия: новый MobileAdapter захватывает восстановленные оригиналы
+    const mobile2 = new MobileAdapter({ adapter: fake } as any);
+    const vsm2 = new VirtualShadowManager(engine, mobile2);
+    const patcher2 = new AdapterPatcher(vsm2, ".obsidian");
+    patcher2.patch(fake as any);
+
+    expect(await fake.read("n.md")).toBe("v1");
+    await fake.write("n.md", "v2");
+    expect(await fake.read("n.md")).toBe("v2");
+    // На диске один слой шифрования: .enc расшифровывается движком напрямую
+    expect(text(await engine.decryptBuffer(fake.files.get("n.md.enc")!))).toBe("v2");
+  });
+
+  it("reEncryptAll на патченном адаптере пишет в ОРИГИНАЛ (без двойного шифрования)", async () => {
+    await fake.write("r.md", "re-encrypt me");
+
+    const newEngine = new WebCryptoEngine();
+    await newEngine.deriveKey(STUB_EMAIL, "brand new password 42");
+    await ivsm.reEncryptAll(".obsidian", newEngine);
+
+    // Ровно один слой шифрования НОВЫМ ключом (до фикса запись шла через
+    // патченный writeBinary → двойное шифрование и r.md.enc.enc)
+    expect(fake.files.has("r.md.enc.enc")).toBe(false);
+    const enc = fake.files.get("r.md.enc")!;
+    expect(text(await newEngine.decryptBuffer(enc))).toBe("re-encrypt me");
   });
 });
