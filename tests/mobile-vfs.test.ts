@@ -65,6 +65,23 @@ class InMemoryAdapter implements PlatformAdapter {
   }
 }
 
+/**
+ * InMemoryAdapter с хуком перед writeBinary — для эмуляции ошибок диска и
+ * искусственных задержек (проверка сериализации записей в VSM).
+ */
+class HookedAdapter extends InMemoryAdapter {
+  /** Вызывается ПЕРЕД записью; может бросить (ошибка диска) или подождать. */
+  beforeWrite?: (path: string) => void | Promise<void>;
+  /** Пути в порядке ФАКТИЧЕСКОГО завершения записи на «диск». */
+  completedWrites: string[] = [];
+
+  async writeBinary(path: string, data: ArrayBuffer): Promise<void> {
+    if (this.beforeWrite) await this.beforeWrite(path);
+    await super.writeBinary(path, data);
+    this.completedWrites.push(path);
+  }
+}
+
 function bytes(s: string): ArrayBuffer {
   return new TextEncoder().encode(s).buffer;
 }
@@ -216,6 +233,123 @@ describe("VirtualShadowManager (mobile write-through)", () => {
     expect(enc.byteLength).toBeGreaterThan(0);
     expect(isV2(new Uint8Array(enc))).toBe(true);
     expect((await newEngine.decryptBuffer(enc)).byteLength).toBe(0);
+  });
+});
+
+describe("VirtualShadowManager: сериализация записей и откат кэша при ошибке", () => {
+  let hooked: HookedAdapter;
+  let v: VirtualShadowManager;
+
+  beforeEach(() => {
+    hooked = new HookedAdapter();
+    v = new VirtualShadowManager(engine, hooked);
+  });
+
+  it("ошибка writeBinary: write бросает, read НЕ отдаёт фантом (прежняя версия с диска)", async () => {
+    await v.write("f.md", bytes("v1"));
+
+    hooked.beforeWrite = () => {
+      throw Object.assign(new Error("disk full"), { code: "EIO" });
+    };
+    await expect(v.write("f.md", bytes("v2"))).rejects.toThrow("disk full");
+    hooked.beforeWrite = undefined;
+
+    // Кэш инвалидирован: read идёт на диск и возвращает ПРЕЖНЮЮ версию,
+    // а не фантомную v2, которой на диске нет.
+    expect(text(await v.read("f.md"))).toBe("v1");
+    // На диске тоже v1
+    expect(text(await engine.decryptBuffer(hooked.files.get("f.md.enc")!))).toBe("v1");
+
+    // Очередь не «отравлена» упавшей записью: следующая запись проходит
+    await v.write("f.md", bytes("v3"));
+    expect(text(await v.read("f.md"))).toBe("v3");
+  });
+
+  it("ошибка writeBinary НОВОГО файла: read даёт ENOENT, exists=false (без фантома)", async () => {
+    hooked.beforeWrite = () => Promise.reject(new Error("EIO"));
+    await expect(v.write("fresh.md", bytes("ghost"))).rejects.toThrow("EIO");
+    hooked.beforeWrite = undefined;
+
+    expect(await v.exists("fresh.md")).toBe(false);
+    await expect(v.read("fresh.md")).rejects.toMatchObject({ code: "ENOENT" });
+    expect(hooked.files.has("fresh.md.enc")).toBe(false);
+  });
+
+  it("параллельные записи одного пути сериализованы: финально ВТОРАЯ версия на диске и в кэше", async () => {
+    let releaseFirst!: () => void;
+    const gate = new Promise<void>((resolve) => (releaseFirst = resolve));
+    let call = 0;
+    // Первая запись «зависает» на диске, вторая — быстрая.
+    hooked.beforeWrite = async () => {
+      if (++call === 1) await gate;
+    };
+
+    const p1 = v.write("race.md", bytes("slow-old"));
+    const p2 = v.write("race.md", bytes("fast-new"));
+
+    // Даём быстрой записи шанс «обогнать» медленную (без сериализации она
+    // завершилась бы здесь, и slow-old затёр бы её на диске после gate).
+    await new Promise((r) => setTimeout(r, 20));
+    releaseFirst();
+    await Promise.all([p1, p2]);
+
+    // На диске финально ВТОРАЯ версия (порядок вызова write сохранён)
+    expect(text(await engine.decryptBuffer(hooked.files.get("race.md.enc")!))).toBe("fast-new");
+    expect(hooked.completedWrites).toEqual(["race.md.enc", "race.md.enc"]);
+    // В кэше тоже вторая
+    expect(text(await v.read("race.md"))).toBe("fast-new");
+    // И холодное чтение (без кэша) подтверждает диск
+    const fresh = new VirtualShadowManager(engine, hooked);
+    expect(text(await fresh.read("race.md"))).toBe("fast-new");
+  });
+
+  it("параллельные записи РАЗНЫХ путей не блокируют друг друга", async () => {
+    let releaseA!: () => void;
+    const gateA = new Promise<void>((resolve) => (releaseA = resolve));
+    hooked.beforeWrite = async (path) => {
+      if (path === "a.md.enc") await gateA;
+    };
+
+    const done: string[] = [];
+    const pA = v.write("a.md", bytes("A")).then(() => done.push("a"));
+    const pB = v.write("b.md", bytes("B")).then(() => done.push("b"));
+
+    // b.md завершается, пока a.md ещё висит на «диске» — очереди per-path
+    await pB;
+    expect(done).toEqual(["b"]);
+    expect(hooked.files.has("b.md.enc")).toBe(true);
+    expect(hooked.files.has("a.md.enc")).toBe(false);
+
+    releaseA();
+    await pA;
+    expect(done).toEqual(["b", "a"]);
+    expect(text(await v.read("a.md"))).toBe("A");
+  });
+
+  it("remove в очереди с write: не обгоняет висящую запись того же пути", async () => {
+    await v.write("q.md", bytes("first"));
+
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let gated = true;
+    hooked.beforeWrite = async () => {
+      if (gated) await gate;
+    };
+
+    const pWrite = v.write("q.md", bytes("second"));
+    const pRemove = v.remove("q.md"); // встаёт в очередь ПОСЛЕ записи
+
+    await new Promise((r) => setTimeout(r, 20));
+    // remove ещё не выполнился: он ждёт завершения висящей записи
+    expect(hooked.files.has("q.md.enc")).toBe(true);
+
+    gated = false;
+    release();
+    await Promise.all([pWrite, pRemove]);
+
+    // Итог по порядку вызовов: записали second, затем удалили — файла нет
+    expect(hooked.files.has("q.md.enc")).toBe(false);
+    expect(await v.exists("q.md")).toBe(false);
   });
 });
 
