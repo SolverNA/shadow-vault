@@ -27,6 +27,12 @@ export class AdapterPatcher {
     this.originalMethods.readBinary = adapter.readBinary.bind(adapter);
     this.originalMethods.write = adapter.write.bind(adapter);
     this.originalMethods.writeBinary = adapter.writeBinary.bind(adapter);
+    this.originalMethods.append = adapter.append.bind(adapter);
+    this.originalMethods.process = adapter.process.bind(adapter);
+    // appendBinary появился в Obsidian 1.12.3 — на старых версиях его нет
+    if (typeof adapter.appendBinary === "function") {
+      this.originalMethods.appendBinary = adapter.appendBinary.bind(adapter);
+    }
     this.originalMethods.exists = adapter.exists.bind(adapter);
     this.originalMethods.remove = adapter.remove.bind(adapter);
     this.originalMethods.rename = adapter.rename.bind(adapter);
@@ -39,6 +45,11 @@ export class AdapterPatcher {
     adapter.readBinary = (p) => this.patchedReadBinary(p);
     adapter.write = (p, d, o) => this.patchedWrite(p, d, o);
     adapter.writeBinary = (p, d, o) => this.patchedWriteBinary(p, d, o);
+    adapter.append = (p, d, o) => this.patchedAppend(p, d, o);
+    adapter.process = (p, fn, o) => this.patchedProcess(p, fn, o);
+    if (this.originalMethods.appendBinary) {
+      adapter.appendBinary = (p, d, o) => this.patchedAppendBinary(p, d, o);
+    }
     adapter.exists = (p, s) => this.patchedExists(p, s);
     adapter.remove = (p) => this.patchedRemove(p);
     adapter.rename = (o, n) => this.patchedRename(o, n);
@@ -59,6 +70,9 @@ export class AdapterPatcher {
     if (this.originalMethods.readBinary) adapter.readBinary = this.originalMethods.readBinary;
     if (this.originalMethods.write) adapter.write = this.originalMethods.write;
     if (this.originalMethods.writeBinary) adapter.writeBinary = this.originalMethods.writeBinary;
+    if (this.originalMethods.append) adapter.append = this.originalMethods.append;
+    if (this.originalMethods.process) adapter.process = this.originalMethods.process;
+    if (this.originalMethods.appendBinary) adapter.appendBinary = this.originalMethods.appendBinary;
     if (this.originalMethods.exists) adapter.exists = this.originalMethods.exists;
     if (this.originalMethods.remove) adapter.remove = this.originalMethods.remove;
     if (this.originalMethods.rename) adapter.rename = this.originalMethods.rename;
@@ -114,6 +128,74 @@ export class AdapterPatcher {
     }
 
     await this.shadowManager.write(normalizedPath, data);
+  }
+
+  /**
+   * append: читаем текущий plaintext через VSM (нет файла → пустая строка),
+   * дописываем и пишем обратно через VSM (шифрование). Без патча данные
+   * уходили в нативный адаптер → открытый note.md рядом с note.md.enc.
+   * options (mtime/ctime) на зашифрованном пути не поддерживаются VSM —
+   * как и в patchedWrite/patchedWriteBinary они передаются только в bypass.
+   */
+  private async patchedAppend(
+    normalizedPath: string,
+    data: string,
+    options?: DataWriteOptions
+  ): Promise<void> {
+    if (this.isBypassPath(normalizedPath)) {
+      return this.originalMethods.append!(normalizedPath, data, options);
+    }
+
+    let current = "";
+    if (await this.shadowManager.exists(normalizedPath)) {
+      current = new TextDecoder().decode(await this.shadowManager.read(normalizedPath));
+    }
+    const buf = new TextEncoder().encode(current + data);
+    await this.shadowManager.write(normalizedPath, buf.buffer);
+  }
+
+  /**
+   * appendBinary (Obsidian ≥1.12.3): та же семантика, что append, но для
+   * бинарных данных — read через VSM + конкатенация + write через VSM.
+   */
+  private async patchedAppendBinary(
+    normalizedPath: string,
+    data: ArrayBuffer,
+    options?: DataWriteOptions
+  ): Promise<void> {
+    if (this.isBypassPath(normalizedPath)) {
+      return this.originalMethods.appendBinary!(normalizedPath, data, options);
+    }
+
+    let current = new ArrayBuffer(0);
+    if (await this.shadowManager.exists(normalizedPath)) {
+      current = await this.shadowManager.read(normalizedPath);
+    }
+    const joined = new Uint8Array(current.byteLength + data.byteLength);
+    joined.set(new Uint8Array(current), 0);
+    joined.set(new Uint8Array(data), current.byteLength);
+    await this.shadowManager.write(normalizedPath, joined.buffer);
+  }
+
+  /**
+   * process: атомарно read → fn → write, возвращает новую строку (семантика
+   * Obsidian). Используется fileManager.processFrontMatter и многими плагинами.
+   * Отсутствующий файл — ошибка (как у нативного process): VSM.read бросит ENOENT.
+   */
+  private async patchedProcess(
+    normalizedPath: string,
+    fn: (data: string) => string,
+    options?: DataWriteOptions
+  ): Promise<string> {
+    if (this.isBypassPath(normalizedPath)) {
+      return this.originalMethods.process!(normalizedPath, fn, options);
+    }
+
+    const current = new TextDecoder().decode(await this.shadowManager.read(normalizedPath));
+    const result = fn(current);
+    const buf = new TextEncoder().encode(result);
+    await this.shadowManager.write(normalizedPath, buf.buffer);
+    return result;
   }
 
   private async patchedExists(

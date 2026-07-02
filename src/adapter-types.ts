@@ -38,6 +38,8 @@ export interface IDataAdapter {
   write(normalizedPath: string, data: string, options?: DataWriteOptions): Promise<void>;
   writeBinary(normalizedPath: string, data: ArrayBuffer, options?: DataWriteOptions): Promise<void>;
   append(normalizedPath: string, data: string, options?: DataWriteOptions): Promise<void>;
+  /** Дописывает бинарные данные в конец файла. Появился в Obsidian 1.12.3 — опционален. */
+  appendBinary?(normalizedPath: string, data: ArrayBuffer, options?: DataWriteOptions): Promise<void>;
   process(normalizedPath: string, fn: (data: string) => string, options?: DataWriteOptions): Promise<string>;
   // ── Мета ────────────────────────────────────────────────────────────────
   exists(normalizedPath: string, sensitive?: boolean): Promise<boolean>;

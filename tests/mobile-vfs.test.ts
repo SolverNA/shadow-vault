@@ -281,6 +281,24 @@ class FakeDataAdapter {
   async writeBinary(path: string, data: ArrayBuffer): Promise<void> {
     this.files.set(path, data);
   }
+  async append(path: string, data: string): Promise<void> {
+    const cur = this.files.get(path);
+    this.files.set(path, bytes((cur ? text(cur) : "") + data));
+  }
+  async appendBinary(path: string, data: ArrayBuffer): Promise<void> {
+    const cur = this.files.get(path) ?? new ArrayBuffer(0);
+    const joined = new Uint8Array(cur.byteLength + data.byteLength);
+    joined.set(new Uint8Array(cur), 0);
+    joined.set(new Uint8Array(data), cur.byteLength);
+    this.files.set(path, joined.buffer);
+  }
+  async process(path: string, fn: (data: string) => string): Promise<string> {
+    const cur = this.files.get(path);
+    if (!cur) throw Object.assign(new Error("ENOENT: " + path), { code: "ENOENT" });
+    const result = fn(text(cur));
+    this.files.set(path, bytes(result));
+    return result;
+  }
   async exists(path: string): Promise<boolean> {
     return this.files.has(path) || this.dirs.has(path);
   }
@@ -417,6 +435,81 @@ describe("Интеграция AdapterPatcher + MobileAdapter + VSM (без ре
     }
   });
 
+  // ── Регрессия: утечка plaintext через непропатченные append/process ─────
+  it("append к существующему файлу: содержимое дописано, на диске только .enc", async () => {
+    await fake.write("ap.md", "line1\n");
+    await fake.append("ap.md", "line2\n");
+
+    // На «диске» нет открытого plaintext-файла — только .enc
+    expect(fake.files.has("ap.md")).toBe(false);
+    const enc = fake.files.get("ap.md.enc");
+    expect(enc).toBeTruthy();
+    expect(isV2(new Uint8Array(enc!))).toBe(true);
+    expect(text(enc!)).not.toContain("line1");
+
+    expect(await fake.read("ap.md")).toBe("line1\nline2\n");
+  });
+
+  it("append к несуществующему файлу создаёт .enc, а не plaintext", async () => {
+    await fake.append("new-daily.md", "первая запись");
+
+    expect(fake.files.has("new-daily.md")).toBe(false);
+    const enc = fake.files.get("new-daily.md.enc");
+    expect(enc).toBeTruthy();
+    expect(isV2(new Uint8Array(enc!))).toBe(true);
+
+    expect(await fake.read("new-daily.md")).toBe("первая запись");
+  });
+
+  it("append читается и после сброса кэша (данные реально в .enc)", async () => {
+    await fake.write("cold-ap.md", "a");
+    await fake.append("cold-ap.md", "b");
+    ivsm.clearCache(); // имитация перезапуска: чтение строго из .enc
+    expect(await fake.read("cold-ap.md")).toBe("ab");
+  });
+
+  it("appendBinary дописывает бинарные данные через VSM без plaintext на диске", async () => {
+    await fake.write("bin.md", "AB");
+    await fake.appendBinary("bin.md", bytes("CD"));
+
+    expect(fake.files.has("bin.md")).toBe(false);
+    const enc = fake.files.get("bin.md.enc");
+    expect(enc).toBeTruthy();
+    expect(isV2(new Uint8Array(enc!))).toBe(true);
+    expect(await fake.read("bin.md")).toBe("ABCD");
+  });
+
+  it("process: применяет fn, возвращает результат, пишет зашифрованно", async () => {
+    await fake.write("fm.md", "---\ntags: []\n---\nbody");
+
+    const returned = await fake.process("fm.md", (data) =>
+      data.replace("tags: []", "tags: [x]")
+    );
+
+    // Возврат — НОВОЕ содержимое (семантика Obsidian process)
+    expect(returned).toBe("---\ntags: [x]\n---\nbody");
+
+    // На «диске» — только .enc, plaintext не появился
+    expect(fake.files.has("fm.md")).toBe(false);
+    const enc = fake.files.get("fm.md.enc")!;
+    expect(isV2(new Uint8Array(enc))).toBe(true);
+    expect(text(enc)).not.toContain("tags: [x]");
+
+    // Результат применён и читается обратно (в т.ч. после сброса кэша)
+    ivsm.clearCache();
+    expect(await fake.read("fm.md")).toBe("---\ntags: [x]\n---\nbody");
+  });
+
+  it("append/process в bypass (.obsidian) идут в оригинал без шифрования", async () => {
+    await fake.append(".obsidian/log.txt", "raw-log");
+    expect(text(fake.files.get(".obsidian/log.txt")!)).toBe("raw-log");
+    expect(fake.files.has(".obsidian/log.txt.enc")).toBe(false);
+
+    const out = await fake.process(".obsidian/log.txt", (d) => d + "!");
+    expect(out).toBe("raw-log!");
+    expect(text(fake.files.get(".obsidian/log.txt")!)).toBe("raw-log!");
+  });
+
   it("bypass: .obsidian идёт напрямую без шифрования", async () => {
     await fake.write(".obsidian/app.json", "{}");
     expect(text(fake.files.get(".obsidian/app.json")!)).toBe("{}");
@@ -429,6 +522,25 @@ describe("Интеграция AdapterPatcher + MobileAdapter + VSM (без ре
     await fake.write("plain.md", "raw");
     expect(text(fake.files.get("plain.md")!)).toBe("raw");
     expect(fake.files.has("plain.md.enc")).toBe(false);
+  });
+
+  it("unpatch восстанавливает оригинальные append/appendBinary/process", async () => {
+    patcher.unpatch(fake as any);
+
+    // append — нативный: plaintext на диске, без .enc
+    await fake.append("plain-ap.md", "raw-append");
+    expect(text(fake.files.get("plain-ap.md")!)).toBe("raw-append");
+    expect(fake.files.has("plain-ap.md.enc")).toBe(false);
+
+    // appendBinary — нативный
+    await fake.appendBinary("plain-ap.md", bytes("+bin"));
+    expect(text(fake.files.get("plain-ap.md")!)).toBe("raw-append+bin");
+
+    // process — нативный: работает по plaintext-файлу напрямую
+    const out = await fake.process("plain-ap.md", (d) => d.toUpperCase());
+    expect(out).toBe("RAW-APPEND+BIN");
+    expect(text(fake.files.get("plain-ap.md")!)).toBe("RAW-APPEND+BIN");
+    expect(fake.files.has("plain-ap.md.enc")).toBe(false);
   });
 
   it("цикл lock/unlock (unpatch → новая связка → patch) не наслаивает патчи", async () => {
