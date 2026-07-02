@@ -190,6 +190,36 @@ describe("SessionManager — endSession()", () => {
     } finally { env.cleanup(); }
   });
 
+  it("keepShadowForRecovery: shadow и session.lock сохраняются, ключ уничтожается", async () => {
+    const env = await makeEnv();
+    try {
+      await writePlaintextShadow(env, "unsaved.md", "не зашифровано при выходе");
+      await env.session.startSession();
+
+      await env.session.endSession({ keepShadowForRecovery: true });
+
+      // Shadow vault и его файлы на месте — для recovery при следующем старте
+      expect(fs.existsSync(env.shadowRoot)).toBe(true);
+      expect(fs.existsSync(nodePath.join(env.shadowRoot, "unsaved.md"))).toBe(true);
+      // session.lock не удалён — следующий startSession() увидит краш
+      expect(fs.existsSync(nodePath.join(env.pluginDir, "session.lock"))).toBe(true);
+      // Ключ уничтожен в любом случае
+      expect(env.engine.isUnlocked()).toBe(false);
+    } finally { env.cleanup(); }
+  });
+
+  it("keepShadowForRecovery: следующий startSession() обнаруживает краш и запускает recovery", async () => {
+    const env = await makeEnv();
+    try {
+      await env.session.startSession();
+      await env.session.endSession({ keepShadowForRecovery: true });
+
+      const result = await env.session.startSession();
+      expect(result.hadCrash).toBe(true);
+      expect(result.recovery).toBeDefined();
+    } finally { env.cleanup(); }
+  });
+
   it("оригинальное хранилище остаётся нетронутым после endSession", async () => {
     const env = await makeEnv();
     try {

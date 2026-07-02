@@ -168,8 +168,22 @@ export class SessionManager {
    * (например, файл заблокирован на Windows) — логируем, но не останавливаем.
    * .session_active удаляется ТОЛЬКО после успешного удаления shadow vault,
    * иначе следующий запуск не запустит recovery для оставшихся файлов.
+   *
+   * @param opts.keepShadowForRecovery — true если финальный encrypt-back не смог
+   *   зашифровать часть файлов: shadow vault и session.lock НЕ удаляются, чтобы
+   *   при следующем запуске сработал crash recovery (аналогично syncCleanup).
+   *   Ключ шифрования уничтожается в любом случае.
    */
-  async endSession(): Promise<void> {
+  async endSession(opts?: { keepShadowForRecovery?: boolean }): Promise<void> {
+    if (opts?.keepShadowForRecovery) {
+      this.logger?.warn(
+        "session",
+        "shadow vault и session.lock сохранены для recovery — encrypt-back завершился с ошибками"
+      );
+      this.engine.destroy();
+      return;
+    }
+
     let shadowDeleted = false;
 
     try {

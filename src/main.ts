@@ -530,6 +530,21 @@ export default class ShadowVaultPlugin extends Plugin {
         `См. консоль для деталей. Шифрование не отключено.`
       );
     }
+    // Orphan .enc (не расшифровались при unlock — повреждены или зашифрованы
+    // другим ключом) НЕ удалены: их plaintext не экспортирован, .enc —
+    // единственная копия данных. Предупреждаем пользователя.
+    if (result.skippedOrphans.length > 0) {
+      console.warn(
+        "[ShadowVault] disableEncryption: не расшифрованы и оставлены как .enc:",
+        result.skippedOrphans
+      );
+      new Notice(
+        `⚠️ Shadow Vault: ${result.skippedOrphans.length} файл(ов) не были расшифрованы ` +
+        `и оставлены на диске как .enc, чтобы не потерять данные. ` +
+        `Список — в консоли (Ctrl+Shift+I).`,
+        0
+      );
+    }
 
     // 2. Сохраняем настройки до cleanup адаптера —
     //    если что-то упадёт ниже, флаг encryptionDisabled уже стоит
@@ -1516,6 +1531,9 @@ export default class ShadowVaultPlugin extends Plugin {
    *      ПЕРЕД удалением shadow vault, чтобы Obsidian не обращался к нему.
    *   3. teardownObsidianSymlink() — снимаем symlink .obsidian.
    *   4. SessionManager.endSession() — удаляем shadow vault, уничтожаем ключ.
+   *      Если финальный encrypt-back не смог зашифровать часть файлов, shadow
+   *      и session.lock НЕ удаляются — их подхватит recovery при следующем
+   *      запуске (аналогично syncCleanup).
    */
   async shutdown(): Promise<void> {
     if (!this.sessionActive) return;
@@ -1543,7 +1561,10 @@ export default class ShadowVaultPlugin extends Plugin {
     }
 
     // 1. Финальный encrypt-back: страховка на случай если write-through
-    //    что-то пропустил (например, файл был изменён сторонним процессом в shadow)
+    //    что-то пропустил (например, файл был изменён сторонним процессом в shadow).
+    //    Если хоть один файл не зашифровался — shadow и session.lock НЕ удаляем
+    //    (encryptBackFailed), чтобы recovery при следующем запуске восстановил данные.
+    let encryptBackFailed = false;
     if (this.shadowManager) {
       try {
         const r = await this.shadowManager.encryptShadowChangesToOriginal();
@@ -1555,6 +1576,7 @@ export default class ShadowVaultPlugin extends Plugin {
           console.debug(`[ShadowVault] shutdown encrypt-back: ${r.encrypted.length} файлов синхронизировано`);
         }
         if (r.failed.length > 0) {
+          encryptBackFailed = true;
           this.logger.warn("shutdown", "shadow сохранён для recovery (есть незашифрованные)", {
             failed: r.failed.length,
           });
@@ -1566,7 +1588,15 @@ export default class ShadowVaultPlugin extends Plugin {
           );
         }
       } catch (err) {
+        // Encrypt-back упал целиком — не знаем, что осталось незашифрованным.
+        // Консервативно сохраняем shadow для recovery.
+        encryptBackFailed = true;
         console.error("[ShadowVault] shutdown encrypt-back ошибка:", err);
+        new Notice(
+          "⚠️ Shadow Vault: ошибка финального шифрования при выходе. " +
+          "Shadow vault сохранён для recovery при следующем запуске.",
+          10000
+        );
         await this.reportError("shutdown.encryptBack", err);
       }
     }
@@ -1585,9 +1615,10 @@ export default class ShadowVaultPlugin extends Plugin {
       this.shadowManager = null;
     }
 
-    // 3. Удаляем shadow vault и уничтожаем ключ
+    // 3. Удаляем shadow vault и уничтожаем ключ. При провале encrypt-back
+    //    shadow и session.lock сохраняются для recovery (уничтожается только ключ).
     try {
-      await this.sessionManager?.endSession();
+      await this.sessionManager?.endSession({ keepShadowForRecovery: encryptBackFailed });
     } catch (err) {
       console.error("[ShadowVault] endSession:", err);
     } finally {
