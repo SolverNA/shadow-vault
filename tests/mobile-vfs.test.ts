@@ -397,6 +397,26 @@ describe("Интеграция AdapterPatcher + MobileAdapter + VSM (без ре
     expect(fake.files.has("g.md.enc")).toBe(false);
   });
 
+  it("list('') корня транслирует имена: note.md, а не note.md.enc (регрессия root-bypass)", async () => {
+    await fake.write("root-note.md", "root payload");
+    await fake.write(".obsidian/app.json", "{}");
+
+    // До фикса isVaultRoot: patchedList("") уходил в bypass ("" ∈ isBypassPath)
+    // и отдавал сырой .enc-листинг → индекс vault строился по неверным именам.
+    const res = await fake.list("");
+    expect(res.files).toContain("root-note.md");
+    expect(res.files.some((f) => f.endsWith(".enc"))).toBe(false);
+    // Служебная папка конфигурации не пропадает из листинга корня
+    expect(res.folders).toContain(".obsidian");
+
+    // Варианты нормализации корня ("/" и ".") транслируются так же, как ""
+    for (const root of ["/", "."]) {
+      const r = await fake.list(root);
+      expect(r.files).toContain("root-note.md");
+      expect(r.files.some((f) => f.endsWith(".enc"))).toBe(false);
+    }
+  });
+
   it("bypass: .obsidian идёт напрямую без шифрования", async () => {
     await fake.write(".obsidian/app.json", "{}");
     expect(text(fake.files.get(".obsidian/app.json")!)).toBe("{}");

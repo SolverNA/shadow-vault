@@ -5,7 +5,7 @@
 
 import { DataAdapter, DataWriteOptions } from "obsidian";
 import { VirtualShadowManager } from "./virtual-shadow-manager";
-import { isBypassPath } from "./path-utils";
+import { isBypassPath, isVaultRoot } from "./path-utils";
 
 export class AdapterPatcher {
   private originalMethods: Partial<DataAdapter> = {};
@@ -198,6 +198,13 @@ export class AdapterPatcher {
   private async patchedList(
     normalizedPath: string
   ): Promise<{ files: string[]; folders: string[] }> {
+    // Корень ("", "/", ".") НЕ байпасим — иначе Obsidian увидит сырые
+    // .enc-имена и построит индекс по неверным именам. Транслируем через
+    // shadowManager, как desktop-аналог (ShadowVaultManager.patchedList).
+    // Служебные пути (.obsidian и всё внутри) остаются в bypass.
+    if (isVaultRoot(normalizedPath)) {
+      return this.shadowManager.list("");
+    }
     if (this.isBypassPath(normalizedPath)) {
       return this.originalMethods.list!(normalizedPath);
     }
