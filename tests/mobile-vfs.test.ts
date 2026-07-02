@@ -266,6 +266,12 @@ describe("VirtualShadowManager.reEncryptAll (mobile смена ключа)", () 
 class FakeDataAdapter {
   files = new Map<string, ArrayBuffer>();
   dirs = new Set<string>();
+  /** «Корзина»: сюда trashLocal/trashSystem переносят файлы (null — папка). */
+  trashed = new Map<string, ArrayBuffer | null>();
+  /** Журналы вызовов — для проверки атомарности rename (нет write+remove). */
+  renameCalls: Array<[string, string]> = [];
+  writeBinaryCalls: string[] = [];
+  removeCalls: string[] = [];
 
   async read(path: string): Promise<string> {
     return text(await this.readBinary(path));
@@ -279,6 +285,7 @@ class FakeDataAdapter {
     await this.writeBinary(path, bytes(data));
   }
   async writeBinary(path: string, data: ArrayBuffer): Promise<void> {
+    this.writeBinaryCalls.push(path);
     this.files.set(path, data);
   }
   async append(path: string, data: string): Promise<void> {
@@ -303,6 +310,7 @@ class FakeDataAdapter {
     return this.files.has(path) || this.dirs.has(path);
   }
   async remove(path: string): Promise<void> {
+    this.removeCalls.push(path);
     if (!this.files.delete(path)) {
       throw Object.assign(new Error("ENOENT: " + path), { code: "ENOENT" });
     }
@@ -312,12 +320,68 @@ class FakeDataAdapter {
     for (const k of [...this.files.keys()]) {
       if (k.startsWith(path + "/")) this.files.delete(k);
     }
+    for (const d of [...this.dirs]) {
+      if (d.startsWith(path + "/")) this.dirs.delete(d);
+    }
   }
   async rename(oldPath: string, newPath: string): Promise<void> {
+    this.renameCalls.push([oldPath, newPath]);
     const v = this.files.get(oldPath);
-    if (!v) throw Object.assign(new Error("ENOENT: " + oldPath), { code: "ENOENT" });
-    this.files.delete(oldPath);
-    this.files.set(newPath, v);
+    if (v) {
+      this.files.delete(oldPath);
+      this.files.set(newPath, v);
+      return;
+    }
+    // Папка: переносим её саму, все файлы и подпапки (как нативный rename)
+    if (this.dirs.has(oldPath)) {
+      this.dirs.delete(oldPath);
+      this.dirs.add(newPath);
+      for (const k of [...this.files.keys()]) {
+        if (k.startsWith(oldPath + "/")) {
+          this.files.set(newPath + k.slice(oldPath.length), this.files.get(k)!);
+          this.files.delete(k);
+        }
+      }
+      for (const d of [...this.dirs]) {
+        if (d.startsWith(oldPath + "/")) {
+          this.dirs.delete(d);
+          this.dirs.add(newPath + d.slice(oldPath.length));
+        }
+      }
+      return;
+    }
+    throw Object.assign(new Error("ENOENT: " + oldPath), { code: "ENOENT" });
+  }
+  async trashLocal(path: string): Promise<void> {
+    if (!(await this.moveToTrash(path))) {
+      throw Object.assign(new Error("ENOENT: " + path), { code: "ENOENT" });
+    }
+  }
+  async trashSystem(path: string): Promise<boolean> {
+    return this.moveToTrash(path);
+  }
+  private async moveToTrash(path: string): Promise<boolean> {
+    const v = this.files.get(path);
+    if (v) {
+      this.files.delete(path);
+      this.trashed.set(path, v);
+      return true;
+    }
+    if (this.dirs.has(path)) {
+      this.dirs.delete(path);
+      this.trashed.set(path, null);
+      for (const k of [...this.files.keys()]) {
+        if (k.startsWith(path + "/")) {
+          this.trashed.set(k, this.files.get(k)!);
+          this.files.delete(k);
+        }
+      }
+      for (const d of [...this.dirs]) {
+        if (d.startsWith(path + "/")) this.dirs.delete(d);
+      }
+      return true;
+    }
+    return false;
   }
   async copy(src: string, dst: string): Promise<void> {
     const v = this.files.get(src);
@@ -572,5 +636,129 @@ describe("Интеграция AdapterPatcher + MobileAdapter + VSM (без ре
     expect(fake.files.has("r.md.enc.enc")).toBe(false);
     const enc = fake.files.get("r.md.enc")!;
     expect(text(await newEngine.decryptBuffer(enc))).toBe("re-encrypt me");
+  });
+
+  // ── Папки: stat/exists/remove/rename не должны транслироваться в .enc ───
+  it("stat/exists папки идут в оригинал: папка видна как folder (не null/false)", async () => {
+    await fake.mkdir("folder");
+    await fake.write("folder/inner.md", "data");
+
+    // До фикса: stat("folder") искал "folder.enc" → null, exists → false
+    const st = await fake.stat("folder");
+    expect(st).not.toBeNull();
+    expect(st!.type).toBe("folder");
+    expect(await fake.exists("folder")).toBe(true);
+
+    // Файл внутри папки при этом остаётся «файлом» с plaintext-размером
+    const fst = await fake.stat("folder/inner.md");
+    expect(fst!.type).toBe("file");
+    expect(fst!.size).toBe("data".length);
+  });
+
+  it("remove папки удаляет её рекурсивно вместе с .enc внутри (без воскрешения)", async () => {
+    await fake.mkdir("folder");
+    await fake.write("folder/a.md", "A");
+    await fake.write("folder/b.md", "B");
+    expect(fake.files.has("folder/a.md.enc")).toBe(true);
+
+    // До фикса: remove("folder") → MobileAdapter.remove("folder.enc") — no-op,
+    // папка и .enc оставались и «воскресали» в UI.
+    await fake.remove("folder");
+
+    expect(fake.dirs.has("folder")).toBe(false);
+    expect(fake.files.has("folder/a.md.enc")).toBe(false);
+    expect(fake.files.has("folder/b.md.enc")).toBe(false);
+    // Кэш VSM инвалидирован: файлы не воскресают из памяти
+    expect(await fake.exists("folder/a.md")).toBe(false);
+    await expect(fake.read("folder/a.md")).rejects.toBeTruthy();
+  });
+
+  it("rmdir инвалидирует кэш VSM по префиксу", async () => {
+    await fake.mkdir("d");
+    await fake.write("d/x.md", "X"); // попадает в кэш VSM
+    await fake.rmdir("d", true);
+    expect(await fake.exists("d/x.md")).toBe(false);
+    await expect(fake.read("d/x.md")).rejects.toBeTruthy();
+  });
+
+  it("rename папки — проброс в оригинал: файлы читаются по новым путям, кэш не отдаёт старьё", async () => {
+    await fake.mkdir("dir");
+    await fake.write("dir/a.md", "payload A");
+    await fake.write("dir/sub/b.md", "payload B");
+
+    // До фикса: rename("dir", ...) падал на readBinary("dir.enc")
+    await fake.rename("dir", "dir2");
+
+    expect(fake.dirs.has("dir")).toBe(false);
+    expect(fake.dirs.has("dir2")).toBe(true);
+    expect(fake.files.has("dir/a.md.enc")).toBe(false);
+    expect(fake.files.has("dir2/a.md.enc")).toBe(true);
+
+    // Содержимое читается по новым путям (расшифровка из переехавших .enc)
+    expect(await fake.read("dir2/a.md")).toBe("payload A");
+    expect(await fake.read("dir2/sub/b.md")).toBe("payload B");
+
+    // Старые пути не воскресают из кэша VSM
+    expect(await fake.exists("dir/a.md")).toBe(false);
+    await expect(fake.read("dir/a.md")).rejects.toBeTruthy();
+  });
+
+  it("rename файла атомарен: нативный rename .enc→.enc, без read+write+remove", async () => {
+    await fake.write("at.md", "atomic payload");
+
+    fake.renameCalls.length = 0;
+    const writesBefore = fake.writeBinaryCalls.length;
+    const removesBefore = fake.removeCalls.length;
+
+    await fake.rename("at.md", "bt.md");
+
+    // Ровно один нативный rename шифртекста, имена транслированы
+    expect(fake.renameCalls).toEqual([["at.md.enc", "bt.md.enc"]]);
+    // Неатомарного пути (write нового + remove старого) НЕ было
+    expect(fake.writeBinaryCalls.length).toBe(writesBefore);
+    expect(fake.removeCalls.length).toBe(removesBefore);
+
+    expect(fake.files.has("at.md.enc")).toBe(false);
+    // Запись кэша VSM переехала и данные реально на диске (после сброса кэша)
+    expect(await fake.read("bt.md")).toBe("atomic payload");
+    ivsm.clearCache();
+    expect(await fake.read("bt.md")).toBe("atomic payload");
+  });
+
+  // ── trashLocal/trashSystem: перехват с трансляцией имени файла ──────────
+  it("trashLocal файла отправляет .enc в корзину (до фикса — ENOENT по plaintext-имени)", async () => {
+    await fake.write("t.md", "trash me");
+
+    await fake.trashLocal("t.md");
+
+    // В корзине лежит .enc (имя с .enc — приемлемый компромисс)
+    expect(fake.trashed.has("t.md.enc")).toBe(true);
+    expect(fake.files.has("t.md.enc")).toBe(false);
+    // Кэш VSM инвалидирован
+    expect(await fake.exists("t.md")).toBe(false);
+  });
+
+  it("trashSystem файла — .enc в системную корзину; trash папки — проброс как есть", async () => {
+    await fake.write("s.md", "sys");
+    expect(await fake.trashSystem("s.md")).toBe(true);
+    expect(fake.trashed.has("s.md.enc")).toBe(true);
+    expect(await fake.exists("s.md")).toBe(false);
+
+    // Папка уезжает в корзину под своим именем, содержимое — вместе с ней
+    await fake.mkdir("tf");
+    await fake.write("tf/x.md", "X");
+    await fake.trashLocal("tf");
+    expect(fake.dirs.has("tf")).toBe(false);
+    expect(fake.trashed.has("tf")).toBe(true);
+    expect(fake.trashed.has("tf/x.md.enc")).toBe(true);
+    // Кэш VSM инвалидирован по префиксу папки
+    expect(await fake.exists("tf/x.md")).toBe(false);
+  });
+
+  it("trash в bypass (.obsidian) идёт в оригинал без трансляции имён", async () => {
+    await fake.write(".obsidian/junk.json", "{}");
+    await fake.trashLocal(".obsidian/junk.json");
+    expect(fake.trashed.has(".obsidian/junk.json")).toBe(true);
+    expect(fake.trashed.has(".obsidian/junk.json.enc")).toBe(false);
   });
 });
