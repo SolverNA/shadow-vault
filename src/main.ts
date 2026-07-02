@@ -389,12 +389,19 @@ export default class ShadowVaultPlugin extends Plugin {
     const checkEngine = await AuthService.verifyPassword(oldEmail, oldPassword, this.settings);
     checkEngine.destroy();
 
+    // Desktop: новый движок после успешной пере-шифровки принадлежит
+    // shadowManager — уничтожаем его ключ только ПОСЛЕ lockVault() (см. ниже).
+    let desktopNewEngine: CryptoEngine | null = null;
+
     if (this.isDesktop) {
       // 2. Новый desktop-движок с НОВЫМ ключом (новый email и/или пароль).
       const newEngine = new CryptoEngine();
       await newEngine.deriveKey(targetEmail, targetPassword);
 
       // 3. Пере-шифровка всех .enc (двухфазно, атомарно: .enc.new → .enc).
+      //    При успехе reEncryptAll переключает активный движок менеджера на
+      //    newEngine (и уничтожает старый ключ) — write-through и финальный
+      //    encrypt-back в shutdown дальше шифруют НОВЫМ ключом.
       try {
         if (!this.shadowManager) {
           throw new Error("shadowManager не инициализирован — сессия не активна");
@@ -406,6 +413,7 @@ export default class ShadowVaultPlugin extends Plugin {
           onProgress(done, total);
         });
       } catch (err) {
+        // Откат: движок менеджера НЕ переключён, newEngine никому не принадлежит.
         newEngine.destroy();
         await this.reportError("reEncrypt.desktop", err);
         throw err;
@@ -420,7 +428,9 @@ export default class ShadowVaultPlugin extends Plugin {
         email: targetEmail,
         verificationBlob: bytesToHex(newVerificationBuf),
       });
-      newEngine.destroy();
+      // НЕ destroy: newEngine — теперь активный движок shadowManager,
+      // им выполняется финальный encrypt-back в shutdown/lockVault.
+      desktopNewEngine = newEngine;
     } else {
       // ── Mobile-путь: WebCryptoEngine + VirtualShadowManager ──────────────
       const newEngine = new WebCryptoEngine();
@@ -459,6 +469,12 @@ export default class ShadowVaultPlugin extends Plugin {
 
     // Блокируем — при следующем входе используется новый email/пароль.
     await this.lockVault();
+
+    // Desktop: shutdown завершён (финальный encrypt-back новым ключом сделан,
+    // shadowManager обнулён) — теперь обнуляем новый ключ в RAM.
+    // SessionManager.endSession уничтожил только СТАРЫЙ движок (он уже был
+    // уничтожен внутри reEncryptAll; destroy() идемпотентен).
+    desktopNewEngine?.destroy();
   }
 
   // ═══════════════════════════════════════════════════════════════════════
