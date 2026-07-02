@@ -10,7 +10,13 @@
 import { describe, it, expect } from "@jest/globals";
 import * as nodeCrypto from "crypto";
 import { NodeCryptoEngine } from "../src/crypto-engine";
-import { detectFormat, isV2 } from "../src/crypto/format";
+import {
+  detectFormat,
+  isV2,
+  writeChunkedHeader,
+  writeChunked2Header,
+  writeSegment,
+} from "../src/crypto/format";
 import {
   legacyDecrypt,
 } from "../src/crypto/legacy";
@@ -22,6 +28,7 @@ import {
   LEGACY_SALT_DOMAIN,
   LEGACY_PBKDF2_ITERATIONS_NODE,
   LEGACY_PBKDF2_ITERATIONS_WEB,
+  CHUNK_FILE_ID_LENGTH,
 } from "../src/crypto/constants";
 
 const EMAIL = "Alice@Example.com";
@@ -150,6 +157,55 @@ describe("migrateBuffer: legacy → v2 с round-trip verify", () => {
     await expect(
       migrateBuffer(new Uint8Array(legacy), "wrong", engine)
     ).rejects.toThrow();
+  });
+
+  // ── Регрессия аудита: chunked-файлы НЕ должны уходить в legacy-decrypt ──
+  // Раньше skip срабатывал только на detectFormat === "v2", а v2-chunked
+  // (0x03/0x04) прогонялся через legacyDecrypt → GCM-fail → легитимный файл
+  // попадал в failed при миграции смешанного хранилища.
+
+  /** Синтетический чанковый контейнер: валидный заголовок + один сегмент. */
+  function makeChunked(version: 3 | 4): Uint8Array {
+    const header =
+      version === 3
+        ? writeChunkedHeader(1024)
+        : writeChunked2Header(
+            1024,
+            1,
+            new Uint8Array(nodeCrypto.randomBytes(CHUNK_FILE_ID_LENGTH))
+          );
+    const seg = writeSegment(
+      new Uint8Array(nodeCrypto.randomBytes(12)),
+      new Uint8Array(nodeCrypto.randomBytes(64 + 16)) // ct + tag
+    );
+    const out = new Uint8Array(header.length + seg.length);
+    out.set(header, 0);
+    out.set(seg, header.length);
+    return out;
+  }
+
+  it("v2-chunked 0x03 → skipped-v2 (уже мигрирован, НЕ failed)", async () => {
+    const buf = makeChunked(3);
+    expect(detectFormat(buf)).toBe("v2-chunked");
+    const engine = await v2Engine();
+    const res = await migrateBuffer(buf, PASSWORD, engine);
+    expect(res.status).toBe("skipped-v2");
+  });
+
+  it("v2-chunked 0x04 → skipped-v2 (уже мигрирован, НЕ failed)", async () => {
+    const buf = makeChunked(4);
+    expect(detectFormat(buf)).toBe("v2-chunked");
+    const engine = await v2Engine();
+    const res = await migrateBuffer(buf, PASSWORD, engine);
+    expect(res.status).toBe("skipped-v2");
+  });
+
+  it("v2-chunked пропускается ДО trial-decrypt: даже с «неверным» паролем не бросает", async () => {
+    const engine = await v2Engine();
+    for (const v of [3, 4] as const) {
+      const res = await migrateBuffer(makeChunked(v), "совсем-не-тот-пароль", engine);
+      expect(res.status).toBe("skipped-v2");
+    }
   });
 
   it("verify-перед-заменой: подделанный движок ловится round-trip'ом", async () => {

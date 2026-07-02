@@ -58,8 +58,13 @@ export async function migrateBuffer(
   engine: V2Engine,
   hint?: LegacyVariant
 ): Promise<MigrateBufferResult> {
-  // Идемпотентность: уже мигрированный файл (v2 по MAGIC) не трогаем.
-  if (detectFormat(enc) === "v2") {
+  // Идемпотентность: уже мигрированный файл не трогаем. Это и цельный v2
+  // (0x02), и чанковый v2-chunked (0x03 legacy-чтение / 0x04 текущий —
+  // detectFormat даёт единый тег "v2-chunked" для обеих версий): chunked-файлы
+  // уже зашифрованы v2-ключом, прогонять их через legacy-decrypt нельзя —
+  // GCM-fail отправил бы легитимный файл в failed.
+  const fmt = detectFormat(enc);
+  if (fmt === "v2" || fmt === "v2-chunked") {
     return { status: "skipped-v2" };
   }
 
