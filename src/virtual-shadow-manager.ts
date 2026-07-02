@@ -12,6 +12,14 @@ import type { Logger } from "./logger";
 
 export class VirtualShadowManager {
   private cache: Map<string, ArrayBuffer> = new Map();
+  /**
+   * Per-path очереди дисковых мутаций (write/remove/rename/copy) — аналог
+   * encryptLocks в desktop ShadowVaultManager. Без сериализации медленный
+   * старый encrypt мог завершить writeBinary ПОСЛЕ быстрого нового: на диске
+   * старая версия, в кэше новая — рассинхрон до перезапуска.
+   * Записи чистятся по завершении хвоста очереди — Map не растёт бесконечно.
+   */
+  private writeLocks: Map<string, Promise<unknown>> = new Map();
   private engine: WebCryptoEngine;
   private adapter: PlatformAdapter;
   /** Опциональный структурный логгер (DI из main); тесты передают undefined. */
@@ -49,21 +57,67 @@ export class VirtualShadowManager {
   }
 
   /**
-   * Записывает файл (сохраняет в кэш и шифрует в .enc)
+   * Сериализует дисковую операцию по указанным путям: op стартует только
+   * после завершения (успешного ИЛИ упавшего) всех ранее поставленных
+   * операций на этих путях. Несколько путей нужны rename/copy — очередь
+   * захватывается на оба пути атомарно (без вложенных захватов → без
+   * взаимных блокировок при встречных rename).
+   */
+  private enqueue<T>(paths: string[], op: () => Promise<T>): Promise<T> {
+    const prev = paths.map((p) => this.writeLocks.get(p) ?? Promise.resolve());
+    // allSettled: упавшая предыдущая операция не «отравляет» очередь.
+    const next = Promise.allSettled(prev).then(op);
+    for (const p of paths) this.writeLocks.set(p, next);
+    return next.finally(() => {
+      // Удаляем себя из карты, только если после нас никто не встал в очередь.
+      for (const p of paths) {
+        if (this.writeLocks.get(p) === next) this.writeLocks.delete(p);
+      }
+    });
+  }
+
+  /**
+   * Записывает файл (сохраняет в кэш и шифрует в .enc).
+   *
+   * Семантика кэша — optimistic: кэш обновляется СРАЗУ (до дисковой записи),
+   * потому что Obsidian читает файл обратно немедленно после write
+   * (read-after-write в редакторе) и ждать encrypt+writeBinary нельзя.
+   * Компромисс: при ОШИБКЕ дисковой записи кэш инвалидируется, иначе read
+   * отдавал бы «фантом» — данные, которых нет на диске (исчезли бы после
+   * lock/перезапуска). Ошибка пробрасывается вызывающему.
+   *
    * @param normalizedPath - путь к файлу (без .enc)
    * @param data - данные для записи
    */
   async write(normalizedPath: string, data: ArrayBuffer): Promise<void> {
-    // 1. Сохраняем в кэш КОПИЮ — иначе последующая мутация переданного буфера
-    //    потребителем испортит кэш и приведёт к рассинхрону с .enc.
-    this.cache.set(normalizedPath, data.slice(0));
+    // Снимок данных на момент вызова: последующая мутация переданного буфера
+    // потребителем не испортит ни кэш, ни шифруемое содержимое.
+    const snapshot = data.slice(0);
 
-    // 2. Шифруем (из исходного буфера — он уже зафиксирован)
-    const encrypted = await this.engine.encryptBuffer(data);
+    // Optimistic-кэш: обновляем сразу, до постановки в очередь на диск.
+    this.cache.set(normalizedPath, snapshot);
 
-    // 3. Пишем .enc в хранилище
-    const encPath = normalizedPath + ".enc";
-    await this.adapter.writeBinary(encPath, encrypted);
+    // Дисковая часть сериализована per-path: параллельные записи одного пути
+    // ложатся на диск строго в порядке вызова write.
+    await this.enqueue([normalizedPath], async () => {
+      try {
+        const encrypted = await this.engine.encryptBuffer(snapshot);
+        await this.adapter.writeBinary(normalizedPath + ".enc", encrypted);
+      } catch (err) {
+        // Откат кэша ТОЛЬКО если там всё ещё наш снимок: более поздний write
+        // уже заменил значение — его судьба решится в его звене очереди.
+        // Инвалидация (а не восстановление прежнего значения) безопаснее:
+        // следующий read пойдёт на диск и вернёт истину (.enc или ENOENT).
+        if (this.cache.get(normalizedPath) === snapshot) {
+          this.cache.delete(normalizedPath);
+        }
+        this.logger?.error("vshadow", `запись .enc не удалась: ${normalizedPath}`, {
+          path: normalizedPath,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        throw err;
+      }
+    });
   }
 
   /**
@@ -84,12 +138,16 @@ export class VirtualShadowManager {
    * @param normalizedPath - путь к файлу (без .enc)
    */
   async remove(normalizedPath: string): Promise<void> {
-    // Удаляем из кэша
-    this.cache.delete(normalizedPath);
+    // В одной очереди с write: remove не должен обогнать «висящую» запись
+    // этого же пути (иначе writeBinary воскресил бы .enc после удаления).
+    await this.enqueue([normalizedPath], async () => {
+      // Удаляем из кэша
+      this.cache.delete(normalizedPath);
 
-    // Удаляем .enc файл
-    const encPath = normalizedPath + ".enc";
-    await this.adapter.remove(encPath);
+      // Удаляем .enc файл
+      const encPath = normalizedPath + ".enc";
+      await this.adapter.remove(encPath);
+    });
   }
 
   /**
@@ -98,27 +156,32 @@ export class VirtualShadowManager {
    * @param newPath - новый путь (без .enc)
    */
   async rename(oldPath: string, newPath: string): Promise<void> {
-    const oldEncPath = oldPath + ".enc";
-    const newEncPath = newPath + ".enc";
+    // Очередь на ОБА пути: rename не должен обогнать «висящую» запись
+    // старого пути (перенёс бы недописанный .enc) и не должен быть затёрт
+    // отставшей записью нового пути.
+    await this.enqueue([oldPath, newPath], async () => {
+      const oldEncPath = oldPath + ".enc";
+      const newEncPath = newPath + ".enc";
 
-    // Приоритет — нативный rename адаптера: атомарно, без пере-шифровки
-    // (шифртекст не зависит от имени файла). Fallback read → write → remove
-    // неатомарен: сбой между write и remove оставляет дубликат .enc.
-    if (this.adapter.rename) {
-      await this.adapter.rename(oldEncPath, newEncPath);
-    } else {
-      const encrypted = await this.adapter.readBinary(oldEncPath);
-      await this.adapter.writeBinary(newEncPath, encrypted);
-      await this.adapter.remove(oldEncPath);
-    }
+      // Приоритет — нативный rename адаптера: атомарно, без пере-шифровки
+      // (шифртекст не зависит от имени файла). Fallback read → write → remove
+      // неатомарен: сбой между write и remove оставляет дубликат .enc.
+      if (this.adapter.rename) {
+        await this.adapter.rename(oldEncPath, newEncPath);
+      } else {
+        const encrypted = await this.adapter.readBinary(oldEncPath);
+        await this.adapter.writeBinary(newEncPath, encrypted);
+        await this.adapter.remove(oldEncPath);
+      }
 
-    // Кэш переносим ПОСЛЕ успешной дисковой операции: если rename упал,
-    // старая запись кэша остаётся валидной.
-    if (this.cache.has(oldPath)) {
-      const data = this.cache.get(oldPath)!;
-      this.cache.delete(oldPath);
-      this.cache.set(newPath, data);
-    }
+      // Кэш переносим ПОСЛЕ успешной дисковой операции: если rename упал,
+      // старая запись кэша остаётся валидной.
+      if (this.cache.has(oldPath)) {
+        const data = this.cache.get(oldPath)!;
+        this.cache.delete(oldPath);
+        this.cache.set(newPath, data);
+      }
+    });
   }
 
   /**
@@ -127,20 +190,22 @@ export class VirtualShadowManager {
    * @param dstPath - целевой путь (без .enc)
    */
   async copy(srcPath: string, dstPath: string): Promise<void> {
-    // Копируем в кэше если есть
-    if (this.cache.has(srcPath)) {
-      const data = this.cache.get(srcPath)!;
-      // Создаём копию ArrayBuffer
-      const copy = data.slice(0);
-      this.cache.set(dstPath, copy);
-    }
+    // Очередь на оба пути: не читаем src, пока его запись «в полёте», и не
+    // даём отставшей записи dst затереть результат копии.
+    await this.enqueue([srcPath, dstPath], async () => {
+      // Копируем .enc файл
+      const srcEncPath = srcPath + ".enc";
+      const dstEncPath = dstPath + ".enc";
 
-    // Копируем .enc файл
-    const srcEncPath = srcPath + ".enc";
-    const dstEncPath = dstPath + ".enc";
+      const encrypted = await this.adapter.readBinary(srcEncPath);
+      await this.adapter.writeBinary(dstEncPath, encrypted);
 
-    const encrypted = await this.adapter.readBinary(srcEncPath);
-    await this.adapter.writeBinary(dstEncPath, encrypted);
+      // Кэш-копию создаём ПОСЛЕ успешной дисковой копии: при сбое кэш dst
+      // не содержит фантома, которого нет на диске.
+      if (this.cache.has(srcPath)) {
+        this.cache.set(dstPath, this.cache.get(srcPath)!.slice(0));
+      }
+    });
   }
 
   /**
