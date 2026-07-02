@@ -45,6 +45,7 @@ import {
   ENCRYPTED_EXT,
   MTIME_TOLERANCE_MS,
   atomicWrite,
+  atomicWriteSync,
   ensureSymlink,
   fileExists,
   filesEqual,
@@ -420,15 +421,12 @@ export class ShadowVaultManager {
         if (!needs) continue;
 
         try {
-          fs.mkdirSync(nodePath.dirname(encAbs), { recursive: true });
           const enc =
             sStat.size === 0
               ? this.engine.encryptBuffer(Buffer.alloc(0)) // валидный v2, не 0 байт
               : this.engine.encryptBuffer(fs.readFileSync(abs));
-          const unique = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-          const tmp = `${encAbs}.${unique}.shadowtmp`;
-          fs.writeFileSync(tmp, enc);
-          fs.renameSync(tmp, encAbs);
+          // tmp + fsync + rename + fsync каталога — переживает power-loss
+          atomicWriteSync(encAbs, enc);
           encrypted++;
         } catch (err) {
           this.logger?.error("shadow", "sync encrypt-back не удался", {

@@ -8,7 +8,7 @@
  * берут node-модули лениво через node-fs (вызываются только на desktop).
  */
 
-import { nfsp, npath } from "./node-fs";
+import { nfs, nfsp, npath } from "./node-fs";
 
 /**
  * Постоянный размер служебных данных контейнера v2:
@@ -51,9 +51,58 @@ export async function fileExists(absPath: string): Promise<boolean> {
   }
 }
 
+/** Уникальный tmp-путь для атомарной записи (PID + время + случайный хвост). */
+function makeTmpPath(absPath: string, tmpExt: string): string {
+  const unique = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  return absPath + "." + unique + tmpExt;
+}
+
+/**
+ * Best-effort fsync каталога — фиксирует rename в журнале ФС.
+ * Без него при power-loss rename может «пережить» сбой, а сами данные — нет.
+ *
+ * На Windows открыть каталог для fsync нельзя (EPERM/EISDIR/EBADF в зависимости
+ * от версии Node/ОС), поэтому любые ошибки глотаются: это усиление durability,
+ * а не условие корректности записи.
+ */
+async function fsyncDirBestEffort(dirPath: string): Promise<void> {
+  const fsp = nfsp();
+  try {
+    const dh = await fsp.open(dirPath, "r");
+    try {
+      await dh.sync();
+    } finally {
+      await dh.close();
+    }
+  } catch {
+    // Windows и экзотические ФС: fsync каталога не поддерживается — игнор.
+  }
+}
+
+/** Синхронный аналог fsyncDirBestEffort — для sync-пути закрытия Obsidian. */
+function fsyncDirSyncBestEffort(dirPath: string): void {
+  const fs = nfs();
+  try {
+    const fd = fs.openSync(dirPath, "r");
+    try {
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    // Windows: fsync каталога не поддерживается (EPERM/EISDIR/EBADF) — игнор.
+  }
+}
+
 /**
  * Атомарная запись через временный файл и rename.
  * Гарантирует что absPath либо содержит старые данные, либо новые — не половину.
+ *
+ * Durability при power-loss: перед rename делается fsync tmp-файла (данные
+ * попадают на диск ДО того, как rename станет видимым), после rename —
+ * best-effort fsync каталога (сам rename фиксируется в журнале ФС). Без этого
+ * журналируемая ФС может зафиксировать rename раньше данных, и после сбоя
+ * питания на месте валидного файла остаётся пустой/усечённый.
  *
  * Уникальный tmp-suffix (с PID + случайным хвостом) защищает от race condition
  * когда два параллельных atomicWrite на одном файле дрались за `.shadowtmp` —
@@ -66,16 +115,60 @@ export async function atomicWrite(
   tmpExt = ".shadowtmp"
 ): Promise<void> {
   const fsp = nfsp();
-  await fsp.mkdir(npath().dirname(absPath), { recursive: true });
-  const unique = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const tmpPath = absPath + "." + unique + tmpExt;
+  const dir = npath().dirname(absPath);
+  await fsp.mkdir(dir, { recursive: true });
+  const tmpPath = makeTmpPath(absPath, tmpExt);
   try {
-    await fsp.writeFile(tmpPath, data);
+    const fh = await fsp.open(tmpPath, "w");
+    try {
+      await fh.writeFile(data);
+      await fh.sync(); // данные на диске ДО rename
+    } finally {
+      await fh.close();
+    }
     await fsp.rename(tmpPath, absPath);
   } catch (err) {
     await fsp.unlink(tmpPath).catch(() => undefined);
     throw err;
   }
+  await fsyncDirBestEffort(dir);
+}
+
+/**
+ * Синхронный вариант atomicWrite — для путей, где await недоступен
+ * (дошифровка при закрытии Obsidian, см. encryptUnsyncedChangesSync).
+ * Семантика и durability-гарантии идентичны async-версии.
+ */
+export function atomicWriteSync(
+  absPath: string,
+  data: Buffer,
+  tmpExt = ".shadowtmp"
+): void {
+  const fs = nfs();
+  const dir = npath().dirname(absPath);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmpPath = makeTmpPath(absPath, tmpExt);
+  try {
+    const fd = fs.openSync(tmpPath, "w");
+    try {
+      let offset = 0;
+      while (offset < data.length) {
+        offset += fs.writeSync(fd, data, offset, data.length - offset);
+      }
+      fs.fsyncSync(fd); // данные на диске ДО rename
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(tmpPath, absPath);
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      /* tmp мог не создаться */
+    }
+    throw err;
+  }
+  fsyncDirSyncBestEffort(dir);
 }
 
 /** Запись каталога для visitor'а walkDir: относительный путь (через "/") + тип. */

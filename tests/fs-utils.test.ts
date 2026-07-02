@@ -16,6 +16,7 @@ import * as nodePath from "path";
 import * as os from "os";
 import {
   atomicWrite,
+  atomicWriteSync,
   ensureSymlink,
   fileExists,
   filesEqual,
@@ -297,6 +298,50 @@ describe("atomicWrite", () => {
     await atomicWrite(p, Buffer.from("data"), ".sessiontmp");
     expect(fs.readFileSync(p, "utf8")).toBe("data");
     expect(await fileExists(p + ".sessiontmp")).toBe(false);
+  });
+
+  it("в каталоге не остаётся никаких временных артефактов (только целевой файл)", async () => {
+    // Фиксирует поведение после добавления fsync (файл + каталог):
+    // содержимое корректно, а уникальный tmp (<pid>-<ts>-<rnd>.shadowtmp) убран.
+    const p = nodePath.join(tmpBase, "out.bin");
+    await atomicWrite(p, Buffer.from([0xde, 0xad, 0xbe, 0xef]));
+    expect(fs.readFileSync(p).equals(Buffer.from([0xde, 0xad, 0xbe, 0xef]))).toBe(true);
+    expect(fs.readdirSync(tmpBase)).toEqual(["out.bin"]);
+  });
+});
+
+// ─────────────────────────────────────────────
+// atomicWriteSync — синхронный вариант для пути закрытия Obsidian
+// ─────────────────────────────────────────────
+
+describe("atomicWriteSync", () => {
+  it("создаёт файл с заданным содержимым и создаёт промежуточные директории", () => {
+    const p = nodePath.join(tmpBase, "deep/sub/out.txt");
+    atomicWriteSync(p, Buffer.from("sync-hello"));
+    expect(fs.readFileSync(p, "utf8")).toBe("sync-hello");
+  });
+
+  it("перезаписывает существующий файл целиком", () => {
+    const p = nodePath.join(tmpBase, "out.txt");
+    fs.writeFileSync(p, "original-very-long-content-AAAAAAA");
+    atomicWriteSync(p, Buffer.from("new"));
+    expect(fs.readFileSync(p, "utf8")).toBe("new");
+    expect(fs.statSync(p).size).toBe(3);
+  });
+
+  it("в каталоге не остаётся временных артефактов", () => {
+    const p = nodePath.join(tmpBase, "out.bin");
+    atomicWriteSync(p, Buffer.from([0x01, 0x02, 0x03]));
+    expect(fs.readdirSync(tmpBase)).toEqual(["out.bin"]);
+  });
+
+  it("при ошибке rename подчищает tmp и пробрасывает ошибку", () => {
+    // Целевой путь — каталог: renameSync файла поверх непустого каталога падает
+    const p = nodePath.join(tmpBase, "target");
+    fs.mkdirSync(p);
+    fs.writeFileSync(nodePath.join(p, "inner.txt"), "x");
+    expect(() => atomicWriteSync(p, Buffer.from("data"))).toThrow();
+    expect(fs.readdirSync(tmpBase)).toEqual(["target"]); // tmp убран
   });
 });
 
