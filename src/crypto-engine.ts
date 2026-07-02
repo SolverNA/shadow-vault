@@ -34,11 +34,16 @@ import { deriveMasterKey } from "./crypto/key-derivation";
 import { nodeRequire } from "./crypto/platform";
 import {
   detectFormat,
+  chunkedVersion,
   parseChunkedContainer,
-  writeChunkedHeader,
+  parseChunked2Container,
+  writeChunked2Header,
+  chunkedSegmentAAD,
   writeSegment,
   CHUNKED_HEADER_LENGTH,
+  CHUNKED2_HEADER_LENGTH,
 } from "./crypto/format";
+import { CHUNK_FILE_ID_LENGTH } from "./crypto/constants";
 
 type NodeCrypto = typeof import("crypto");
 type NodeFs = typeof import("fs");
@@ -180,7 +185,7 @@ export class NodeCryptoEngine {
 
     const size = (await fs.promises.stat(srcPath)).size;
     if (size >= CHUNKED_THRESHOLD) {
-      await this.encryptStreamChunked(srcPath, dstPath);
+      await this.encryptStreamChunked(srcPath, dstPath, size);
       return;
     }
 
@@ -227,11 +232,20 @@ export class NodeCryptoEngine {
   }
 
   /**
-   * Реально потоковое чанковое шифрование (под-формат 0x03).
+   * Реально потоковое чанковое шифрование (под-формат 0x04).
    * Читает src блоками по CHUNK_BLOCK_SIZE, каждый блок шифрует независимым
    * AES-GCM и дописывает сегмент в выход. Пиковая память ~ один блок.
+   *
+   * Связка сегментов: заголовок содержит segCount (известен заранее из stat)
+   * и случайный fileId; AAD сегмента i = заголовок ‖ u32LE(i). Если файл
+   * изменился между stat и чтением (число сегментов разошлось с заголовком) —
+   * шифрование прерывается ошибкой, битый контейнер не публикуется.
    */
-  private async encryptStreamChunked(srcPath: string, dstPath: string): Promise<void> {
+  private async encryptStreamChunked(
+    srcPath: string,
+    dstPath: string,
+    srcSize: number
+  ): Promise<void> {
     const fs = this.fs;
     const crypto = this.crypto;
     const blockSize = CHUNK_BLOCK_SIZE;
@@ -247,18 +261,30 @@ export class NodeCryptoEngine {
           ws.write(Buffer.from(data), (err) => (err ? reject(err) : resolve()));
         });
 
-      // Заголовок чанкового контейнера
-      await writeChunk(writeChunkedHeader(blockSize));
+      // Заголовок чанкового контейнера 0x04: segCount известен заранее,
+      // т.к. encryptStream уже сделал stat источника.
+      const segCount = Math.ceil(srcSize / blockSize);
+      const fileId = crypto.randomBytes(CHUNK_FILE_ID_LENGTH);
+      const header = writeChunked2Header(blockSize, segCount, fileId);
+      await writeChunk(header);
 
       // Поблочное чтение src через readStream с highWaterMark = blockSize
       const readStream = fs.createReadStream(srcPath, { highWaterMark: blockSize });
       let carry: Buffer = Buffer.alloc(0);
+      let segIndex = 0;
 
       const encryptAndWriteBlock = async (block: Buffer): Promise<void> => {
+        if (segIndex >= segCount) {
+          throw new Error(
+            "[NodeCryptoEngine] Источник вырос во время шифрования: сегментов больше, чем в заголовке"
+          );
+        }
         const iv = crypto.randomBytes(IV_LENGTH);
         const cipher = crypto.createCipheriv(ALGORITHM_NODE, this.keyBuffer!, iv, {
           authTagLength: GCM_TAG_LENGTH,
         });
+        cipher.setAAD(Buffer.from(chunkedSegmentAAD(header, segIndex)));
+        segIndex++;
         const ct = Buffer.concat([cipher.update(block), cipher.final()]);
         const tag = cipher.getAuthTag();
         const body = Buffer.concat([ct, tag]);
@@ -292,6 +318,13 @@ export class NodeCryptoEngine {
         });
       });
 
+      if (segIndex !== segCount) {
+        throw new Error(
+          "[NodeCryptoEngine] Источник изменился во время шифрования: " +
+            `записано сегментов ${segIndex}, ожидалось ${segCount}`
+        );
+      }
+
       await new Promise<void>((resolve, reject) => {
         ws.end((err?: Error | null) => (err ? reject(err) : resolve()));
       });
@@ -305,25 +338,47 @@ export class NodeCryptoEngine {
     }
   }
 
-  /** Расшифровывает чанковый контейнер (0x03) целиком в памяти. */
+  /**
+   * Расшифровывает чанковый контейнер (0x03 legacy или 0x04) целиком в памяти.
+   * Для 0x04 структура проверяется строго (segCount) и каждый сегмент
+   * аутентифицируется с AAD = заголовок ‖ индекс.
+   */
   private decryptChunkedBuffer(container: Buffer): Buffer {
     const crypto = this.crypto;
-    const { segments } = parseChunkedContainer(container);
-    const out: Buffer[] = [];
-    for (const seg of segments) {
+    const ver = chunkedVersion(container);
+
+    const decryptSegment = (
+      seg: { iv: Uint8Array; body: Uint8Array },
+      aad: Buffer | null
+    ): Buffer => {
       const tagStart = seg.body.length - GCM_TAG_LENGTH;
       const ct = seg.body.subarray(0, tagStart);
       const tag = seg.body.subarray(tagStart);
       const decipher = crypto.createDecipheriv(ALGORITHM_NODE, this.keyBuffer!, seg.iv, {
         authTagLength: GCM_TAG_LENGTH,
       });
+      if (aad) decipher.setAAD(aad);
       decipher.setAuthTag(Buffer.from(tag));
       try {
-        out.push(Buffer.concat([decipher.update(ct), decipher.final()]));
+        return Buffer.concat([decipher.update(Buffer.from(ct)), decipher.final()]);
       } catch {
         throw new Error(
           "[NodeCryptoEngine] Расшифровка чанкового сегмента не удалась (Auth Tag mismatch)"
         );
+      }
+    };
+
+    const out: Buffer[] = [];
+    if (ver === 4) {
+      const { header, segments } = parseChunked2Container(container);
+      for (let i = 0; i < segments.length; i++) {
+        out.push(decryptSegment(segments[i], Buffer.from(chunkedSegmentAAD(header, i))));
+      }
+    } else {
+      // 0x03 (legacy-чтение): сегменты без AAD, как писали старые версии.
+      const { segments } = parseChunkedContainer(container);
+      for (const seg of segments) {
+        out.push(decryptSegment(seg, null));
       }
     }
     return Buffer.concat(out);
@@ -378,6 +433,13 @@ export class NodeCryptoEngine {
   /**
    * Потоковая расшифровка чанкового контейнера: читаем заголовок, затем
    * посегментно по длинам, расшифровываем и пишем plaintext. Память ~ один блок.
+   *
+   * Поддерживает обе версии:
+   *   - 0x03 (legacy): сегменты без AAD, число сегментов не проверяется
+   *     (в формате его нет) — как писали старые версии плагина;
+   *   - 0x04: каждый сегмент проверяется с AAD = заголовок ‖ индекс, число
+   *     сегментов сверяется с segCount заголовка — усечение/перестановка/
+   *     дублирование/подстановка → ошибка целостности, не частичные данные.
    */
   private async decryptStreamChunked(srcPath: string, dstPath: string): Promise<void> {
     const fs = this.fs;
@@ -385,10 +447,30 @@ export class NodeCryptoEngine {
     const fd = await fs.promises.open(srcPath, "r");
     let ws: import("fs").WriteStream | null = null;
     try {
-      const header = Buffer.alloc(CHUNKED_HEADER_LENGTH);
-      const hr = await fd.read(header, 0, CHUNKED_HEADER_LENGTH, 0);
-      if (hr.bytesRead < CHUNKED_HEADER_LENGTH || detectFormat(header) !== "v2-chunked") {
+      const headBuf = Buffer.alloc(CHUNKED2_HEADER_LENGTH);
+      const hr = await fd.read(headBuf, 0, CHUNKED2_HEADER_LENGTH, 0);
+      const ver = chunkedVersion(headBuf.subarray(0, hr.bytesRead));
+      if (ver === null || hr.bytesRead < CHUNKED_HEADER_LENGTH) {
         throw new Error("формат: чанковый заголовок повреждён");
+      }
+
+      let header: Buffer | null = null; // полный заголовок 0x04 (для AAD)
+      let segCount = -1;
+      let pos: number;
+      if (ver === 4) {
+        if (hr.bytesRead < CHUNKED2_HEADER_LENGTH) {
+          throw new Error("формат: обрезан заголовок 0x04");
+        }
+        header = headBuf;
+        segCount =
+          (headBuf[HEADER_LENGTH + 4] |
+            (headBuf[HEADER_LENGTH + 5] << 8) |
+            (headBuf[HEADER_LENGTH + 6] << 16) |
+            (headBuf[HEADER_LENGTH + 7] << 24)) >>>
+          0;
+        pos = CHUNKED2_HEADER_LENGTH;
+      } else {
+        pos = CHUNKED_HEADER_LENGTH;
       }
 
       ws = fs.createWriteStream(dstPath);
@@ -398,10 +480,10 @@ export class NodeCryptoEngine {
           wstream.write(data, (err) => (err ? reject(err) : resolve()));
         });
 
-      let pos = CHUNKED_HEADER_LENGTH;
       const lenBuf = Buffer.alloc(4);
       // Размер файла, чтобы понять где конец.
       const total = (await fd.stat()).size;
+      let segIndex = 0;
 
       while (pos < total) {
         const lr = await fd.read(lenBuf, 0, 4, pos);
@@ -411,6 +493,9 @@ export class NodeCryptoEngine {
         pos += 4;
         if (segLen < IV_LENGTH + GCM_TAG_LENGTH || pos + segLen > total) {
           throw new Error("формат: неверная длина сегмента");
+        }
+        if (ver === 4 && segIndex >= segCount) {
+          throw new Error("формат: сегментов больше, чем заявлено в заголовке");
         }
         const seg = Buffer.alloc(segLen);
         await fd.read(seg, 0, segLen, pos);
@@ -423,7 +508,11 @@ export class NodeCryptoEngine {
         const decipher = crypto.createDecipheriv(ALGORITHM_NODE, this.keyBuffer!, iv, {
           authTagLength: GCM_TAG_LENGTH,
         });
+        if (header) {
+          decipher.setAAD(Buffer.from(chunkedSegmentAAD(header, segIndex)));
+        }
         decipher.setAuthTag(tag);
+        segIndex++;
         let plain: Buffer;
         try {
           plain = Buffer.concat([decipher.update(ct), decipher.final()]);
@@ -431,6 +520,12 @@ export class NodeCryptoEngine {
           throw new Error("сегмент: Auth Tag mismatch");
         }
         await writeOut(plain);
+      }
+
+      if (ver === 4 && segIndex !== segCount) {
+        throw new Error(
+          `формат: файл усечён — сегментов ${segIndex}, в заголовке ${segCount}`
+        );
       }
 
       await new Promise<void>((resolve, reject) => {

@@ -17,7 +17,10 @@ import {
   writeContainer,
   parseContainer,
   detectFormat,
+  chunkedVersion,
   parseChunkedContainer,
+  parseChunked2Container,
+  chunkedSegmentAAD,
 } from "./crypto/format";
 
 export class WebCryptoEngine {
@@ -103,18 +106,39 @@ export class WebCryptoEngine {
     );
   }
 
-  /** Посегментная расшифровка чанкового контейнера (0x03) через subtle.decrypt. */
+  /**
+   * Посегментная расшифровка чанкового контейнера через subtle.decrypt.
+   *   - 0x03 (legacy-чтение): сегменты без AAD — как писали старые версии;
+   *   - 0x04: строгий разбор (segCount) и AAD = заголовок ‖ индекс сегмента —
+   *     перестановка/удаление/дублирование/усечение/подстановка → ошибка.
+   */
   private async decryptChunked(buf: Uint8Array): Promise<ArrayBuffer> {
     const subtle = getSubtle();
-    const { segments } = parseChunkedContainer(buf);
+    const ver = chunkedVersion(buf);
+
+    let segments: { iv: Uint8Array; body: Uint8Array }[];
+    let header: Uint8Array | null = null;
+    if (ver === 4) {
+      const parsed = parseChunked2Container(buf);
+      segments = parsed.segments;
+      header = parsed.header;
+    } else {
+      segments = parseChunkedContainer(buf).segments;
+    }
+
     const parts: Uint8Array[] = [];
     let totalLen = 0;
-    for (const seg of segments) {
-      const plain = await subtle.decrypt(
-        { name: "AES-GCM", iv: seg.iv, tagLength: GCM_TAG_LENGTH * 8 },
-        this.key!,
-        seg.body
-      );
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i];
+      const params: AesGcmParams = {
+        name: "AES-GCM",
+        iv: seg.iv,
+        tagLength: GCM_TAG_LENGTH * 8,
+      };
+      if (header) {
+        params.additionalData = chunkedSegmentAAD(header, i);
+      }
+      const plain = await subtle.decrypt(params, this.key!, seg.body);
       const u8 = new Uint8Array(plain);
       parts.push(u8);
       totalLen += u8.length;

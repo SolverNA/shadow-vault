@@ -28,7 +28,13 @@ import * as nodePath from "path";
 import * as crypto from "crypto";
 import * as os from "os";
 import { CryptoEngine } from "./crypto-engine";
-import { detectFormat, CHUNKED_HEADER_LENGTH, SEGMENT_LEN_PREFIX } from "./crypto/format";
+import {
+  detectFormat,
+  chunkedVersion,
+  CHUNKED_HEADER_LENGTH,
+  CHUNKED2_HEADER_LENGTH,
+  SEGMENT_LEN_PREFIX,
+} from "./crypto/format";
 import { IV_LENGTH, GCM_TAG_LENGTH } from "./crypto/constants";
 import { migrateBuffer } from "./crypto/migration";
 import { isBypassPath } from "./path-utils";
@@ -1591,8 +1597,10 @@ export class ShadowVaultManager {
   /**
    * Вычисляет размер plaintext по .enc-файлу БЕЗ полной расшифровки.
    *   - v2 (0x02): plaintext = размер_файла − CRYPTO_HEADER_SIZE (33).
-   *   - v2-chunked (0x03): читаем только префиксы длин сегментов и суммируем
-   *     plaintext-длины: Σ(segLen − IV − tag). Файл целиком не читаем.
+   *   - v2-chunked (0x03 и 0x04): читаем только префиксы длин сегментов и
+   *     суммируем plaintext-длины: Σ(segLen − IV − tag). Файл целиком не читаем.
+   *     Для 0x04 дополнительно сверяем число сегментов с segCount заголовка —
+   *     усечённый файл не даёт молчаливой частичной суммы (fallback = fileSize).
    *   - 0 байт (legacy-артефакт пустого файла): plaintext = 0.
    *   - прочее/нераспознанное: грубо не искажаем — отдаём размер файла как есть.
    * @param encAbs абсолютный путь к .enc
@@ -1608,9 +1616,9 @@ export class ShadowVaultManager {
       return fileSize;
     }
     try {
-      // Читаем заголовок для детекта формата.
-      const head = Buffer.alloc(CHUNKED_HEADER_LENGTH);
-      const { bytesRead } = await fh.read(head, 0, CHUNKED_HEADER_LENGTH, 0);
+      // Читаем заголовок для детекта формата (29 байт хватает обеим версиям).
+      const head = Buffer.alloc(CHUNKED2_HEADER_LENGTH);
+      const { bytesRead } = await fh.read(head, 0, CHUNKED2_HEADER_LENGTH, 0);
       const fmt = detectFormat(head.subarray(0, bytesRead));
 
       if (fmt === "v2") {
@@ -1621,9 +1629,17 @@ export class ShadowVaultManager {
       if (fmt === "v2-chunked") {
         // Суммируем plaintext-длины сегментов по их u32-префиксам, читая
         // только 4 байта на сегмент (тело файла не читаем).
+        const ver = chunkedVersion(head.subarray(0, bytesRead));
+        const strict = ver === 4;
+        if (strict && bytesRead < CHUNKED2_HEADER_LENGTH) return fileSize; // обрезан заголовок
+        const expectedSegs = strict
+          ? (head[9] | (head[10] << 8) | (head[11] << 16) | (head[12] << 24)) >>> 0
+          : -1;
+
         const SEG_OVERHEAD = IV_LENGTH + GCM_TAG_LENGTH; // IV + GCM-tag на сегмент
-        let off = CHUNKED_HEADER_LENGTH;
+        let off = strict ? CHUNKED2_HEADER_LENGTH : CHUNKED_HEADER_LENGTH;
         let plaintext = 0;
+        let segs = 0;
         const lenBuf = Buffer.alloc(SEGMENT_LEN_PREFIX);
         for (;;) {
           if (off + SEGMENT_LEN_PREFIX > fileSize) break;
@@ -1633,7 +1649,12 @@ export class ShadowVaultManager {
             (lenBuf[0] | (lenBuf[1] << 8) | (lenBuf[2] << 16) | (lenBuf[3] << 24)) >>> 0;
           if (segLen < SEG_OVERHEAD) break; // защита от битого заголовка
           plaintext += segLen - SEG_OVERHEAD;
+          segs++;
           off += SEGMENT_LEN_PREFIX + segLen;
+        }
+        if (strict && (segs !== expectedSegs || off !== fileSize)) {
+          // Усечение/повреждение 0x04 — не отдаём частичную сумму.
+          return fileSize;
         }
         return plaintext;
       }
