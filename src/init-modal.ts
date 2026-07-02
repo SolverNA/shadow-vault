@@ -18,7 +18,7 @@
 
 import { App, Modal } from "obsidian";
 import { PluginSettings, isValidEmail } from "./types";
-import { AuthService, AuthResult, PasswordError, SettingsCorruptedError, SaveSettingsFn } from "./auth-service";
+import { AuthService, AuthResult, PasswordError, SettingsCorruptedError, SaveSettingsFn, FirstRunPasswordValidator } from "./auth-service";
 import { createPasswordField } from "./password-field";
 import { PinStore, PinError, PinLockoutError } from "./pin-store";
 import { createCryptoEngine } from "./crypto/factory";
@@ -36,6 +36,11 @@ export class InitModal extends Modal {
   private orphanVault: boolean;
   /** Текущий экран (только для orphan-режима) */
   private orphanScreen: OrphanScreen = "choice";
+  /**
+   * Проверка first-run-пароля по существующим .enc (защита от отравления
+   * verificationBlob). Внедряется из main.ts; null — без проверки (тесты).
+   */
+  private firstRunValidator: FirstRunPasswordValidator | null;
 
   private pinStore: PinStore;
   /** true — на экране разблокировки показан ввод PIN вместо пароля */
@@ -58,7 +63,8 @@ export class InitModal extends Modal {
     settings: PluginSettings,
     saveFn: SaveSettingsFn,
     onUnlock: UnlockCallback,
-    orphanVault = false
+    orphanVault = false,
+    firstRunValidator: FirstRunPasswordValidator | null = null
   ) {
     super(app);
     this.settings = settings;
@@ -66,6 +72,7 @@ export class InitModal extends Modal {
     this.onUnlock = onUnlock;
     this.authService = new AuthService();
     this.orphanVault = orphanVault;
+    this.firstRunValidator = firstRunValidator;
     this.pinStore = new PinStore();
     // Если на устройстве настроен PIN — по умолчанию предлагаем вход по PIN.
     this.pinMode = this.pinStore.isPinSet() && settings.verificationBlob !== null && !orphanVault;
@@ -419,11 +426,17 @@ export class InitModal extends Modal {
     this.setLoading(true);
 
     try {
+      // Валидатор first-run-пароля (trial-decrypt существующих .enc) НЕ
+      // применяется только в явном orphan-create: пользователь на экране
+      // выбора сознательно согласился создать новое хранилище — старые .enc
+      // с новым паролем заведомо не расшифруются, это не опечатка.
+      const isOrphanCreate = this.orphanVault && this.orphanScreen === "create";
       const result = await this.authService.authenticate(
         email,
         password,
         this.settings,
-        this.saveFn
+        this.saveFn,
+        isOrphanCreate ? undefined : this.firstRunValidator ?? undefined
       );
 
       this.inputPassword.value = "";

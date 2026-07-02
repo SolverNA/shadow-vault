@@ -307,3 +307,115 @@ describe("AuthService — mobile (WebCryptoEngine, без глобального
     }
   });
 });
+
+// ─────────────────────────────────────────────
+// Orphan-защита: firstRunValidator против «отравления» verificationBlob
+// ─────────────────────────────────────────────
+
+describe("AuthService — защита от отравления verificationBlob (orphan-сценарий)", () => {
+  /**
+   * Готовит «осиротевшее» хранилище: шифрует образец правильным паролем
+   * (это наш .enc на диске), data.json считается утерянным (blob = null).
+   */
+  async function makeOrphanEnc(correctPassword: string): Promise<Uint8Array> {
+    const svc = new AuthService();
+    const { fn } = makeSaveFn();
+    const { engine } = await svc.authenticate(TEST_EMAIL, correctPassword, DEFAULT_SETTINGS, fn);
+    const enc = engine.encryptBuffer(Buffer.from("содержимое старой заметки"));
+    engine.destroy();
+    return new Uint8Array(enc);
+  }
+
+  /**
+   * Валидатор как в main.ts: trial-decrypt существующего .enc деривированным
+   * движком. true — расшифровался, false — нет (значит пароль неверный).
+   */
+  function makeValidator(encSample: Uint8Array) {
+    return async (engine: { decryptBuffer(b: Uint8Array): unknown }): Promise<boolean | null> => {
+      try {
+        await Promise.resolve(engine.decryptBuffer(encSample));
+        return true;
+      } catch {
+        return false;
+      }
+    };
+  }
+
+  it("есть .enc + нет blob + НЕВЕРНЫЙ пароль → PasswordError, blob НЕ записан", async () => {
+    const encSample = await makeOrphanEnc("correct-password");
+
+    const svc = new AuthService();
+    const { fn, lastSaved } = makeSaveFn();
+
+    await expect(
+      svc.authenticate(TEST_EMAIL, "wrong-password", DEFAULT_SETTINGS, fn, makeValidator(encSample))
+    ).rejects.toThrow(PasswordError);
+
+    // Главное: настройки НЕ сохранены — «отравленный» blob не записан.
+    expect(fn).not.toHaveBeenCalled();
+    expect(lastSaved()).toBeNull();
+  });
+
+  it("есть .enc + нет blob + ВЕРНЫЙ пароль → blob записан, вход успешен", async () => {
+    const encSample = await makeOrphanEnc("correct-password");
+
+    const svc = new AuthService();
+    const { fn, lastSaved } = makeSaveFn();
+
+    const result = await svc.authenticate(
+      TEST_EMAIL, "correct-password", DEFAULT_SETTINGS, fn, makeValidator(encSample)
+    );
+
+    expect(result.isFirstRun).toBe(true);
+    expect(result.engine.isUnlocked()).toBe(true);
+    expect(lastSaved()!.verificationBlob).toBeTruthy();
+
+    // И ключ действительно расшифровывает старые данные.
+    const dec = result.engine.decryptBuffer(encSample);
+    expect(Buffer.from(dec).toString("utf8")).toBe("содержимое старой заметки");
+    result.engine.destroy();
+  });
+
+  it("настоящий first-run (валидатор вернул null — .enc нет) → blob создаётся как раньше", async () => {
+    const svc = new AuthService();
+    const { fn, lastSaved } = makeSaveFn();
+    const validator = jest.fn(async () => null as boolean | null);
+
+    const result = await svc.authenticate(
+      TEST_EMAIL, "brand-new-password", DEFAULT_SETTINGS, fn, validator
+    );
+
+    expect(validator).toHaveBeenCalledTimes(1);
+    expect(result.isFirstRun).toBe(true);
+    expect(lastSaved()!.verificationBlob).toBeTruthy();
+    expect(lastSaved()!.email).toBe(TEST_EMAIL);
+    result.engine.destroy();
+  });
+
+  it("после отклонения неверного пароля ВЕРНЫЙ пароль по-прежнему проходит (нет lockout)", async () => {
+    const encSample = await makeOrphanEnc("correct-password");
+    const svc = new AuthService();
+    const { fn, lastSaved } = makeSaveFn();
+
+    await expect(
+      svc.authenticate(TEST_EMAIL, "typo-password", DEFAULT_SETTINGS, fn, makeValidator(encSample))
+    ).rejects.toThrow(PasswordError);
+
+    // Повторная попытка с правильным паролем — успех (blob не был отравлен).
+    const result = await svc.authenticate(
+      TEST_EMAIL, "correct-password", DEFAULT_SETTINGS, fn, makeValidator(encSample)
+    );
+    expect(result.isFirstRun).toBe(true);
+    expect(lastSaved()!.verificationBlob).toBeTruthy();
+    result.engine.destroy();
+  });
+
+  it("без валидатора (не внедрён) поведение прежнее — blob создаётся сразу", async () => {
+    const svc = new AuthService();
+    const { fn, lastSaved } = makeSaveFn();
+    const result = await svc.authenticate(TEST_EMAIL, "any-password", DEFAULT_SETTINGS, fn);
+    expect(result.isFirstRun).toBe(true);
+    expect(lastSaved()!.verificationBlob).toBeTruthy();
+    result.engine.destroy();
+  });
+});

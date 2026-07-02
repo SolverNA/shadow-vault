@@ -38,6 +38,8 @@ import { InitModal } from "./init-modal";
 import { PinStore } from "./pin-store";
 import { deriveMasterKey } from "./crypto/key-derivation";
 import { FORMAT_VERSION } from "./crypto/constants";
+import { detectFormat } from "./crypto/format";
+import type { AnyCryptoEngine } from "./crypto/factory";
 // Desktop-only модули грузятся ЛЕНИВО (await import) только в desktop-ветке
 // onUnlockDesktop — их top-level node-импорты не должны выполняться на mobile.
 import type { ShadowVaultManager } from "./shadow-vault-manager";
@@ -155,7 +157,7 @@ export default class ShadowVaultPlugin extends Plugin {
 
     // Показываем модал ввода пароля когда workspace готов к отображению UI
     this.app.workspace.onLayoutReady(() => {
-      this.openInitModal();
+      void this.openInitModal();
     });
 
     this.logger.debug("main", "onload: завершён, ожидаем пароль");
@@ -325,7 +327,7 @@ export default class ShadowVaultPlugin extends Plugin {
   async lockVault(): Promise<void> {
     await this.shutdown();
     // После блокировки показываем модал повторно (без перезапуска Obsidian)
-    this.openInitModal();
+    await this.openInitModal();
   }
 
   isUnlocked(): boolean {
@@ -620,13 +622,13 @@ export default class ShadowVaultPlugin extends Plugin {
   // Инициализация после успешной аутентификации
   // ═══════════════════════════════════════════════════════════════════════
 
-  private openInitModal(): void {
+  private async openInitModal(): Promise<void> {
     // Детекция: verificationBlob отсутствует (плагин считает что это первый
     // запуск), но в оригинале уже лежат .enc файлы. Значит data.json утерян —
     // нужно предупредить и предложить выбор: восстановить старым паролем или
     // создать новое хранилище (старые .enc станут недоступны).
     const orphanVault =
-      this.settings.verificationBlob === null && this.detectEncryptedFiles();
+      this.settings.verificationBlob === null && (await this.detectEncryptedFiles());
     if (orphanVault) {
       console.warn(
         "[ShadowVault] orphan vault: .enc найдены, verificationBlob отсутствует"
@@ -638,40 +640,170 @@ export default class ShadowVaultPlugin extends Plugin {
       this.settings,
       (s) => this.saveSettings(s),
       (result) => { void this.onUnlock(result); },
-      orphanVault
+      orphanVault,
+      // Защита от отравления verificationBlob: на first-run пароль проверяется
+      // trial-decrypt'ом существующего .enc ДО записи блоба (обе платформы).
+      (engine, password) => this.validateFirstRunPassword(engine, password)
     ).open();
   }
 
   /**
-   * Синхронно сканирует корень оригинального vault на наличие .enc файлов.
+   * Сканирует хранилище на наличие .enc файлов (кросс-платформенно).
    * Используется для детекции orphan-vault — когда verificationBlob отсутствует
    * (плагин думает что это первый запуск), но .enc на диске уже есть.
    */
-  private detectEncryptedFiles(): boolean {
-    const basePath = this.getVaultBasePath();
-    if (!basePath) return false;
+  private async detectEncryptedFiles(): Promise<boolean> {
     try {
-      return this.scanDirForEnc(basePath, 3); // глубина 3 уровня — для скорости
+      return (await this.findEncryptedFiles(1)).length > 0;
     } catch {
       return false;
     }
   }
 
-  private scanDirForEnc(absDir: string, depth: number): boolean {
-    if (depth < 0) return false;
+  /**
+   * Собирает до `limit` путей .enc-файлов хранилища.
+   *   - Desktop: синхронный обход fs от basePath (пути АБСОЛЮТНЫЕ).
+   *   - Mobile: BFS через adapter.list (пути vault-относительные). Адаптер в
+   *     этот момент ещё НЕ пропатчен (unlock не завершён; AdapterPatcher.patch
+   *     ставится позже в onUnlockMobile Phase 5), поэтому list/readBinary видят
+   *     реальные .enc. Если стоит ранний патч list (patchListEarly) — берём
+   *     сохранённый оригинал earlyListOriginal.
+   * Глубина ограничена (одинаково на обеих платформах) — компромисс скорости;
+   * детекция и валидация пароля используют ОДИН сканер, поэтому согласованы.
+   */
+  private async findEncryptedFiles(limit: number): Promise<string[]> {
+    const out: string[] = [];
+    if (this.isDesktop) {
+      const basePath = this.getVaultBasePath();
+      if (!basePath) return out;
+      this.collectEncDesktop(basePath, 3, limit, out); // глубина 3 — для скорости
+      return out;
+    }
+    return this.findEncFilesMobile(limit);
+  }
+
+  private collectEncDesktop(absDir: string, depth: number, limit: number, out: string[]): void {
+    if (depth < 0 || out.length >= limit) return;
     const fs = nfs();
     let entries: import("fs").Dirent[];
     try {
       entries = fs.readdirSync(absDir, { withFileTypes: true });
-    } catch { return false; }
+    } catch { return; }
     for (const e of entries) {
+      if (out.length >= limit) return;
       if (e.name.startsWith(".")) continue;
-      if (e.isFile() && e.name.endsWith(ENCRYPTED_EXT)) return true;
-      if (e.isDirectory() && this.scanDirForEnc(npath().join(absDir, e.name), depth - 1)) {
-        return true;
+      if (e.isFile() && e.name.endsWith(ENCRYPTED_EXT)) {
+        out.push(npath().join(absDir, e.name));
+      } else if (e.isDirectory()) {
+        this.collectEncDesktop(npath().join(absDir, e.name), depth - 1, limit, out);
       }
     }
-    return false;
+  }
+
+  /**
+   * Mobile: поиск .enc через adapter.list BFS. Компромисс производительности:
+   * глубина ≤ 3 (как на desktop) и не более 200 просмотренных папок — на
+   * типичных хранилищах этого достаточно, а полный рекурсивный обход на
+   * мобильном I/O может занимать секунды. configDir и dot-папки пропускаются.
+   */
+  private async findEncFilesMobile(limit: number): Promise<string[]> {
+    const adapter = this.app.vault.adapter;
+    const listFn: (p: string) => Promise<ListedFiles> =
+      this.earlyListOriginal ?? ((p: string) => adapter.list(p));
+    const configDir = this.app.vault.configDir;
+    const out: string[] = [];
+    const MAX_DEPTH = 3;
+    const MAX_DIRS = 200;
+    const queue: Array<{ dir: string; depth: number }> = [{ dir: "", depth: 0 }];
+    let visited = 0;
+    while (queue.length > 0 && out.length < limit && visited < MAX_DIRS) {
+      const { dir, depth } = queue.shift()!;
+      visited++;
+      let listed: ListedFiles;
+      try {
+        listed = await listFn(dir);
+      } catch { continue; }
+      for (const f of listed.files) {
+        if (f.endsWith(ENCRYPTED_EXT)) {
+          out.push(f);
+          if (out.length >= limit) break;
+        }
+      }
+      if (depth >= MAX_DEPTH) continue;
+      for (const sub of listed.folders) {
+        const name = sub.split("/").pop() ?? "";
+        if (name.startsWith(".")) continue;
+        if (sub === configDir || sub.startsWith(configDir + "/")) continue;
+        queue.push({ dir: sub, depth: depth + 1 });
+      }
+    }
+    return out;
+  }
+
+  /** Читает .enc-образец: desktop — node fs (абсолютный путь), mobile — adapter. */
+  private async readEncSample(path: string): Promise<Uint8Array> {
+    if (this.isDesktop) {
+      return new Uint8Array(await nfsp().readFile(path));
+    }
+    return new Uint8Array(await this.app.vault.adapter.readBinary(path));
+  }
+
+  /**
+   * Валидатор пароля «первого запуска» (внедряется в AuthService.authenticate
+   * через InitModal). Вызывается ДО создания verificationBlob:
+   *   - true  — существующий v2 .enc расшифровался ключом engine (или legacy
+   *             .enc расшифровался паролем) → пароль верный, blob можно писать;
+   *   - false — реальный .enc НЕ расшифровался → пароль неверный, blob НЕ писать
+   *             (иначе перманентный lockout — «отравление» блоба);
+   *   - null  — .enc-файлов нет → настоящий first-run, blob создаётся как раньше.
+   * Логика зеркалит ShadowVaultManager.validateV2Password, но работает ДО
+   * создания менеджеров (на этапе InitModal) и на обеих платформах.
+   */
+  private async validateFirstRunPassword(
+    engine: AnyCryptoEngine,
+    password: string
+  ): Promise<boolean | null> {
+    let candidates: string[];
+    try {
+      candidates = await this.findEncryptedFiles(24);
+    } catch {
+      return null; // сканер недоступен — не блокируем (как прежнее поведение)
+    }
+    if (candidates.length === 0) return null;
+
+    let legacySample: Uint8Array | null = null;
+    for (const p of candidates) {
+      let buf: Uint8Array;
+      try {
+        buf = await this.readEncSample(p);
+      } catch { continue; } // нечитаемый — к следующему
+      const fmt = detectFormat(buf);
+      if (fmt === "v2" || fmt === "v2-chunked") {
+        try {
+          await Promise.resolve(engine.decryptBuffer(buf));
+          this.logger.info("auth", "first-run валидация: v2 .enc расшифрован", { sample: p });
+          return true;
+        } catch {
+          this.logger.warn("auth", "first-run валидация: v2 .enc НЕ расшифрован — неверный пароль", { sample: p });
+          return false; // GCM auth fail → точно неверный пароль
+        }
+      }
+      if ((fmt === "legacy-node" || fmt === "legacy-web") && !legacySample) {
+        legacySample = buf; // придержим на случай отсутствия v2-образцов
+      }
+    }
+
+    // v2-образцов нет, но есть legacy: проверяем пароль legacy-декриптом —
+    // иначе неверный пароль отравил бы blob ещё ДО legacy-миграции.
+    if (legacySample) {
+      const { probeLegacyPassword } = await import("./crypto/migration");
+      const probe = await probeLegacyPassword(legacySample, password);
+      this.logger.info("auth", "first-run валидация: legacy-проба", { status: probe.status });
+      if (probe.status === "LEGACY_OK") return true;
+      if (probe.status === "LEGACY_WRONG_PASSWORD") return false;
+    }
+
+    return null; // решающих образцов нет (пустые/битые) — не блокируем
   }
 
   /**
