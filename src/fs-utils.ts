@@ -20,6 +20,27 @@ export const CRYPTO_HEADER_SIZE = 33;
 /** Суффикс зашифрованных файлов в оригинальном хранилище */
 export const ENCRYPTED_EXT = ".enc";
 
+/**
+ * Допуск (мс) при сравнении mtime shadow-файла с mtime его .enc: shadow
+ * считается «несхороненным», если shadow.mtime > enc.mtime + допуск.
+ * Единая константа для sync-дошифровки при закрытии (shadow-vault-manager)
+ * и crash recovery (session-manager) — раньше значения расходились в 20 раз
+ * (1000 мс против 50 мс), и секундный допуск открывал окно тихой потери
+ * правки, сделанной менее чем за 1 с до закрытия Obsidian.
+ *
+ * Почему именно 50 мс, а не строгое сравнение (0):
+ *   - .enc всегда пишется ПОСЛЕ shadow (encryptOne читает shadow → пишет .enc),
+ *     поэтому у реально дошифрованного файла enc.mtime >= shadow.mtime;
+ *   - но ensureDecrypted() копирует mtime .enc в shadow через utimes, и
+ *     round-trip stat→utimes→stat (double-секунды libuv ↔ наносекунды ФС)
+ *     может сдвинуть shadow.mtime на доли мс В ОБЕ стороны. Строгое сравнение
+ *     тогда пометило бы каждый расшифрованный, но не изменённый файл как
+ *     «несхороненный» → полная пере-шифровка vault при каждом закрытии.
+ *   50 мс с запасом гасят эту погрешность, но на порядки меньше любого
+ *   реального интервала «autosave → закрытие окна».
+ */
+export const MTIME_TOLERANCE_MS = 50;
+
 /** Возвращает true если по абсолютному пути существует файл/папка */
 export async function fileExists(absPath: string): Promise<boolean> {
   try {

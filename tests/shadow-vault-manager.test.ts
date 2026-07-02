@@ -1194,6 +1194,43 @@ describe("ShadowVaultManager — encryptUnsyncedChangesSync / hasUnsyncedChanges
     } finally { env.cleanup(); }
   });
 
+  it("правка за <1с до закрытия (shadow новее .enc на ~800мс) не теряется", async () => {
+    // Регрессия: допуск был 1000мс, и правка, записанная autosave'ом менее чем
+    // через секунду после последнего encryptOne, тихо терялась при закрытии.
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "late.md", "v1");
+      await env.manager.decryptAllToShadow();
+
+      // .enc «зашифрован» в момент T, autosave записал shadow в T+800мс
+      const enc = nodePath.join(env.origRoot, "late.md.enc");
+      const shadow = nodePath.join(env.shadowRoot, "late.md");
+      fs.writeFileSync(shadow, "v2 за 800мс до закрытия");
+      const sStat = fs.statSync(shadow);
+      const encTime = new Date(sStat.mtimeMs - 800);
+      fs.utimesSync(enc, encTime, encTime);
+
+      expect(env.manager.hasUnsyncedChangesSync()).toBe(true);
+      const r = env.manager.encryptUnsyncedChangesSync();
+      expect(r.failed).toHaveLength(0);
+      expect(r.encrypted).toBeGreaterThanOrEqual(1);
+      expect(env.engine.decryptBuffer(fs.readFileSync(enc)).toString("utf8"))
+        .toBe("v2 за 800мс до закрытия");
+    } finally { env.cleanup(); }
+  });
+
+  it("shadow с mtime внутри допуска (== .enc после ensureDecrypted) — синхронизирован", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "clean.md", "untouched");
+      await env.manager.decryptAllToShadow();
+      // decryptAllToShadow/ensureDecrypted копирует mtime .enc в shadow —
+      // не изменённый файл не должен считаться несхороненным (иначе полная
+      // пере-шифровка vault на каждом закрытии)
+      expect(env.manager.hasUnsyncedChangesSync()).toBe(false);
+    } finally { env.cleanup(); }
+  });
+
   it("новый файл в shadow без .enc считается несхороненным и шифруется", async () => {
     const env = await makeEnv();
     try {
@@ -1331,6 +1368,62 @@ describe("ShadowVaultManager — reEncryptAll (смена ключа)", () => {
       await env.manager.reEncryptAll(newEngine, () => {});
       expect(fs.existsSync(nodePath.join(env.origRoot, "x.md.enc.new"))).toBe(false);
       expect(fs.existsSync(nodePath.join(env.origRoot, "x.md.enc"))).toBe(true);
+      newEngine.destroy();
+    } finally { env.cleanup(); }
+  });
+
+  it("переключает активный движок на новый: encryptOne после смены пишет НОВЫМ ключом", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "a.md", "alpha");
+
+      const newEngine = new CryptoEngine();
+      await newEngine.deriveKey("test@test.local", "new-password");
+      await env.manager.reEncryptAll(newEngine, () => {});
+
+      // Активный движок менеджера — новый; старый ключ уничтожен.
+      expect(env.manager.getEngine()).toBe(newEngine);
+      expect(() => env.engine.encryptBuffer(Buffer.from("x"))).toThrow();
+
+      // Autosave ПОСЛЕ смены пароля (modify → encryptOne) шифрует новым ключом.
+      const shadowFile = nodePath.join(env.shadowRoot, "note.md");
+      await fsp.writeFile(shadowFile, "after-rekey", "utf8");
+      await env.manager.encryptOne("note.md");
+
+      const enc = await fsp.readFile(nodePath.join(env.origRoot, "note.md.enc"));
+      expect(newEngine.decryptBuffer(enc).toString("utf8")).toBe("after-rekey");
+      newEngine.destroy();
+    } finally { env.cleanup(); }
+  });
+
+  it("гейтит encryptOne во время пере-шифровки и дошифровывает отложенное новым ключом", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "a.md", "alpha");
+      await writeEncrypted(env, "b.md", "beta");
+
+      const newEngine = new CryptoEngine();
+      await newEngine.deriveKey("test@test.local", "new-password");
+
+      // Правка «a.md» прилетает ПОСЕРЕДИНЕ пере-шифровки (через onProgress).
+      let injected = false;
+      await env.manager.reEncryptAll(newEngine, (done) => {
+        if (!injected && done >= 1) {
+          injected = true;
+          fs.writeFileSync(nodePath.join(env.shadowRoot, "a.md"), "edited-during-rekey");
+          void env.manager.encryptOne("a.md"); // должен отложиться, НЕ писать старым ключом
+        }
+      });
+      expect(injected).toBe(true);
+
+      // Дожидаемся дошифровки отложенных путей.
+      await env.manager.drainPending();
+
+      // Правка не потеряна и зашифрована НОВЫМ ключом.
+      const encA = await fsp.readFile(nodePath.join(env.origRoot, "a.md.enc"));
+      expect(newEngine.decryptBuffer(encA).toString("utf8")).toBe("edited-during-rekey");
+      const encB = await fsp.readFile(nodePath.join(env.origRoot, "b.md.enc"));
+      expect(newEngine.decryptBuffer(encB).toString("utf8")).toBe("beta");
       newEngine.destroy();
     } finally { env.cleanup(); }
   });

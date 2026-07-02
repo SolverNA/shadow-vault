@@ -24,7 +24,7 @@ import * as fs from "fs";
 import * as nodePath from "path";
 import * as os from "os";
 import { CryptoEngine } from "./crypto-engine";
-import { atomicWrite, fileExists } from "./fs-utils";
+import { MTIME_TOLERANCE_MS, atomicWrite, fileExists } from "./fs-utils";
 import { checkFileIntegrity, compareSemantic } from "./integrity-check";
 import type { Logger } from "./logger";
 
@@ -211,7 +211,7 @@ export class SessionManager {
    *
    * Алгоритм:
    *   Этап 0 (фильтр): берём только файлы, чей shadow строго новее оригинала
-   *     (с допуском 50 мс на погрешность ФС).
+   *     (с допуском MTIME_TOLERANCE_MS на погрешность ФС).
    *   Этап 1 (semantic): расшифровываем оригинал и сравниваем побайтово с shadow.
    *     Идентичны → пропускаем (нет реальных изменений несмотря на mtime).
    *     Различаются → переходим к Этапу 2.
@@ -234,7 +234,6 @@ export class SessionManager {
     }
 
     const shadowFiles = await this.scanShadowFiles();
-    const TOLERANCE_MS = 50;
 
     for (const normalizedPath of shadowFiles) {
       const shadowAbs      = nodePath.join(this.shadowRoot,   ...normalizedPath.split("/"));
@@ -245,7 +244,7 @@ export class SessionManager {
         const shadowStat   = await fsp.stat(shadowAbs);
         const originalStat = await fsp.stat(originalEncAbs).catch(() => null);
 
-        if (originalStat && shadowStat.mtimeMs <= originalStat.mtimeMs + TOLERANCE_MS) {
+        if (originalStat && shadowStat.mtimeMs <= originalStat.mtimeMs + MTIME_TOLERANCE_MS) {
           continue;
         }
 

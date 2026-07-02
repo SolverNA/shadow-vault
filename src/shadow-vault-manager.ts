@@ -37,6 +37,7 @@ import { IDataAdapter, AdapterStat, DataWriteOptions, ListedFiles } from "./adap
 import {
   CRYPTO_HEADER_SIZE,
   ENCRYPTED_EXT,
+  MTIME_TOLERANCE_MS,
   atomicWrite,
   ensureSymlink,
   fileExists,
@@ -60,7 +61,8 @@ function bulkConcurrency(): number {
 }
 
 export class ShadowVaultManager {
-  private readonly engine: CryptoEngine;
+  /** Активный движок шифрования. НЕ readonly: reEncryptAll (смена пароля) переключает его на новый ключ. */
+  private engine: CryptoEngine;
   /** Абсолютный путь к оригинальному (зашифрованному) хранилищу */
   readonly originalRoot: string;
   /** Абсолютный путь к теневому (расшифрованному) хранилищу */
@@ -252,6 +254,15 @@ export class ShadowVaultManager {
    */
   private pendingWrites: Set<Promise<unknown>> = new Set();
 
+  /** true пока идёт reEncryptAll (смена пароля): write-through приостановлен. */
+  private rekeyInProgress = false;
+
+  /**
+   * Пути, чьи encryptOne были отложены на время reEncryptAll.
+   * Дошифровываются в flushDeferredAfterRekey() уже АКТИВНЫМ движком.
+   */
+  private deferredDuringRekey: Set<string> = new Set();
+
   /**
    * Регистрирует promise write-through в набор pendingWrites и
    * саморегистрирует его удаление по завершении (успех или ошибка).
@@ -333,9 +344,11 @@ export class ShadowVaultManager {
             // .enc нет вовсе — файл создан в shadow и не зашифрован → несхороненное
             return true;
           }
-          // mtime shadow заметно новее .enc → правка не дошифрована.
-          // Допуск 1с компенсирует разрешение mtime ФС и порядок записи.
-          if (sStat.mtimeMs > eStat.mtimeMs + 1000) {
+          // mtime shadow новее .enc → правка не дошифрована. Допуск малый
+          // и общий с crash recovery (см. MTIME_TOLERANCE_MS в fs-utils):
+          // секундный допуск здесь тихо терял правку, сделанную за <1с
+          // до закрытия (in-flight encryptOne не успевал обновить .enc).
+          if (sStat.mtimeMs > eStat.mtimeMs + MTIME_TOLERANCE_MS) {
             return true;
           }
         } catch {
@@ -393,7 +406,8 @@ export class ShadowVaultManager {
         }
         try {
           const eStat = fs.statSync(encAbs);
-          needs = sStat.mtimeMs > eStat.mtimeMs + 1000;
+          // Тот же допуск, что в hasUnsyncedChangesSync и crash recovery
+          needs = sStat.mtimeMs > eStat.mtimeMs + MTIME_TOLERANCE_MS;
         } catch {
           needs = true; // .enc отсутствует
         }
@@ -431,6 +445,14 @@ export class ShadowVaultManager {
    * последовательных save'а на одном файле обработаются строго по порядку.
    */
   async encryptOne(normalizedPath: string): Promise<void> {
+    if (this.rekeyInProgress) {
+      // Смена пароля: запись .enc текущим (старым) ключом поверх уже
+      // пере-шифрованных файлов недопустима — файл стал бы нечитаем новым
+      // паролем. Откладываем путь: flushDeferredAfterRekey() дошифрует его
+      // после переключения на новый движок.
+      this.deferredDuringRekey.add(normalizedPath);
+      return;
+    }
     const previous = this.encryptLocks.get(normalizedPath) ?? Promise.resolve();
     const next = previous.then(
       () => this.encryptOneInner(normalizedPath),
@@ -1085,11 +1107,39 @@ export class ShadowVaultManager {
    *            После успешного переименования всех файлов оригинал заменён новым.
    *
    * Настройки (verificationBlob) обновляются снаружи ПОСЛЕ успеха.
+   *
+   * ПОСЛЕ успеха менеджер переключает this.engine на newEngine (владение
+   * newEngine переходит менеджеру, старый ключ уничтожается) — иначе каждый
+   * последующий write-through/encrypt-back писал бы .enc СТАРЫМ ключом поверх
+   * пере-шифрованных файлов, делая их нечитаемыми новым паролем.
+   * На время пере-шифровки encryptOne гейтится (см. rekeyInProgress).
    */
   async reEncryptAll(
     newEngine: CryptoEngine,
     onProgress?: (done: number, total: number) => void
   ): Promise<void> {
+    // Гейт write-through: modify-события на время пере-шифровки откладываются,
+    // чтобы .enc не перезаписывались старым ключом (см. encryptOne).
+    this.rekeyInProgress = true;
+    try {
+      await this.reEncryptAllInner(newEngine, onProgress);
+    } finally {
+      this.rekeyInProgress = false;
+      // Дошифровываем отложенные правки уже АКТИВНЫМ движком: при успехе —
+      // новым ключом, при откате (throw до свапа) — по-прежнему старым,
+      // что консистентно с откаченными .enc.
+      this.flushDeferredAfterRekey();
+    }
+  }
+
+  private async reEncryptAllInner(
+    newEngine: CryptoEngine,
+    onProgress?: (done: number, total: number) => void
+  ): Promise<void> {
+    // Дожидаемся in-flight записей старым ключом ДО снапшота .enc — иначе
+    // пере-шифровка могла бы прочитать ещё пишущийся (torn) файл.
+    await this.drainPending();
+
     const encFiles = await this.scanEncryptedFiles();
     const total = encFiles.length;
 
@@ -1142,7 +1192,37 @@ export class ShadowVaultManager {
       onProgress?.(total + i + 1, total * 2);
     }
 
+    // Переключаем активный движок на новый ключ (как mobile-версия в
+    // VirtualShadowManager.reEncryptAll): все последующие encryptOne и
+    // финальный encrypt-back в shutdown шифруют НОВЫМ ключом.
+    // Старый ключ уничтожаем сразу — destroy() идемпотентен, повторный
+    // destroy того же движка из SessionManager.endSession безопасен.
+    const oldEngine = this.engine;
+    this.engine = newEngine;
+    oldEngine.destroy();
+
     this.logger?.debug("shadow", "пере-шифровка завершена", { files: total });
+  }
+
+  /**
+   * Дошифровывает пути, чьи encryptOne были отложены гейтом rekeyInProgress.
+   * Fire-and-forget через trackPending — drainPending()/shutdown их дождётся.
+   */
+  private flushDeferredAfterRekey(): void {
+    if (this.deferredDuringRekey.size === 0) return;
+    const paths = [...this.deferredDuringRekey];
+    this.deferredDuringRekey.clear();
+    this.logger?.debug("shadow", "дошифровка отложенных на время пере-шифровки", { files: paths.length });
+    for (const normalizedPath of paths) {
+      void this.trackPending(
+        this.encryptOne(normalizedPath).catch((err) => {
+          this.logger?.error("shadow", "отложенный encryptOne после пере-шифровки не удался", {
+            path: normalizedPath,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        })
+      );
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════
