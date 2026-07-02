@@ -92,10 +92,11 @@ export class AuthService {
       await engine.deriveKey(email, password);
 
       // Шифруем маркер верификации — чтобы при следующем входе можно было
-      // проверить пароль, не расшифровывая реальные файлы
+      // проверить пароль, не расшифровывая реальные файлы.
+      // TextEncoder вместо Buffer: на mobile (Capacitor) глобального Buffer нет.
       const verificationBytes = toBytes(
         await Promise.resolve(
-          engine.encryptBuffer(Buffer.from(VERIFICATION_PLAINTEXT, "utf8") as Uint8Array)
+          engine.encryptBuffer(new TextEncoder().encode(VERIFICATION_PLAINTEXT))
         )
       );
 

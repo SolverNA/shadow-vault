@@ -9,6 +9,8 @@
 import { describe, it, expect, jest } from "@jest/globals";
 import { AuthService, PasswordError, SettingsCorruptedError } from "../src/auth-service";
 import { DEFAULT_SETTINGS, PluginSettings } from "../src/types";
+import * as cryptoFactory from "../src/crypto/factory";
+import { WebCryptoEngine } from "../src/web-crypto-engine";
 
 /** Email для тестов — фиксированная соль деривации. */
 const TEST_EMAIL = "test@vault.local";
@@ -265,5 +267,43 @@ describe("AuthService — сквозные сценарии", () => {
     const dec = engine2.decryptBuffer(enc);
     expect(dec.toString("utf8")).toBe("data from old vault");
     engine2.destroy();
+  });
+});
+
+// ─────────────────────────────────────────────
+// Mobile: окружение без глобального Buffer
+// ─────────────────────────────────────────────
+
+describe("AuthService — mobile (WebCryptoEngine, без глобального Buffer)", () => {
+  it("первый запуск и повторный вход проходят без Buffer (регрессия ReferenceError на mobile)", async () => {
+    // Симулируем mobile: фабрика отдаёт WebCryptoEngine, глобального Buffer нет
+    const spy = jest
+      .spyOn(cryptoFactory, "createCryptoEngine")
+      .mockImplementation(() => new WebCryptoEngine());
+    const g = globalThis as { Buffer?: unknown };
+    const savedBuffer = g.Buffer;
+    delete g.Buffer;
+
+    try {
+      // Первый запуск (онбординг) — раньше падал с "Buffer is not defined"
+      const svc = new AuthService();
+      const { fn, lastSaved } = makeSaveFn();
+      const result = await svc.authenticate(TEST_EMAIL, "mobile-password", DEFAULT_SETTINGS, fn);
+
+      expect(result.isFirstRun).toBe(true);
+      expect(result.engine.isUnlocked()).toBe(true);
+      expect(lastSaved()!.verificationBlob).toBeTruthy();
+      result.engine.destroy();
+
+      // Повторный вход по сохранённому verificationBlob — тоже без Buffer
+      const svc2 = new AuthService();
+      const { fn: fn2 } = makeSaveFn();
+      const result2 = await svc2.authenticate(TEST_EMAIL, "mobile-password", lastSaved()!, fn2);
+      expect(result2.isFirstRun).toBe(false);
+      result2.engine.destroy();
+    } finally {
+      g.Buffer = savedBuffer;
+      spy.mockRestore();
+    }
   });
 });
