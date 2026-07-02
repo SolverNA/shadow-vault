@@ -1056,6 +1056,25 @@ export default class ShadowVaultPlugin extends Plugin {
       engine.destroy();
 
       // ── Phase 2: создаём platform adapter ─────────────────────────────
+      // ВАЖНО: MobileAdapter захватывает (bind) ОРИГИНАЛЬНЫЕ методы адаптера
+      // в конструкторе, поэтому адаптер обязан быть в НЕпатченном состоянии
+      // именно здесь, ДО AdapterPatcher.patch() (иначе — рекурсия).
+      const adapter = this.app.vault.adapter as DataAdapter;
+
+      // Страховка от повторного unlock без lock: снимаем предыдущий патч,
+      // чтобы MobileAdapter не захватил уже патченные методы.
+      if (this.adapterPatcher) {
+        this.adapterPatcher.unpatch(adapter as any);
+        this.adapterPatcher = null;
+      }
+
+      // Восстанавливаем оригинальный list() если был ранний патч — тоже до
+      // создания MobileAdapter, чтобы он захватил нетронутый list.
+      if (this.earlyListOriginal) {
+        (adapter as any).list = this.earlyListOriginal;
+        this.earlyListOriginal = null;
+      }
+
       this.platformAdapter = new MobileAdapter(this.app.vault);
 
       // ── Phase 3: создаём virtual shadow manager ───────────────────────
@@ -1077,14 +1096,7 @@ export default class ShadowVaultPlugin extends Plugin {
       );
 
       // ── Phase 5: патчим адаптер ───────────────────────────────────────
-      const adapter = this.app.vault.adapter as DataAdapter;
-
-      // Восстанавливаем оригинальный list() если был ранний патч
-      if (this.earlyListOriginal) {
-        (adapter as any).list = this.earlyListOriginal;
-        this.earlyListOriginal = null;
-      }
-
+      // (оригиналы уже захвачены MobileAdapter'ом в Phase 2)
       this.adapterPatcher.patch(adapter as any);
 
       // ── Phase 6: reconcile fileMap ────────────────────────────────────
@@ -1630,6 +1642,28 @@ export default class ShadowVaultPlugin extends Plugin {
     } finally {
       this.shadowManager = null;
     }
+
+    // 2b. Mobile: снимаем патч адаптера и чистим виртуальный shadow.
+    //     Без этого адаптер оставался патченным после lockVault, а следующий
+    //     unlock создавал бы MobileAdapter поверх патченных методов → рекурсия.
+    try {
+      if (this.adapterPatcher) {
+        const adapter = this.app.vault.adapter as unknown as IDataAdapter;
+        this.adapterPatcher.unpatch(adapter as any);
+      }
+    } catch (err) {
+      console.error("[ShadowVault] unpatch адаптера (mobile):", err);
+    } finally {
+      this.adapterPatcher = null;
+    }
+    try {
+      this.virtualShadowManager?.clearCache();
+    } catch (err) {
+      console.error("[ShadowVault] clearCache (mobile):", err);
+    } finally {
+      this.virtualShadowManager = null;
+    }
+    this.platformAdapter = null;
 
     // 3. Удаляем shadow vault и уничтожаем ключ. При провале encrypt-back
     //    shadow и session.lock сохраняются для recovery (уничтожается только ключ).
