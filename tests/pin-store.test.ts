@@ -126,6 +126,33 @@ describe("PinStore — device-local хранение", () => {
   });
 });
 
+describe("PinStore — повреждённые PIN-данные (битый hex в localStorage)", () => {
+  it("битый wrappedMaster → PinLockoutError и сброс PIN (не «неверный PIN»)", async () => {
+    const store = new FakeStore();
+    const pin = new PinStore(store);
+    await pin.enablePin("1234", MASTER);
+
+    // Симулируем порчу localStorage: не-hex мусор вместо wrapped-контейнера.
+    store.map.set("shadow-vault:pin:wrapped", "это-не-hex!!");
+
+    await expect(pin.unlockWithPin("1234")).rejects.toThrow(PinLockoutError);
+    // Повреждённые данные никогда не разблокируются — они стёрты.
+    expect(pin.isPinSet()).toBe(false);
+  });
+
+  it("битый deviceSalt (hex нечётной длины) → PinLockoutError и сброс PIN", async () => {
+    const store = new FakeStore();
+    const pin = new PinStore(store);
+    await pin.enablePin("1234", MASTER);
+
+    const salt = store.map.get("shadow-vault:pin:deviceSalt")!;
+    store.map.set("shadow-vault:pin:deviceSalt", salt.slice(0, -1)); // обрезан на 1 символ
+
+    await expect(pin.unlockWithPin("1234")).rejects.toThrow(PinLockoutError);
+    expect(pin.isPinSet()).toBe(false);
+  });
+});
+
 describe("PinStore — интеграция с движком (вход по PIN)", () => {
   it("masterKey из deriveMasterKey, обёрнутый PIN, разворачивается и движок шифрует/расшифровывает", async () => {
     const email = "user@vault.local";

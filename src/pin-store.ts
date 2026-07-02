@@ -157,10 +157,23 @@ export class PinStore {
     const wrappedHex = this.store.getItem(LS_WRAPPED)!;
     const saltHex = this.store.getItem(LS_DEVICE_SALT)!;
     const iterations = parseInt(this.store.getItem(LS_ITERATIONS) ?? String(PIN_KDF_ITERATIONS), 10);
-    const deviceSalt = hexToBytes(saltHex);
+
+    // Битый hex в localStorage (повреждённые PIN-данные) — не «неверный PIN»,
+    // а необратимая порча: разблокировать таким wrappedMaster нельзя никогда.
+    // Стираем PIN-данные и явно отправляем пользователя на вход по паролю.
+    let deviceSalt: Uint8Array;
+    let container: Uint8Array;
+    try {
+      deviceSalt = hexToBytes(saltHex);
+      container = hexToBytes(wrappedHex);
+    } catch {
+      this.clearPin();
+      throw new PinLockoutError(
+        "PIN-данные на этом устройстве повреждены. PIN сброшен — войдите по паролю."
+      );
+    }
 
     const pinKey = await derivePinKey(pin, deviceSalt, iterations);
-    const container = hexToBytes(wrappedHex);
     const { iv, body } = parseContainer(container);
 
     try {

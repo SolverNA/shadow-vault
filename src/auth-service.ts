@@ -191,6 +191,18 @@ export class AuthService {
       );
     }
 
+    // Разбираем hex ДО деривации и ДО общего try/catch: битый hex — это
+    // повреждённые настройки (SettingsCorruptedError), а не «неверный пароль».
+    let verificationBytes: Uint8Array;
+    try {
+      verificationBytes = hexToBytes(settings.verificationBlob);
+    } catch {
+      throw new SettingsCorruptedError(
+        "Файл настроек повреждён: verificationBlob не является корректной hex-строкой. " +
+        "Восстановите data.json из резервной копии."
+      );
+    }
+
     const engine = createCryptoEngine();
     const effectiveEmail = email || settings.email;
     await engine.deriveKey(effectiveEmail, password);
@@ -198,7 +210,7 @@ export class AuthService {
     try {
       const decryptedBytes = toBytes(
         await Promise.resolve(
-          engine.decryptBuffer(hexToBytes(settings.verificationBlob))
+          engine.decryptBuffer(verificationBytes)
         )
       );
       const decryptedText = new TextDecoder().decode(decryptedBytes);

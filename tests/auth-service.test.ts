@@ -216,6 +216,32 @@ describe("AuthService — повторный вход", () => {
       svc.authenticate(TEST_EMAIL, "password", corruptedSettings, fn)
     ).rejects.toThrow(PasswordError);
   });
+
+  it("бросает SettingsCorruptedError если verificationBlob — не hex (битый data.json)", async () => {
+    const savedSettings = await initVault("password");
+    const corruptedSettings: PluginSettings = {
+      ...savedSettings,
+      verificationBlob: "zz-не-hex-мусор!!",
+    };
+
+    // Раньше битый hex тихо превращался в мусорные байты (NaN → 0) и падал
+    // как «неверный пароль». Теперь — явная ошибка формата настроек.
+    await expect(
+      AuthService.verifyPassword(TEST_EMAIL, "password", corruptedSettings)
+    ).rejects.toThrow(SettingsCorruptedError);
+  });
+
+  it("бросает SettingsCorruptedError если verificationBlob — hex нечётной длины", async () => {
+    const savedSettings = await initVault("password");
+    const corruptedSettings: PluginSettings = {
+      ...savedSettings,
+      verificationBlob: savedSettings.verificationBlob!.slice(0, -1), // обрезан на 1 символ
+    };
+
+    await expect(
+      AuthService.verifyPassword(TEST_EMAIL, "password", corruptedSettings)
+    ).rejects.toThrow(SettingsCorruptedError);
+  });
 });
 
 // ─────────────────────────────────────────────

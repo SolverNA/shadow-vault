@@ -15,6 +15,7 @@ import { WebCryptoEngine } from "../src/web-crypto-engine";
 import { deriveMasterKey, deriveSalt, normalizeEmail } from "../src/crypto/key-derivation";
 import { detectFormat, isV2 } from "../src/crypto/format";
 import { createVerificationBlob, verifyPassword } from "../src/crypto/verification";
+import { bytesToHex, hexToBytes } from "../src/hex";
 import {
   MAGIC,
   FORMAT_VERSION,
@@ -64,6 +65,40 @@ describe("key-derivation", () => {
     const k1 = await deriveMasterKey(EMAIL, "pw-A");
     const k2 = await deriveMasterKey(EMAIL, "pw-B");
     expect(Buffer.from(k1).equals(Buffer.from(k2))).toBe(false);
+  });
+});
+
+// ─────────────────────────────────────────────
+// hex: bytesToHex / hexToBytes
+// ─────────────────────────────────────────────
+
+describe("hex: bytesToHex/hexToBytes", () => {
+  it("round-trip: bytesToHex → hexToBytes возвращает исходные байты", () => {
+    const bytes = new Uint8Array([0, 1, 15, 16, 127, 128, 255]);
+    const hex = bytesToHex(bytes);
+    expect(hex).toBe("00010f107f80ff");
+    expect(Buffer.from(hexToBytes(hex)).equals(Buffer.from(bytes))).toBe(true);
+  });
+
+  it("верхний регистр (A-F) принимается", () => {
+    expect(Buffer.from(hexToBytes("DEADBEEF")).equals(
+      Buffer.from([0xde, 0xad, 0xbe, 0xef])
+    )).toBe(true);
+  });
+
+  it("пустая строка → пустой массив (как раньше)", () => {
+    expect(hexToBytes("").length).toBe(0);
+  });
+
+  it("нечётная длина → явная ошибка формата (не молчаливый обрезанный байт)", () => {
+    expect(() => hexToBytes("abc")).toThrow(/нечётная длина/);
+    expect(() => hexToBytes("0")).toThrow(/нечётная длина/);
+  });
+
+  it("не-hex символы → явная ошибка формата (не NaN → 0)", () => {
+    expect(() => hexToBytes("zzzz")).toThrow(/недопустимые символы/);
+    expect(() => hexToBytes("12g4")).toThrow(/недопустимые символы/);
+    expect(() => hexToBytes("de.dad")).toThrow(/недопустимые символы/);
   });
 });
 
