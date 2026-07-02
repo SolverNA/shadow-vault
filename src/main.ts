@@ -458,8 +458,12 @@ export default class ShadowVaultPlugin extends Plugin {
         email: targetEmail,
         verificationBlob: bytesToHex(new Uint8Array(blob)),
       });
-      // Активный движок плагина переключаем на новый ключ.
+      // Активный движок плагина переключаем на новый ключ. Старый движок
+      // уничтожаем — иначе СТАРЫЙ мастер-ключ остаётся в памяти (reEncryptAll
+      // уже переключил virtualShadowManager на newEngine, старый не нужен).
+      const oldEngine = this.cryptoEngine;
       this.cryptoEngine = newEngine;
+      oldEngine?.destroy();
     }
 
     // PIN привязан к старому masterKey → после смены ключа он невалиден.
@@ -1643,27 +1647,11 @@ export default class ShadowVaultPlugin extends Plugin {
       this.shadowManager = null;
     }
 
-    // 2b. Mobile: снимаем патч адаптера и чистим виртуальный shadow.
-    //     Без этого адаптер оставался патченным после lockVault, а следующий
-    //     unlock создавал бы MobileAdapter поверх патченных методов → рекурсия.
-    try {
-      if (this.adapterPatcher) {
-        const adapter = this.app.vault.adapter as unknown as IDataAdapter;
-        this.adapterPatcher.unpatch(adapter as any);
-      }
-    } catch (err) {
-      console.error("[ShadowVault] unpatch адаптера (mobile):", err);
-    } finally {
-      this.adapterPatcher = null;
-    }
-    try {
-      this.virtualShadowManager?.clearCache();
-    } catch (err) {
-      console.error("[ShadowVault] clearCache (mobile):", err);
-    } finally {
-      this.virtualShadowManager = null;
-    }
-    this.platformAdapter = null;
+    // 2b. Mobile: снимаем патч адаптера, чистим виртуальный shadow и
+    //     уничтожаем мастер-ключ. Без этого адаптер оставался патченным после
+    //     lockVault (следующий unlock создавал бы MobileAdapter поверх
+    //     патченных методов → рекурсия), а ключ продолжал жить в памяти.
+    this.cleanupMobileState();
 
     // 3. Удаляем shadow vault и уничтожаем ключ. При провале encrypt-back
     //    shadow и session.lock сохраняются для recovery (уничтожается только ключ).
@@ -1692,6 +1680,20 @@ export default class ShadowVaultPlugin extends Plugin {
     this.shuttingDown = true;
     this.sessionActive = false;
 
+    this.cleanupMobileState();
+
+    console.debug("[ShadowVault] Мобильная сессия завершена.");
+  }
+
+  /**
+   * Общая mobile-зачистка: снимает патч адаптера, чистит кэш виртуального
+   * shadow, уничтожает мастер-ключ и обнуляет ссылки. Единственная точка
+   * очистки mobile-состояния — вызывается из shutdown() (шаг 2b, путь
+   * lockVault) и syncCleanupMobile() (beforeunload), чтобы наборы действий
+   * не расходились. Все шаги идемпотентны и безопасны на desktop
+   * (mobile-ссылки там null, cryptoEngine не используется).
+   */
+  private cleanupMobileState(): void {
     // 1. Снимаем патч с адаптера
     try {
       if (this.adapterPatcher) {
@@ -1699,36 +1701,30 @@ export default class ShadowVaultPlugin extends Plugin {
         this.adapterPatcher.unpatch(adapter as any);
       }
     } catch (err) {
-      console.error("[ShadowVault] unpatch адаптера:", err);
+      console.error("[ShadowVault] unpatch адаптера (mobile):", err);
     } finally {
       this.adapterPatcher = null;
     }
 
     // 2. Очищаем кэш виртуального shadow
     try {
-      if (this.virtualShadowManager) {
-        this.virtualShadowManager.clearCache();
-      }
+      this.virtualShadowManager?.clearCache();
     } catch (err) {
-      console.error("[ShadowVault] clearCache:", err);
+      console.error("[ShadowVault] clearCache (mobile):", err);
     } finally {
       this.virtualShadowManager = null;
     }
 
-    // 3. Уничтожаем ключ
+    // 3. Уничтожаем мастер-ключ
     try {
-      if (this.cryptoEngine) {
-        this.cryptoEngine.destroy();
-      }
+      this.cryptoEngine?.destroy();
     } catch (err) {
-      console.error("[ShadowVault] destroy engine:", err);
+      console.error("[ShadowVault] destroy engine (mobile):", err);
     } finally {
       this.cryptoEngine = null;
     }
 
     this.platformAdapter = null;
-
-    console.debug("[ShadowVault] Мобильная сессия завершена.");
   }
 
   // ═══════════════════════════════════════════════════════════════════════
