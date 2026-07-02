@@ -14,6 +14,12 @@ export interface PlatformAdapter {
   list(path: string): Promise<{ files: string[]; folders: string[] }>;
   mkdir(path: string): Promise<void>;
   stat(path: string): Promise<{ size: number; mtime: number } | null>;
+  /**
+   * Нативное атомарное переименование (если платформа его поддерживает).
+   * Опционально: при отсутствии VirtualShadowManager падает обратно на
+   * неатомарный read → write → remove.
+   */
+  rename?(oldPath: string, newPath: string): Promise<void>;
 }
 
 /**
@@ -39,6 +45,7 @@ export class MobileAdapter implements PlatformAdapter {
     exists: (path: string) => Promise<boolean>;
     remove: (path: string) => Promise<void>;
     rmdir: (path: string, recursive: boolean) => Promise<void>;
+    rename: (oldPath: string, newPath: string) => Promise<void>;
     list: (path: string) => Promise<{ files: string[]; folders: string[] }>;
     mkdir: (path: string) => Promise<void>;
     stat: (path: string) => Promise<{ size: number; mtime: number } | null>;
@@ -52,6 +59,7 @@ export class MobileAdapter implements PlatformAdapter {
       exists: adapter.exists.bind(adapter),
       remove: adapter.remove.bind(adapter),
       rmdir: adapter.rmdir.bind(adapter),
+      rename: adapter.rename.bind(adapter),
       list: adapter.list.bind(adapter),
       mkdir: adapter.mkdir.bind(adapter),
       stat: adapter.stat.bind(adapter),
@@ -91,6 +99,17 @@ export class MobileAdapter implements PlatformAdapter {
       // Если это папка, удаляем рекурсивно
       await this.fs.rmdir(normalized, true);
     }
+  }
+
+  async rename(oldPath: string, newPath: string): Promise<void> {
+    const from = normalizePath(oldPath);
+    const to = normalizePath(newPath);
+    // Целевая директория может ещё не существовать (перенос в новую папку)
+    const parts = to.split("/");
+    if (parts.length > 1) {
+      await this.mkdir(parts.slice(0, -1).join("/"));
+    }
+    await this.fs.rename(from, to);
   }
 
   async list(path: string): Promise<{ files: string[]; folders: string[] }> {

@@ -35,10 +35,13 @@ export class AdapterPatcher {
     }
     this.originalMethods.exists = adapter.exists.bind(adapter);
     this.originalMethods.remove = adapter.remove.bind(adapter);
+    this.originalMethods.rmdir = adapter.rmdir.bind(adapter);
     this.originalMethods.rename = adapter.rename.bind(adapter);
     this.originalMethods.copy = adapter.copy.bind(adapter);
     this.originalMethods.stat = adapter.stat.bind(adapter);
     this.originalMethods.list = adapter.list.bind(adapter);
+    this.originalMethods.trashSystem = adapter.trashSystem.bind(adapter);
+    this.originalMethods.trashLocal = adapter.trashLocal.bind(adapter);
 
     // Подменяем методы
     adapter.read = (p) => this.patchedRead(p);
@@ -52,10 +55,13 @@ export class AdapterPatcher {
     }
     adapter.exists = (p, s) => this.patchedExists(p, s);
     adapter.remove = (p) => this.patchedRemove(p);
+    adapter.rmdir = (p, r) => this.patchedRmdir(p, r);
     adapter.rename = (o, n) => this.patchedRename(o, n);
     adapter.copy = (s, d) => this.patchedCopy(s, d);
     adapter.stat = (p) => this.patchedStat(p);
     adapter.list = (p) => this.patchedList(p);
+    adapter.trashSystem = (p) => this.patchedTrashSystem(p);
+    adapter.trashLocal = (p) => this.patchedTrashLocal(p);
 
     this.patched = true;
   }
@@ -75,10 +81,13 @@ export class AdapterPatcher {
     if (this.originalMethods.appendBinary) adapter.appendBinary = this.originalMethods.appendBinary;
     if (this.originalMethods.exists) adapter.exists = this.originalMethods.exists;
     if (this.originalMethods.remove) adapter.remove = this.originalMethods.remove;
+    if (this.originalMethods.rmdir) adapter.rmdir = this.originalMethods.rmdir;
     if (this.originalMethods.rename) adapter.rename = this.originalMethods.rename;
     if (this.originalMethods.copy) adapter.copy = this.originalMethods.copy;
     if (this.originalMethods.stat) adapter.stat = this.originalMethods.stat;
     if (this.originalMethods.list) adapter.list = this.originalMethods.list;
+    if (this.originalMethods.trashSystem) adapter.trashSystem = this.originalMethods.trashSystem;
+    if (this.originalMethods.trashLocal) adapter.trashLocal = this.originalMethods.trashLocal;
 
     this.originalMethods = {};
     this.patched = false;
@@ -206,6 +215,12 @@ export class AdapterPatcher {
       return this.originalMethods.exists!(normalizedPath, sensitive);
     }
 
+    // Папки лежат на диске под своими именами (не транслируются в .enc) —
+    // без этой проверки exists("folder") искал бы "folder.enc" → false.
+    if (await this.isFolder(normalizedPath)) {
+      return true;
+    }
+
     return await this.shadowManager.exists(normalizedPath);
   }
 
@@ -214,7 +229,29 @@ export class AdapterPatcher {
       return this.originalMethods.remove!(normalizedPath);
     }
 
+    // Папка: VSM.remove("folder") удалял бы "folder.enc" — тихий no-op,
+    // папка с .enc внутри «воскресала» в UI. Удаляем рекурсивно через
+    // оригинальный rmdir (содержимое — .enc-файлы, они уезжают вместе)
+    // и инвалидируем кэш VSM по префиксу.
+    if (await this.isFolder(normalizedPath)) {
+      await this.originalMethods.rmdir!(normalizedPath, true);
+      this.shadowManager.invalidatePrefix(normalizedPath);
+      return;
+    }
+
     await this.shadowManager.remove(normalizedPath);
+  }
+
+  /**
+   * rmdir оперирует папками — имена папок не транслируются, поэтому проброс
+   * в оригинал. Но кэш VSM обязан инвалидироваться по префиксу: иначе
+   * удалённые файлы «воскресают» из кэша (exists → true, read → старьё).
+   */
+  private async patchedRmdir(normalizedPath: string, recursive: boolean): Promise<void> {
+    await this.originalMethods.rmdir!(normalizedPath, recursive);
+    if (!this.isBypassPath(normalizedPath)) {
+      this.shadowManager.invalidatePrefix(normalizedPath);
+    }
   }
 
   private async patchedRename(
@@ -234,7 +271,16 @@ export class AdapterPatcher {
       throw new Error("Cannot rename between encrypted and unencrypted paths");
     }
 
-    // Оба пути зашифрованы
+    // Папка: пробрасываем в оригинал как есть — содержимое уже в .enc-именах
+    // и переезжает вместе с папкой. Кэш VSM инвалидируем по старому префиксу,
+    // иначе старые пути продолжали бы читаться из кэша.
+    if (await this.isFolder(oldPath)) {
+      await this.originalMethods.rename!(oldPath, newPath);
+      this.shadowManager.invalidatePrefix(oldPath);
+      return;
+    }
+
+    // Оба пути зашифрованы (файл)
     await this.shadowManager.rename(oldPath, newPath);
   }
 
@@ -266,6 +312,13 @@ export class AdapterPatcher {
       return this.originalMethods.stat!(normalizedPath);
     }
 
+    // Папки не шифруются и не транслируются — отдаём оригинальный stat.
+    // Без этого stat("folder") искал бы "folder.enc" → null.
+    const origStat = await this.statOriginal(normalizedPath);
+    if (origStat?.type === "folder") {
+      return origStat;
+    }
+
     const stat = await this.shadowManager.stat(normalizedPath);
     if (!stat) return null;
 
@@ -294,6 +347,45 @@ export class AdapterPatcher {
     return await this.shadowManager.list(normalizedPath);
   }
 
+  /**
+   * trashSystem: нативный trash ищет файл по plaintext-имени ("note.md"),
+   * а на диске лежит "note.md.enc" → ENOENT. Для файла — trash его .enc
+   * (в корзине останется имя с .enc — приемлемый компромисс, содержимое
+   * зашифровано; remove вместо trash терял бы корзину). Для папки — проброс
+   * как есть (имена папок не транслируются). Кэш VSM инвалидируем.
+   */
+  private async patchedTrashSystem(normalizedPath: string): Promise<boolean> {
+    if (this.isBypassPath(normalizedPath)) {
+      return this.originalMethods.trashSystem!(normalizedPath);
+    }
+
+    if (await this.isFolder(normalizedPath)) {
+      const ok = await this.originalMethods.trashSystem!(normalizedPath);
+      if (ok) this.shadowManager.invalidatePrefix(normalizedPath);
+      return ok;
+    }
+
+    const ok = await this.originalMethods.trashSystem!(normalizedPath + ".enc");
+    if (ok) this.shadowManager.invalidatePrefix(normalizedPath);
+    return ok;
+  }
+
+  /** trashLocal: та же семантика, что patchedTrashSystem (корзина .obsidian/trash). */
+  private async patchedTrashLocal(normalizedPath: string): Promise<void> {
+    if (this.isBypassPath(normalizedPath)) {
+      return this.originalMethods.trashLocal!(normalizedPath);
+    }
+
+    if (await this.isFolder(normalizedPath)) {
+      await this.originalMethods.trashLocal!(normalizedPath);
+      this.shadowManager.invalidatePrefix(normalizedPath);
+      return;
+    }
+
+    await this.originalMethods.trashLocal!(normalizedPath + ".enc");
+    this.shadowManager.invalidatePrefix(normalizedPath);
+  }
+
   // ========== Вспомогательные методы ==========
 
   /**
@@ -302,5 +394,27 @@ export class AdapterPatcher {
    */
   private isBypassPath(normalizedPath: string): boolean {
     return isBypassPath(normalizedPath, this.configDir);
+  }
+
+  /** stat через ОРИГИНАЛЬНЫЙ адаптер (без трансляции имён); ошибки → null. */
+  private async statOriginal(
+    normalizedPath: string
+  ): Promise<{ ctime: number; mtime: number; size: number; type: "file" | "folder" } | null> {
+    try {
+      return await this.originalMethods.stat!(normalizedPath);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Папка ли этот путь на диске? Надёжный признак — type оригинального stat:
+   * папки хранятся под своими именами (не .enc), поэтому оригинальный stat
+   * их видит. Несуществующий путь (create-сценарии) → null → НЕ папка,
+   * операция уходит по файловой ветке (трансляция в .enc).
+   */
+  private async isFolder(normalizedPath: string): Promise<boolean> {
+    const s = await this.statOriginal(normalizedPath);
+    return s?.type === "folder";
   }
 }

@@ -98,20 +98,27 @@ export class VirtualShadowManager {
    * @param newPath - новый путь (без .enc)
    */
   async rename(oldPath: string, newPath: string): Promise<void> {
-    // Если файл в кэше, переносим
+    const oldEncPath = oldPath + ".enc";
+    const newEncPath = newPath + ".enc";
+
+    // Приоритет — нативный rename адаптера: атомарно, без пере-шифровки
+    // (шифртекст не зависит от имени файла). Fallback read → write → remove
+    // неатомарен: сбой между write и remove оставляет дубликат .enc.
+    if (this.adapter.rename) {
+      await this.adapter.rename(oldEncPath, newEncPath);
+    } else {
+      const encrypted = await this.adapter.readBinary(oldEncPath);
+      await this.adapter.writeBinary(newEncPath, encrypted);
+      await this.adapter.remove(oldEncPath);
+    }
+
+    // Кэш переносим ПОСЛЕ успешной дисковой операции: если rename упал,
+    // старая запись кэша остаётся валидной.
     if (this.cache.has(oldPath)) {
       const data = this.cache.get(oldPath)!;
       this.cache.delete(oldPath);
       this.cache.set(newPath, data);
     }
-
-    // Переименовываем .enc файл (читаем + пишем + удаляем)
-    const oldEncPath = oldPath + ".enc";
-    const newEncPath = newPath + ".enc";
-
-    const encrypted = await this.adapter.readBinary(oldEncPath);
-    await this.adapter.writeBinary(newEncPath, encrypted);
-    await this.adapter.remove(oldEncPath);
   }
 
   /**
@@ -183,6 +190,20 @@ export class VirtualShadowManager {
    */
   clearCache(): void {
     this.cache.clear();
+  }
+
+  /**
+   * Инвалидирует кэш по пути: сам путь и всё под ним (prefix + "/").
+   * Нужен при папочных операциях (rmdir/rename/trash папки), которые идут
+   * мимо VSM через оригинальный адаптер: без инвалидации кэш «воскрешал» бы
+   * удалённые/переехавшие файлы (exists → true, read → старые данные).
+   */
+  invalidatePrefix(prefix: string): void {
+    for (const key of [...this.cache.keys()]) {
+      if (key === prefix || key.startsWith(prefix + "/")) {
+        this.cache.delete(key);
+      }
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════
