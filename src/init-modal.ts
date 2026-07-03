@@ -488,9 +488,12 @@ export class InitModal extends Modal {
     this.setLoading(true);
     let rawKey: Uint8Array | null = null;
     try {
+      // Владение rawKey переходит нам (контракт unlockWithPin) — зачищаем
+      // его в finally и при успехе, и при любой ошибке.
       rawKey = await this.pinStore.unlockWithPin(pin);
 
       // Строим движок из сырого мастер-ключа (минуя PBKDF2 из пароля).
+      // loadRawKey копирует байты внутрь (Buffer/CryptoKey) — rawKey остаётся наш.
       const engine = createCryptoEngine();
       await Promise.resolve((engine as { loadRawKey: (k: Uint8Array) => unknown }).loadRawKey(rawKey));
 
@@ -498,6 +501,8 @@ export class InitModal extends Modal {
         engine,
         password: null,
         email: this.settings.email,
+        // Копия для mobile-пути (onUnlockMobile → loadRawKey): владение этой
+        // копией переходит onUnlock — main.ts зачищает её после использования.
         rawKey: rawKey.slice(),
         isFirstRun: false,
       };
@@ -523,6 +528,10 @@ export class InitModal extends Modal {
         this.pinMode = false;
         this.render();
       }
+    } finally {
+      // Гигиена ключей: наш экземпляр rawKey больше никому не нужен
+      // (движок и result.rawKey держат собственные копии).
+      rawKey?.fill(0);
     }
   }
 

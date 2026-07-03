@@ -74,19 +74,36 @@ export class NodeCryptoEngine {
    */
   async deriveKey(email: string, password: string): Promise<void> {
     const raw = await deriveMasterKey(email, password);
-    this.keyBuffer = Buffer.from(raw);
+    try {
+      this.replaceKeyBuffer(Buffer.from(raw));
+    } finally {
+      // deriveMasterKey передал владение сырыми байтами нам — байты уже
+      // скопированы в keyBuffer, временную копию зачищаем.
+      raw.fill(0);
+    }
   }
 
   /**
    * Загружает уже готовый сырой мастер-ключ (32 байта) напрямую, минуя PBKDF2.
    * Используется при входе по PIN: masterKey извлекается из локального
    * wrapped-контейнера (см. pin-store) и инжектится в движок.
+   *
+   * Байты КОПИРУЮТСЯ во внутренний буфер: владение `raw` остаётся у
+   * вызывающего — он обязан сам зачистить свой буфер (fill(0)) после вызова.
    */
   loadRawKey(raw: Uint8Array): void {
     if (raw.length !== KEY_LENGTH) {
       throw new Error(`[NodeCryptoEngine] Неверная длина ключа: ${raw.length}`);
     }
-    this.keyBuffer = Buffer.from(raw);
+    this.replaceKeyBuffer(Buffer.from(raw));
+  }
+
+  /** Заменяет keyBuffer, зачищая предыдущий буфер ключа (fill(0)). */
+  private replaceKeyBuffer(next: Buffer): void {
+    if (this.keyBuffer) {
+      this.keyBuffer.fill(0);
+    }
+    this.keyBuffer = next;
   }
 
   isUnlocked(): boolean {

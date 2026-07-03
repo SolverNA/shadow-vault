@@ -32,13 +32,22 @@ export class WebCryptoEngine {
    */
   async deriveKey(email: string, password: string): Promise<void> {
     const raw = await deriveMasterKey(email, password);
-    await this.loadRawKey(raw);
+    try {
+      await this.loadRawKey(raw);
+    } finally {
+      // deriveMasterKey передал владение сырыми байтами нам — после импорта
+      // в CryptoKey они больше не нужны, зачищаем.
+      raw.fill(0);
+    }
   }
 
   /**
    * Загружает уже готовый сырой мастер-ключ (32 байта) напрямую, минуя PBKDF2.
    * Используется при входе по PIN: masterKey извлекается из локального
    * wrapped-контейнера (см. pin-store) и инжектится в движок.
+   *
+   * Байты копируются внутрь non-extractable CryptoKey: владение `raw`
+   * остаётся у вызывающего — он обязан сам зачистить буфер (fill(0)).
    */
   async loadRawKey(raw: Uint8Array): Promise<void> {
     if (raw.length !== KEY_LENGTH) {
@@ -163,7 +172,12 @@ export class WebCryptoEngine {
     return new TextDecoder().decode(decrypted);
   }
 
-  /** Очищает ключ из памяти. */
+  /**
+   * Очищает ключ из памяти. Движок не хранит сырых байтов ключа — только
+   * non-extractable CryptoKey, чью внутреннюю память зачистить из JS нельзя
+   * (её освобождает браузер/Node после потери ссылки). Все временные сырые
+   * копии зачищаются сразу в deriveKey/loadRawKey.
+   */
   destroy(): void {
     this.key = null;
   }

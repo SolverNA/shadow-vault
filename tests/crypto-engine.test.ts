@@ -281,3 +281,52 @@ describe("CryptoEngine — destroy()", () => {
     expect(() => engine.destroy()).not.toThrow();
   });
 });
+
+// ─────────────────────────────────────────────
+// Гигиена ключей в памяти (zeroization)
+// ─────────────────────────────────────────────
+
+describe("CryptoEngine — зачистка ключевого материала", () => {
+  /** Доступ к приватному буферу ключа — только для проверки зачистки. */
+  const keyBufferOf = (engine: CryptoEngine): Buffer =>
+    (engine as any).keyBuffer as Buffer;
+
+  it("destroy() обнуляет байты keyBuffer (не только сбрасывает ссылку)", async () => {
+    const engine = new CryptoEngine();
+    await engine.deriveKey(TEST_EMAIL, "password");
+    const held = keyBufferOf(engine); // удерживаем ссылку до destroy
+    expect(held.some((b) => b !== 0)).toBe(true);
+
+    engine.destroy();
+    expect(held.every((b) => b === 0)).toBe(true);
+  });
+
+  it("повторный deriveKey зачищает предыдущий keyBuffer", async () => {
+    const engine = new CryptoEngine();
+    await engine.deriveKey(TEST_EMAIL, "first-password");
+    const old = keyBufferOf(engine);
+    expect(old.some((b) => b !== 0)).toBe(true);
+
+    await engine.deriveKey(TEST_EMAIL, "second-password");
+    expect(old.every((b) => b === 0)).toBe(true);
+    expect(engine.isUnlocked()).toBe(true);
+    engine.destroy();
+  });
+
+  it("loadRawKey зачищает предыдущий keyBuffer и копирует вход (не алиасит)", async () => {
+    const engine = new CryptoEngine();
+    await engine.deriveKey(TEST_EMAIL, "password");
+    const old = keyBufferOf(engine);
+
+    const raw = nodeCrypto.randomBytes(32);
+    engine.loadRawKey(raw);
+    expect(old.every((b) => b === 0)).toBe(true);
+
+    // Владение входным буфером остаётся у вызывающего: его зачистка
+    // не должна испортить ключ внутри движка (движок держит копию).
+    raw.fill(0);
+    const enc = engine.encryptBuffer(Buffer.from("still works"));
+    expect(engine.decryptBuffer(enc).toString("utf8")).toBe("still works");
+    engine.destroy();
+  });
+});

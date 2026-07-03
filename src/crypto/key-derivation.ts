@@ -55,6 +55,12 @@ export async function deriveSalt(email: string): Promise<Uint8Array> {
  * Деривирует мастер-ключ (сырые 32 байта) из email+password.
  * Возвращает Uint8Array, чтобы обе реализации движков могли импортировать
  * его в свой формат ключа (CryptoKey для WebCrypto, Buffer для Node).
+ *
+ * ВЛАДЕНИЕ: возвращаемый буфер переходит вызывающему — он ОБЯЗАН зачистить
+ * его (fill(0)), как только байты скопированы/импортированы и больше не нужны.
+ * Промежуточных сырых копий функция не удерживает: keyMaterial —
+ * non-extractable CryptoKey, `bits` оборачивается в возвращаемый Uint8Array
+ * без дополнительной копии.
  */
 export async function deriveMasterKey(
   email: string,

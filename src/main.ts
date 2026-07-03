@@ -888,6 +888,9 @@ export default class ShadowVaultPlugin extends Plugin {
     // Десктопная архитектура (старая, Node.js).
     // На десктопе фабрика гарантированно вернула NodeCryptoEngine (см. AuthService).
     if (this.isDesktop) {
+      // rawKey (копия из PIN-входа) нужен только mobile-пути — desktop
+      // использует engine напрямую. Зачищаем неиспользуемую копию сразу.
+      rawKey?.fill(0);
       await this.onUnlockDesktop(engine as CryptoEngine, isFirstRun, password);
       return;
     }
@@ -1246,12 +1249,19 @@ export default class ShadowVaultPlugin extends Plugin {
 
       // ── Phase 1: создаём Web Crypto engine ────────────────────────────
       const webEngine = new WebCryptoEngine();
-      if (creds.rawKey) {
-        // Вход по PIN: загружаем уже развёрнутый мастер-ключ напрямую.
-        await webEngine.loadRawKey(creds.rawKey);
-      } else {
-        // Обычный вход: деривируем ключ из email + пароля.
-        await webEngine.deriveKey(creds.email, creds.password ?? "");
+      try {
+        if (creds.rawKey) {
+          // Вход по PIN: загружаем уже развёрнутый мастер-ключ напрямую.
+          // loadRawKey копирует байты в CryptoKey — исходник дальше не нужен.
+          await webEngine.loadRawKey(creds.rawKey);
+        } else {
+          // Обычный вход: деривируем ключ из email + пароля.
+          await webEngine.deriveKey(creds.email, creds.password ?? "");
+        }
+      } finally {
+        // Гигиена ключей: наша копия rawKey зачищается и при успехе,
+        // и если loadRawKey бросил (владение перешло нам от onUnlock).
+        creds.rawKey?.fill(0);
       }
       this.cryptoEngine = webEngine;
 
