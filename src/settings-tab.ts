@@ -76,6 +76,12 @@ export class ShadowVaultSettingTab extends PluginSettingTab {
           .setButtonText("🔒 Заблокировать")
           .setWarning()
           .onClick(async () => {
+            // Guard как у соседних кнопок: без него повторный клик при уже
+            // запертом хранилище открывал ВТОРОЙ InitModal поверх первого.
+            if (!this.plugin.isUnlocked()) {
+              new Notice("🔒 Хранилище уже заблокировано.", 4000);
+              return;
+            }
             await this.plugin.lockVault();
           });
       });
