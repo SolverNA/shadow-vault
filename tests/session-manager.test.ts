@@ -123,6 +123,21 @@ describe("SessionManager — startSession()", () => {
     } finally { env.cleanup(); }
   });
 
+  it("остаток shadow/.trash без session.lock → hadCrash=true, корзина восстанавливается в оригинал", async () => {
+    const env = await makeEnv();
+    try {
+      // Краш до создания lock-файла: в shadow остались только данные корзины.
+      await writePlaintextShadow(env, ".trash/note.md", "выжившая корзина");
+
+      const result = await env.session.startSession();
+
+      expect(result.hadCrash).toBe(true);
+      expect(result.recovery?.recoveredFiles).toContain(".trash/note.md");
+      const encPath = nodePath.join(env.originalRoot, ".trash", "note.md.enc");
+      expect(fs.existsSync(encPath)).toBe(true);
+    } finally { env.cleanup(); }
+  });
+
   it("после краша создаётся новый session.lock для текущей сессии", async () => {
     const env = await makeEnv();
     try {
@@ -367,6 +382,25 @@ describe("SessionManager — recoverFromCrash()", () => {
     } finally { env.cleanup(); }
   });
 
+  it("восстанавливает файл из shadow/.trash (содержимое корзины переживает краш)", async () => {
+    const env = await makeEnv();
+    try {
+      // Заметка была удалена в корзину, encrypt-back не успел до краша:
+      // файл есть только в shadow/.trash, .enc в оригинале нет.
+      await writePlaintextShadow(env, ".trash/note.md", "удалённая заметка");
+
+      const result = await env.session.recoverFromCrash();
+
+      expect(result.recoveredFiles).toContain(".trash/note.md");
+      expect(result.failedFiles).toHaveLength(0);
+
+      const encPath = nodePath.join(env.originalRoot, ".trash", "note.md.enc");
+      expect(fs.existsSync(encPath)).toBe(true);
+      const plain = env.engine.decryptBuffer(fs.readFileSync(encPath));
+      expect(plain.toString("utf8")).toBe("удалённая заметка");
+    } finally { env.cleanup(); }
+  });
+
   it("если shadow vault не существует: возвращает пустой результат", async () => {
     const env = await makeEnv();
     try {
@@ -400,17 +434,25 @@ describe("SessionManager — scanShadowFiles()", () => {
     } finally { env.cleanup(); }
   });
 
-  it("исключает скрытые файлы из списка", async () => {
+  it("включает пользовательские dot-пути (.trash), исключает служебные артефакты", async () => {
     const env = await makeEnv();
     try {
       await writePlaintextShadow(env, "visible.md", "v");
-      // Создаём скрытый файл напрямую
-      await fsp.writeFile(nodePath.join(env.shadowRoot, ".hidden"), "hidden");
+      // Пользовательские dot-данные: локальная корзина Obsidian
+      await writePlaintextShadow(env, ".trash/deleted.md", "из корзины");
+      // Служебные артефакты: конфиг, временные файлы, legacy-маркер
+      fs.mkdirSync(nodePath.join(env.shadowRoot, ".obsidian"), { recursive: true });
+      await fsp.writeFile(nodePath.join(env.shadowRoot, ".obsidian", "app.json"), "{}");
+      await fsp.writeFile(nodePath.join(env.shadowRoot, "x.md.shadowtmp"), "tmp");
+      await fsp.writeFile(nodePath.join(env.shadowRoot, ".session_active"), "");
 
       const files = await env.session.scanShadowFiles();
 
       expect(files).toContain("visible.md");
-      expect(files).not.toContain(".hidden");
+      expect(files).toContain(".trash/deleted.md");
+      expect(files).not.toContain(".obsidian/app.json");
+      expect(files).not.toContain("x.md.shadowtmp");
+      expect(files).not.toContain(".session_active");
     } finally { env.cleanup(); }
   });
 

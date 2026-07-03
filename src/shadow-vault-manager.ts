@@ -49,6 +49,7 @@ import {
   ensureSymlink,
   fileExists,
   filesEqual,
+  isServiceEntryName,
   isTempFile,
   listEncryptedDir,
   parallelMap,
@@ -331,7 +332,9 @@ export class ShadowVaultManager {
         continue;
       }
       for (const e of entries) {
-        if (e.name === this.configDir || e.name.startsWith(".") || isTempFile(e.name)) {
+        // Пропускаем ТОЛЬКО служебные артефакты (configDir, tmp и т.п.).
+        // Пользовательские dot-пути (.trash, .git) — данные, их не пропускаем.
+        if (isServiceEntryName(e.name, this.configDir)) {
           continue;
         }
         const abs = nodePath.join(dir, e.name);
@@ -391,7 +394,9 @@ export class ShadowVaultManager {
         continue;
       }
       for (const e of entries) {
-        if (e.name === this.configDir || e.name.startsWith(".") || isTempFile(e.name)) {
+        // Пропускаем ТОЛЬКО служебные артефакты (configDir, tmp и т.п.).
+        // Пользовательские dot-пути (.trash, .git) — данные, их не пропускаем.
+        if (isServiceEntryName(e.name, this.configDir)) {
           continue;
         }
         const abs = nodePath.join(dir, e.name);
@@ -922,14 +927,20 @@ export class ShadowVaultManager {
 
   /**
    * Рекурсивно собирает все обычные файлы в shadow для encrypt-back.
-   * Пропускает .obsidian (symlink → оригинал, не шифруется),
-   * скрытые файлы и временные .tmp/.shadowtmp.
+   * Пропускает ТОЛЬКО служебные артефакты (единый фильтр isServiceEntryName):
+   * .obsidian (symlink → оригинал, не шифруется) и временные .tmp/.shadowtmp.
+   *
+   * Пользовательские dot-пути (.trash — локальная корзина Obsidian, .git от
+   * obsidian-git и т.п.) НЕ пропускаются: vault-события для dot-путей не
+   * приходят (Obsidian их не индексирует), поэтому bulk encrypt-back —
+   * единственный путь, которым их содержимое попадает в оригинал. Без этого
+   * корзина уничтожалась бы при каждом lock (endSession удаляет shadow).
+   * Симметрия с decrypt-стороной — см. scanEncryptedFiles.
    */
   private async scanShadowFilesForSync(): Promise<string[]> {
     const result: string[] = [];
     await walkDir(this.shadowRoot, (e) => {
-      // .obsidian — symlink на оригинал; скрытые/служебные; временные — пропуск
-      if (e.name === this.configDir || e.name.startsWith(".") || isTempFile(e.name)) {
+      if (isServiceEntryName(e.name, this.configDir)) {
         return "skip";
       }
       if (e.isFile) result.push(e.rel);
@@ -1386,7 +1397,11 @@ export class ShadowVaultManager {
    * новую заметку (Obsidian упадёт с ENOENT при native writeFile).
    *
    * Пропускает: dotfiles (включая configDir — для него отдельный symlink).
-   * Возвращает количество созданных директорий (для прогресс-логов).
+   * Dot-папки СОЗНАТЕЛЬНО не зеркалим: структура пользовательских dot-путей
+   * (.trash и т.п.) воссоздаётся через ensureDecrypted (mkdir на каждый файл),
+   * а пустые реплики чужих dot-каталогов оригинала (например настоящий .git
+   * пользователя на уровне оригинала) в shadow только ломали бы сторонние
+   * инструменты. Возвращает количество созданных директорий (для прогресс-логов).
    */
   private async replicateFolderStructure(): Promise<number> {
     let count = 0;
@@ -1406,11 +1421,17 @@ export class ShadowVaultManager {
   /**
    * Сканирует оригинальное хранилище и возвращает normalizedPath
    * для всех зашифрованных файлов (.enc).
+   *
+   * Пропускает только служебные записи (isServiceEntryName): dot-папки с
+   * пользовательскими данными (.trash/*.enc и т.п.) ВКЛЮЧАЮТСЯ — иначе они
+   * не расшифровывались бы при unlock (decryptAllToShadow) и не
+   * пере-шифровывались при смене пароля (reEncryptAll), становясь
+   * нечитаемыми. Симметрия с encrypt-back — см. scanShadowFilesForSync.
    */
   async scanEncryptedFiles(): Promise<string[]> {
     const result: string[] = [];
     await walkDir(this.originalRoot, (e) => {
-      if (e.name.startsWith(".")) return "skip";
+      if (isServiceEntryName(e.name, this.configDir)) return "skip";
       if (e.isFile && e.name.endsWith(ENCRYPTED_EXT)) {
         result.push(e.rel.slice(0, -ENCRYPTED_EXT.length));
       }
@@ -1828,6 +1849,11 @@ export class ShadowVaultManager {
    * Рекурсивно сканирует оригинальное хранилище и возвращает список
    * normalizedPath для файлов БЕЗ суффикса .enc (незашифрованных).
    * Нужен для обнаружения файлов, которые требуют первичной миграции.
+   *
+   * Dot-пути пропускаются СОЗНАТЕЛЬНО (в отличие от scanShadowFilesForSync/
+   * scanEncryptedFiles): первичная миграция не должна трогать данные в
+   * dot-каталогах уровня оригинала (настоящий .git пользователя, .stfolder
+   * Syncthing и т.п.) — их шифрование сломало бы сторонние инструменты.
    */
   private async scanPlaintextFiles(relDir = ""): Promise<string[]> {
     const result: string[] = [];

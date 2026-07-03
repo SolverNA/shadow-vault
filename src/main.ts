@@ -881,7 +881,8 @@ export default class ShadowVaultPlugin extends Plugin {
       // в .enc. Это ДО reset/decrypt — иначе мы потеряли бы недосохранённые
       // изменения с прошлой сессии.
       this.sessionManager = new SessionManager(
-        engine, basePath, this.shadowManager.shadowRoot, this.getPluginDirAbs(basePath), this.logger
+        engine, basePath, this.shadowManager.shadowRoot, this.getPluginDirAbs(basePath), this.logger,
+        this.app.vault.configDir
       );
       const sessionResult = await this.sessionManager.startSession();
       this.logger.info("recovery", "startSession", { hadCrash: sessionResult.hadCrash });
@@ -1449,6 +1450,12 @@ export default class ShadowVaultPlugin extends Plugin {
    * Фильтр configDir: события для .obsidian/* игнорируем — конфиг живёт
    * через symlink, шифровать его не нужно (и Obsidian заваливал бы handler
    * каждое сохранение workspace.json).
+   *
+   * Dot-пути (.trash, .git): vault-события для них НЕ приходят (Obsidian не
+   * индексирует dot-файлы), поэтому их содержимое попадает в оригинал через
+   * bulk-пути: финальный encrypt-back в shutdown, sync-дошифровку в
+   * syncCleanup и crash recovery (все три сканируют dot-папки, см.
+   * isServiceEntryName в fs-utils).
    */
   /**
    * Гейт жизненного цикла для vault-обработчиков. Возвращает живой

@@ -278,6 +278,38 @@ export function isTempFile(name: string): boolean {
 }
 
 /**
+ * true если запись каталога — СЛУЖЕБНЫЙ артефакт (не пользовательские данные)
+ * и должна исключаться из всех сканов shadow/original: encrypt-back,
+ * bulk decrypt, sync-дошифровка при закрытии и crash recovery.
+ *
+ * ЕДИНЫЙ источник правды для фильтров сканеров. Симметрия критична:
+ * если encrypt-back видит путь, а decrypt/recovery — нет (или наоборот),
+ * появляется односторонняя утечка данных между хранилищами.
+ *
+ * Служебное:
+ *   - configDir (.obsidian) — конфиг живёт в оригинале и доступен из shadow
+ *     через symlink, его нельзя ни шифровать, ни сканировать;
+ *   - .session_active — legacy-маркер сессии в корне оригинала (до v1.1.0);
+ *   - .DS_Store — мусор Finder (macOS), не переносим между хранилищами;
+ *   - .shadow-vault-* — сам теневой каталог (защита, если он оказался
+ *     внутри сканируемого дерева);
+ *   - временные файлы атомарной записи (см. isTempFile).
+ *
+ * Всё остальное — включая ПОЛЬЗОВАТЕЛЬСКИЕ dot-пути (.trash, .git от
+ * obsidian-git и т.п.) — данные пользователя: шифруются в оригинал и
+ * восстанавливаются в shadow наравне с обычными файлами.
+ */
+export function isServiceEntryName(name: string, configDir: string): boolean {
+  return (
+    name === configDir ||
+    name === ".session_active" ||
+    name === ".DS_Store" ||
+    name.startsWith(".shadow-vault-") ||
+    isTempFile(name)
+  );
+}
+
+/**
  * Создаёт symlink target → linkPath. На Windows fs.symlink требует прав администратора
  * для symlink на директорию, поэтому на Win используем junction (работает без elevation).
  *

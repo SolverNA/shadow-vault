@@ -24,7 +24,7 @@ import * as fs from "fs";
 import * as nodePath from "path";
 import * as os from "os";
 import { CryptoEngine } from "./crypto-engine";
-import { MTIME_TOLERANCE_MS, atomicWrite, fileExists } from "./fs-utils";
+import { MTIME_TOLERANCE_MS, atomicWrite, fileExists, isServiceEntryName } from "./fs-utils";
 import { checkFileIntegrity, compareSemantic } from "./integrity-check";
 import type { Logger } from "./logger";
 
@@ -74,7 +74,9 @@ export class SessionManager {
     private readonly originalRoot: string,
     private readonly shadowRoot:   string,
     pluginDirAbs:                  string,
-    logger?:                       Logger
+    logger?:                       Logger,
+    /** Имя каталога конфигурации Obsidian — исключается из сканов shadow. */
+    private readonly configDir:    string = ".obsidian"
   ) {
     this.sessionFilePath = nodePath.join(pluginDirAbs, SESSION_FILE);
     this.legacySessionFilePath = nodePath.join(originalRoot, LEGACY_SESSION_FILE);
@@ -149,7 +151,12 @@ export class SessionManager {
     try {
       const entries = await fsp.readdir(this.shadowRoot, { withFileTypes: true });
       for (const e of entries) {
-        if (e.name.startsWith(".")) continue;
+        // Служебные артефакты не считаются данными. Пользовательские dot-пути
+        // (.trash и т.п.) — считаются: их остаток в shadow означает краш,
+        // и recovery должен зашифровать их обратно в оригинал.
+        // .obsidian-symlink отсекается и по имени (configDir), и по типу
+        // (Dirent симлинка — не file и не directory).
+        if (isServiceEntryName(e.name, this.configDir)) continue;
         if (e.isFile() || e.isDirectory()) return true;
       }
     } catch { /* нет доступа — считаем что shadow пуст */ }
@@ -348,7 +355,13 @@ export class SessionManager {
 
   /**
    * Рекурсивно сканирует Теневое хранилище и возвращает список normalizedPath.
-   * Исключает: .obsidian/*, скрытые системные файлы, директории.
+   * Исключает ТОЛЬКО служебные артефакты (единый фильтр isServiceEntryName):
+   * .obsidian (конфиг живёт в оригинале через symlink), временные файлы.
+   *
+   * Пользовательские dot-пути (.trash, .git и т.п.) ВКЛЮЧАЮТСЯ — recovery
+   * должен восстанавливать и их, иначе содержимое корзины, пережившее краш,
+   * терялось бы при последующем resetShadow. Фильтр симметричен
+   * ShadowVaultManager.scanShadowFilesForSync (encrypt-back).
    */
   async scanShadowFiles(relDir = ""): Promise<string[]> {
     const result: string[] = [];
@@ -366,8 +379,9 @@ export class SessionManager {
     const prefix = relDir ? relDir + "/" : "";
 
     for (const entry of entries) {
-      // Пропускаем скрытые служебные файлы и .obsidian
-      if (entry.name.startsWith(".")) continue;
+      // Пропускаем служебные артефакты (configDir, tmp, маркеры сессии).
+      // Симлинки не проходят ни isDirectory(), ни isFile() — отсекаются сами.
+      if (isServiceEntryName(entry.name, this.configDir)) continue;
 
       const rel = prefix + entry.name;
       if (entry.isDirectory()) {
