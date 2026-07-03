@@ -30,8 +30,8 @@ export function isBypassPath(normalizedPath: string, configDir: string): boolean
  * корнем (stat/exists/mkdir) должны идти в оригинальный адаптер. Но для
  * list() корень bypass'ить НЕЛЬЗЯ: иначе Obsidian увидит сырые .enc-имена
  * и построит индекс по неверным именам. list-патчи обязаны проверять
- * isVaultRoot ДО isBypassPath (см. AdapterPatcher.patchedList и
- * ShadowVaultManager.patchedList).
+ * isVaultRoot ДО isBypassPath (см. AdapterPatcher.patchedList и ранний
+ * list-патч main.patchListEarly).
  */
 export function isVaultRoot(normalizedPath: string): boolean {
   return normalizedPath === "" || normalizedPath === "/" || normalizedPath === ".";

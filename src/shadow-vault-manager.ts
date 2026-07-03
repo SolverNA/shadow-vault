@@ -8,20 +8,22 @@
  *                                  <appData>/shadow-vault/shadow-<hash>
  *                                  (см. shadow-location.ts; fallback — сиблинг vault'а)
  *
- * Маршрутизация:
- *   ┌──────────────────────────────────────────────────────────────────┐
- *   │  normalizedPath начинается с '.obsidian'?                        │
- *   │       ДА  →  оригинальный адаптер без изменений                 │
- *   │       НЕТ →  read  из shadow (lazy decrypt от оригинала)        │
- *   │              write в shadow + немедленное шифрование в оригинал │
- *   └──────────────────────────────────────────────────────────────────┘
+ * Архитектура (desktop): методы адаптера НЕ патчатся. После mount() Obsidian
+ * работает с shadow напрямую (adapter.basePath = shadowRoot), а мирроринг
+ * правок в оригинал.enc делают vault-события (main.setupVaultEventHandlersDesktop
+ * → encryptOne/removeEncrypted/renameEncrypted и т.д.) плюс bulk-операции
+ * этого класса (decryptAllToShadow / encryptShadowChangesToOriginal).
+ * Конфиг .obsidian доступен через symlink shadow/.obsidian → original/.obsidian.
+ * (Mobile-путь этот класс не использует вовсе — там VirtualShadowManager +
+ * AdapterPatcher.)
  *
  * Формат зашифрованных файлов в originalRoot:
  *   note.md  →  note.md.enc    (IV 12б + AuthTag 16б + шифртекст)
  *   img.png  →  img.png.enc
  *
- * Obsidian при вызове list() получает пути БЕЗ суффикса .enc, т.е. видит "note.md".
- * Все внутренние операции (ensureDecrypted, write-through) добавляют .enc сами.
+ * Все внутренние операции (ensureDecrypted, encrypt-back) добавляют .enc сами;
+ * трансляцию имён .enc → plaintext для раннего list() делает main.patchListEarly
+ * (через fs-utils.listEncryptedDir).
  */
 
 import * as fs from "fs";
@@ -30,18 +32,11 @@ import * as nodePath from "path";
 import * as os from "os";
 import { CryptoEngine } from "./crypto-engine";
 import { resolveShadowRoot } from "./shadow-location";
-import {
-  detectFormat,
-  chunkedVersion,
-  CHUNKED_HEADER_LENGTH,
-  CHUNKED2_HEADER_LENGTH,
-  SEGMENT_LEN_PREFIX,
-} from "./crypto/format";
-import { IV_LENGTH, GCM_TAG_LENGTH } from "./crypto/constants";
+import { detectFormat } from "./crypto/format";
 import { migrateBuffer } from "./crypto/migration";
 import { isBypassPath } from "./path-utils";
 import type { LegacyVariant } from "./crypto/legacy";
-import { IDataAdapter, AdapterStat, DataWriteOptions, ListedFiles } from "./adapter-types";
+import { IDataAdapter } from "./adapter-types";
 import {
   CRYPTO_HEADER_SIZE,
   ENCRYPTED_EXT,
@@ -53,7 +48,6 @@ import {
   filesEqual,
   isServiceEntryName,
   isTempFile,
-  listEncryptedDir,
   parallelMap,
   removeSymlink,
   walkDir,
@@ -79,8 +73,6 @@ export class ShadowVaultManager {
   /** Абсолютный путь к теневому (расшифрованному) хранилищу */
   readonly shadowRoot: string;
 
-  private patched = false;
-  private originalMethods: Partial<IDataAdapter> = {};
   private readonly configDir: string;
 
   /** Сохранённое значение adapter.basePath ДО mount — для отката при unmount */
@@ -131,9 +123,10 @@ export class ShadowVaultManager {
    *   - adapter.getResourcePath(p) возвращает app://-URL указывающий внутрь shadow
    *     (чем рендерятся изображения, PDF и другие attachment'ы)
    *
-   * Не трогает методы адаптера — они уже пропатчены через patch().
+   * Методы адаптера (read/write/list/…) НЕ подменяются — Obsidian работает
+   * с shadow нативно, мирроринг в .enc делают vault-события (см. main).
    *
-   * После mount необходимо вызвать setupObsidianSymlink() чтобы конфиг был доступен.
+   * setupObsidianSymlink() должен быть вызван ДО mount, чтобы конфиг был доступен.
    */
   mount(adapter: IDataAdapter): void {
     if (this.mounted) {
@@ -1036,73 +1029,6 @@ export class ShadowVaultManager {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // Monkey-patching
-  // ═══════════════════════════════════════════════════════════════════════
-
-  patch(adapter: IDataAdapter): void {
-    if (this.patched) return;
-
-    const orig = this.originalMethods;
-    orig.read        = adapter.read.bind(adapter);
-    orig.readBinary  = adapter.readBinary.bind(adapter);
-    orig.write       = adapter.write.bind(adapter);
-    orig.writeBinary = adapter.writeBinary.bind(adapter);
-    orig.append      = adapter.append.bind(adapter);
-    orig.process     = adapter.process.bind(adapter);
-    orig.exists      = adapter.exists.bind(adapter);
-    orig.stat        = adapter.stat.bind(adapter);
-    orig.list        = adapter.list.bind(adapter);
-    orig.mkdir       = adapter.mkdir.bind(adapter);
-    orig.remove      = adapter.remove.bind(adapter);
-    orig.rename      = adapter.rename.bind(adapter);
-    orig.copy        = adapter.copy.bind(adapter);
-    orig.trashSystem = adapter.trashSystem.bind(adapter);
-    orig.trashLocal  = adapter.trashLocal.bind(adapter);
-
-    adapter.read        = (p)        => this.patchedRead(p);
-    adapter.readBinary  = (p)        => this.patchedReadBinary(p);
-    adapter.write       = (p, d, o)  => this.patchedWrite(p, d, o);
-    adapter.writeBinary = (p, d, o)  => this.patchedWriteBinary(p, d, o);
-    adapter.append      = (p, d, o)  => this.patchedAppend(p, d, o);
-    adapter.process     = (p, fn, o) => this.patchedProcess(p, fn, o);
-    adapter.exists      = (p, s)     => this.patchedExists(p, s);
-    adapter.stat        = (p)        => this.patchedStat(p);
-    adapter.list        = (p)        => this.patchedList(p);
-    adapter.mkdir       = (p)        => this.patchedMkdir(p);
-    adapter.remove      = (p)        => this.patchedRemove(p);
-    adapter.rename      = (p, np)    => this.patchedRename(p, np);
-    adapter.copy        = (p, np)    => this.patchedCopy(p, np);
-    adapter.trashSystem = (p)        => this.patchedTrashSystem(p);
-    adapter.trashLocal  = (p)        => this.patchedTrashLocal(p);
-
-    this.patched = true;
-  }
-
-  unpatch(adapter: IDataAdapter): void {
-    if (!this.patched) return;
-
-    const orig = this.originalMethods;
-    if (orig.read)        adapter.read        = orig.read;
-    if (orig.readBinary)  adapter.readBinary  = orig.readBinary;
-    if (orig.write)       adapter.write       = orig.write;
-    if (orig.writeBinary) adapter.writeBinary = orig.writeBinary;
-    if (orig.append)      adapter.append      = orig.append;
-    if (orig.process)     adapter.process     = orig.process;
-    if (orig.exists)      adapter.exists      = orig.exists;
-    if (orig.stat)        adapter.stat        = orig.stat;
-    if (orig.list)        adapter.list        = orig.list;
-    if (orig.mkdir)       adapter.mkdir       = orig.mkdir;
-    if (orig.remove)      adapter.remove      = orig.remove;
-    if (orig.rename)      adapter.rename      = orig.rename;
-    if (orig.copy)        adapter.copy        = orig.copy;
-    if (orig.trashSystem) adapter.trashSystem = orig.trashSystem;
-    if (orig.trashLocal)  adapter.trashLocal  = orig.trashLocal;
-
-    this.originalMethods = {};
-    this.patched = false;
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════
   // Публичные утилиты путей
   // ═══════════════════════════════════════════════════════════════════════
 
@@ -1577,368 +1503,6 @@ export class ShadowVaultManager {
     // только write-through файлы будут иметь shadow.mtime > original_enc.mtime
     const encStat = await fsp.stat(origEncPath);
     await fsp.utimes(shadowPath, encStat.atime, encStat.mtime);
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════
-  // Патченые методы адаптера
-  // ═══════════════════════════════════════════════════════════════════════
-
-  private async patchedRead(normalizedPath: string): Promise<string> {
-    if (this.isBypassPath(normalizedPath)) {
-      return this.originalMethods.read!(normalizedPath);
-    }
-    await this.ensureDecrypted(normalizedPath);
-    return fsp.readFile(this.shadowAbs(normalizedPath), "utf8");
-  }
-
-  private async patchedReadBinary(normalizedPath: string): Promise<ArrayBuffer> {
-    if (this.isBypassPath(normalizedPath)) {
-      return this.originalMethods.readBinary!(normalizedPath);
-    }
-    await this.ensureDecrypted(normalizedPath);
-    const buf = await fsp.readFile(this.shadowAbs(normalizedPath));
-    return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
-  }
-
-  private async patchedWrite(
-    normalizedPath: string,
-    data: string,
-    options?: DataWriteOptions
-  ): Promise<void> {
-    if (this.isBypassPath(normalizedPath)) {
-      this.logger?.debug("shadow", "write: bypass", { path: normalizedPath });
-      return this.originalMethods.write!(normalizedPath, data, options);
-    }
-
-    const shadowPath  = this.shadowAbs(normalizedPath);
-    const origEncPath = this.originalEncAbs(normalizedPath);
-
-    this.logger?.debug("shadow", "write → shadow + .enc", { path: normalizedPath, chars: data.length });
-
-    await fsp.mkdir(nodePath.dirname(shadowPath),  { recursive: true });
-    await fsp.mkdir(nodePath.dirname(origEncPath), { recursive: true });
-
-    // 1. СНАЧАЛА шифруем в память. Если шифрование падает — НЕ трогаем shadow,
-    //    пробрасываем ошибку (Obsidian узнает о неуспехе записи), и .enc/shadow
-    //    остаются в прежнем согласованном состоянии.
-    const encrypted = this.engine.encryptBuffer(Buffer.from(data, "utf8"));
-
-    // 2. Только при успешном шифровании пишем И shadow, И .enc (атомарно).
-    await fsp.writeFile(shadowPath, data, "utf8");
-    await atomicWrite(origEncPath, encrypted);
-  }
-
-  private async patchedWriteBinary(
-    normalizedPath: string,
-    data: ArrayBuffer,
-    options?: DataWriteOptions
-  ): Promise<void> {
-    if (this.isBypassPath(normalizedPath)) {
-      return this.originalMethods.writeBinary!(normalizedPath, data, options);
-    }
-
-    const shadowPath  = this.shadowAbs(normalizedPath);
-    const origEncPath = this.originalEncAbs(normalizedPath);
-    const buf = Buffer.from(data);
-
-    await fsp.mkdir(nodePath.dirname(shadowPath),  { recursive: true });
-    await fsp.mkdir(nodePath.dirname(origEncPath), { recursive: true });
-
-    // Зашифровано → оригинальное хранилище
-    if (buf.length > 1024 * 1024) {
-      // > 1 МБ: потоковое шифрование shadow → origEnc (читает из shadow,
-      // поэтому shadow пишем первым). Своя атомарность через .tmp + rename.
-      await fsp.writeFile(shadowPath, buf);
-      await this.engine.encryptStream(shadowPath, origEncPath);
-    } else {
-      // Малый файл: СНАЧАЛА шифруем в память; при ошибке shadow не трогаем
-      // (как в patchedWrite — без рассинхрона shadow/.enc).
-      const encrypted = this.engine.encryptBuffer(buf);
-      await fsp.writeFile(shadowPath, buf);
-      await atomicWrite(origEncPath, encrypted);
-    }
-  }
-
-  private async patchedAppend(
-    normalizedPath: string,
-    data: string,
-    options?: DataWriteOptions
-  ): Promise<void> {
-    if (this.isBypassPath(normalizedPath)) {
-      return this.originalMethods.append!(normalizedPath, data, options);
-    }
-
-    const shadowPath  = this.shadowAbs(normalizedPath);
-    const origEncPath = this.originalEncAbs(normalizedPath);
-
-    if (await fileExists(origEncPath)) {
-      await this.ensureDecrypted(normalizedPath);
-    } else {
-      await fsp.mkdir(nodePath.dirname(shadowPath), { recursive: true });
-    }
-
-    await fsp.appendFile(shadowPath, data, "utf8");
-
-    const fullContent = await fsp.readFile(shadowPath, "utf8");
-    const encrypted   = this.engine.encryptBuffer(Buffer.from(fullContent, "utf8"));
-    await atomicWrite(origEncPath, encrypted);
-  }
-
-  private async patchedProcess(
-    normalizedPath: string,
-    fn: (data: string) => string,
-    options?: DataWriteOptions
-  ): Promise<string> {
-    if (this.isBypassPath(normalizedPath)) {
-      return this.originalMethods.process!(normalizedPath, fn, options);
-    }
-    await this.ensureDecrypted(normalizedPath);
-    const current = await fsp.readFile(this.shadowAbs(normalizedPath), "utf8");
-    const result = fn(current);
-    await this.patchedWrite(normalizedPath, result, options);
-    return result;
-  }
-
-  private async patchedExists(
-    normalizedPath: string,
-    sensitive?: boolean
-  ): Promise<boolean> {
-    if (this.isBypassPath(normalizedPath)) {
-      return this.originalMethods.exists!(normalizedPath, sensitive);
-    }
-    // Файл существует если есть .enc в оригинале ИЛИ уже расшифрован в shadow
-    return (
-      (await fileExists(this.originalEncAbs(normalizedPath))) ||
-      (await fileExists(this.shadowAbs(normalizedPath)))
-    );
-  }
-
-  /**
-   * Вычисляет размер plaintext по .enc-файлу БЕЗ полной расшифровки.
-   *   - v2 (0x02): plaintext = размер_файла − CRYPTO_HEADER_SIZE (33).
-   *   - v2-chunked (0x03 и 0x04): читаем только префиксы длин сегментов и
-   *     суммируем plaintext-длины: Σ(segLen − IV − tag). Файл целиком не читаем.
-   *     Для 0x04 дополнительно сверяем число сегментов с segCount заголовка —
-   *     усечённый файл не даёт молчаливой частичной суммы (fallback = fileSize).
-   *   - 0 байт (legacy-артефакт пустого файла): plaintext = 0.
-   *   - прочее/нераспознанное: грубо не искажаем — отдаём размер файла как есть.
-   * @param encAbs абсолютный путь к .enc
-   * @param fileSize размер .enc из stat (чтобы не делать повторный stat)
-   */
-  private async plaintextSizeOfEnc(encAbs: string, fileSize: number): Promise<number> {
-    if (fileSize === 0) return 0;
-
-    let fh: import("fs/promises").FileHandle;
-    try {
-      fh = await fsp.open(encAbs, "r");
-    } catch {
-      return fileSize;
-    }
-    try {
-      // Читаем заголовок для детекта формата (29 байт хватает обеим версиям).
-      const head = Buffer.alloc(CHUNKED2_HEADER_LENGTH);
-      const { bytesRead } = await fh.read(head, 0, CHUNKED2_HEADER_LENGTH, 0);
-      const fmt = detectFormat(head.subarray(0, bytesRead));
-
-      if (fmt === "v2") {
-        // Цельный контейнер: фиксированный overhead 33 байта.
-        return fileSize >= CRYPTO_HEADER_SIZE ? fileSize - CRYPTO_HEADER_SIZE : fileSize;
-      }
-
-      if (fmt === "v2-chunked") {
-        // Суммируем plaintext-длины сегментов по их u32-префиксам, читая
-        // только 4 байта на сегмент (тело файла не читаем).
-        const ver = chunkedVersion(head.subarray(0, bytesRead));
-        const strict = ver === 4;
-        if (strict && bytesRead < CHUNKED2_HEADER_LENGTH) return fileSize; // обрезан заголовок
-        const expectedSegs = strict
-          ? (head[9] | (head[10] << 8) | (head[11] << 16) | (head[12] << 24)) >>> 0
-          : -1;
-
-        const SEG_OVERHEAD = IV_LENGTH + GCM_TAG_LENGTH; // IV + GCM-tag на сегмент
-        let off = strict ? CHUNKED2_HEADER_LENGTH : CHUNKED_HEADER_LENGTH;
-        let plaintext = 0;
-        let segs = 0;
-        const lenBuf = Buffer.alloc(SEGMENT_LEN_PREFIX);
-        for (;;) {
-          if (off + SEGMENT_LEN_PREFIX > fileSize) break;
-          const r = await fh.read(lenBuf, 0, SEGMENT_LEN_PREFIX, off);
-          if (r.bytesRead < SEGMENT_LEN_PREFIX) break;
-          const segLen =
-            (lenBuf[0] | (lenBuf[1] << 8) | (lenBuf[2] << 16) | (lenBuf[3] << 24)) >>> 0;
-          if (segLen < SEG_OVERHEAD) break; // защита от битого заголовка
-          plaintext += segLen - SEG_OVERHEAD;
-          segs++;
-          off += SEGMENT_LEN_PREFIX + segLen;
-        }
-        if (strict && (segs !== expectedSegs || off !== fileSize)) {
-          // Усечение/повреждение 0x04 — не отдаём частичную сумму.
-          return fileSize;
-        }
-        return plaintext;
-      }
-
-      // legacy/unknown — точного overhead не знаем; не искажаем грубо.
-      return fileSize;
-    } catch {
-      return fileSize;
-    } finally {
-      await fh.close().catch(() => undefined);
-    }
-  }
-
-  private async patchedStat(normalizedPath: string): Promise<AdapterStat | null> {
-    if (this.isBypassPath(normalizedPath)) {
-      return this.originalMethods.stat!(normalizedPath);
-    }
-
-    const shadowPath  = this.shadowAbs(normalizedPath);
-    const origEncPath = this.originalEncAbs(normalizedPath);
-
-    // Если файл уже расшифрован в теневом — возвращаем его стат (точный размер)
-    const statPath = (await fileExists(shadowPath)) ? shadowPath : origEncPath;
-
-    try {
-      const s     = await fsp.stat(statPath);
-      const isDir = s.isDirectory();
-      // Размер plaintext: для shadow — как есть; для .enc — компенсируем overhead
-      // с учётом формата (v2 / v2-chunked), без грубого искажения для chunked.
-      const size = (!isDir && statPath === origEncPath)
-        ? await this.plaintextSizeOfEnc(origEncPath, s.size)
-        : s.size;
-
-      return {
-        type:  isDir ? "folder" : "file",
-        ctime: s.ctimeMs,
-        mtime: s.mtimeMs,
-        size,
-      };
-    } catch {
-      return null;
-    }
-  }
-
-  private async patchedList(normalizedPath: string): Promise<ListedFiles> {
-    // "" (корень) НЕ байпасим — нам нужно перехватить список чтобы убрать .enc суффиксы.
-    // .obsidian и его содержимое — байпасим (конфигурация Obsidian хранится незашифрованно).
-    if (normalizedPath !== "" && this.isBypassPath(normalizedPath)) {
-      return this.originalMethods.list!(normalizedPath);
-    }
-
-    // Источник истины: оригинальное хранилище (содержит .enc файлы).
-    // Единый list-транслятор (см. fs-utils.listEncryptedDir).
-    return listEncryptedDir(
-      this.originalAbs(normalizedPath),
-      normalizedPath,
-      this.configDir
-    );
-  }
-
-  private async patchedMkdir(normalizedPath: string): Promise<void> {
-    if (this.isBypassPath(normalizedPath)) {
-      this.logger?.debug("shadow", "mkdir: bypass", { path: normalizedPath });
-      return this.originalMethods.mkdir!(normalizedPath);
-    }
-    this.logger?.debug("shadow", "mkdir → shadow + original", { path: normalizedPath });
-    await Promise.all([
-      fsp.mkdir(this.shadowAbs(normalizedPath),   { recursive: true }),
-      fsp.mkdir(this.originalAbs(normalizedPath), { recursive: true }),
-    ]);
-  }
-
-  private async patchedRemove(normalizedPath: string): Promise<void> {
-    if (this.isBypassPath(normalizedPath)) {
-      this.logger?.debug("shadow", "remove: bypass", { path: normalizedPath });
-      return this.originalMethods.remove!(normalizedPath);
-    }
-    this.logger?.debug("shadow", "remove → shadow + .enc", { path: normalizedPath });
-    await Promise.allSettled([
-      fsp.unlink(this.shadowAbs(normalizedPath)),
-      fsp.unlink(this.originalEncAbs(normalizedPath)),
-    ]);
-  }
-
-  private async patchedRename(
-    normalizedPath: string,
-    newNormalizedPath: string
-  ): Promise<void> {
-    if (this.isBypassPath(normalizedPath)) {
-      this.logger?.debug("shadow", "rename: bypass", { from: normalizedPath, to: newNormalizedPath });
-      return this.originalMethods.rename!(normalizedPath, newNormalizedPath);
-    }
-
-    const newShadow   = this.shadowAbs(newNormalizedPath);
-    const newOrigEnc  = this.originalEncAbs(newNormalizedPath);
-    const oldShadow   = this.shadowAbs(normalizedPath);
-    const oldOrigEnc  = this.originalEncAbs(normalizedPath);
-
-    this.logger?.debug("shadow", "rename", { from: normalizedPath, to: newNormalizedPath });
-
-    await fsp.mkdir(nodePath.dirname(newShadow),  { recursive: true });
-    await fsp.mkdir(nodePath.dirname(newOrigEnc), { recursive: true });
-
-    const shadowExists = await fileExists(oldShadow);
-    const encExists = await fileExists(oldOrigEnc);
-    this.logger?.debug("shadow", "rename: проверка источников", { shadowExists, encExists });
-
-    if (shadowExists) {
-      await fsp.rename(oldShadow, newShadow);
-    } else {
-      this.logger?.warn("shadow", "rename: oldShadow НЕ НАЙДЕН — пропускаем shadow rename", { path: oldShadow });
-    }
-
-    if (encExists) {
-      await fsp.rename(oldOrigEnc, newOrigEnc);
-    } else {
-      this.logger?.warn("shadow", "rename: oldEnc НЕ НАЙДЕН — пропускаем .enc rename", { path: oldOrigEnc });
-    }
-  }
-
-  private async patchedCopy(
-    normalizedPath: string,
-    newNormalizedPath: string
-  ): Promise<void> {
-    if (this.isBypassPath(normalizedPath)) {
-      return this.originalMethods.copy!(normalizedPath, newNormalizedPath);
-    }
-
-    const newShadow  = this.shadowAbs(newNormalizedPath);
-    const newOrigEnc = this.originalEncAbs(newNormalizedPath);
-
-    await fsp.mkdir(nodePath.dirname(newShadow),  { recursive: true });
-    await fsp.mkdir(nodePath.dirname(newOrigEnc), { recursive: true });
-
-    const oldShadow = this.shadowAbs(normalizedPath);
-    if (await fileExists(oldShadow)) {
-      await fsp.copyFile(oldShadow, newShadow);
-    }
-
-    // Копия должна иметь свой IV → шифруем заново (нельзя просто копировать .enc блоб)
-    await this.ensureDecrypted(normalizedPath);
-    const content   = await fsp.readFile(this.shadowAbs(normalizedPath));
-    const encrypted = this.engine.encryptBuffer(content);
-    await atomicWrite(newOrigEnc, encrypted);
-  }
-
-  private async patchedTrashSystem(normalizedPath: string): Promise<boolean> {
-    if (this.isBypassPath(normalizedPath)) {
-      return this.originalMethods.trashSystem!(normalizedPath);
-    }
-    await fsp.unlink(this.shadowAbs(normalizedPath)).catch(() => undefined);
-    try {
-      await fsp.unlink(this.originalEncAbs(normalizedPath));
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  private async patchedTrashLocal(normalizedPath: string): Promise<void> {
-    if (this.isBypassPath(normalizedPath)) {
-      return this.originalMethods.trashLocal!(normalizedPath);
-    }
-    await fsp.unlink(this.shadowAbs(normalizedPath)).catch(() => undefined);
-    await fsp.unlink(this.originalEncAbs(normalizedPath)).catch(() => undefined);
   }
 
   // ═══════════════════════════════════════════════════════════════════════
