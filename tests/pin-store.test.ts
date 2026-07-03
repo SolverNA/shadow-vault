@@ -14,9 +14,14 @@ import {
   PinError,
   PinLockoutError,
   PIN_MAX_ATTEMPTS,
+  PIN_KDF_ITERATIONS,
+  PIN_KDF_ITERATIONS_LEGACY,
   DeviceStore,
 } from "../src/pin-store";
-import { randomBytes } from "../src/crypto/platform";
+import { getSubtle, randomBytes } from "../src/crypto/platform";
+import { KEY_LENGTH, IV_LENGTH, GCM_TAG_LENGTH } from "../src/crypto/constants";
+import { writeContainer } from "../src/crypto/format";
+import { bytesToHex } from "../src/hex";
 import { deriveMasterKey } from "../src/crypto/key-derivation";
 import { NodeCryptoEngine } from "../src/crypto-engine";
 
@@ -150,6 +155,78 @@ describe("PinStore — повреждённые PIN-данные (битый hex
 
     await expect(pin.unlockWithPin("1234")).rejects.toThrow(PinLockoutError);
     expect(pin.isPinSet()).toBe(false);
+  });
+});
+
+describe("PinStore — совместимость по числу итераций PBKDF2", () => {
+  /**
+   * Записывает legacy-blob так, как это делали старые версии плагина:
+   * PBKDF2 с PIN_KDF_ITERATIONS_LEGACY и БЕЗ поля iterations в store.
+   */
+  async function writeLegacyBlob(
+    store: FakeStore,
+    pin: string,
+    masterKey: Uint8Array
+  ): Promise<void> {
+    const subtle = getSubtle();
+    const deviceSalt = randomBytes(16);
+    const material = await subtle.importKey(
+      "raw",
+      new TextEncoder().encode(pin),
+      "PBKDF2",
+      false,
+      ["deriveBits"]
+    );
+    const bits = await subtle.deriveBits(
+      {
+        name: "PBKDF2",
+        salt: deviceSalt,
+        iterations: PIN_KDF_ITERATIONS_LEGACY,
+        hash: "SHA-512",
+      },
+      material,
+      KEY_LENGTH * 8
+    );
+    const pinKey = await subtle.importKey(
+      "raw",
+      new Uint8Array(bits),
+      { name: "AES-GCM", length: KEY_LENGTH * 8 },
+      false,
+      ["encrypt"]
+    );
+    const iv = randomBytes(IV_LENGTH);
+    const ctWithTag = await subtle.encrypt(
+      { name: "AES-GCM", iv, tagLength: GCM_TAG_LENGTH * 8 },
+      pinKey,
+      masterKey
+    );
+    store.setItem("shadow-vault:pin:wrapped", bytesToHex(writeContainer(iv, new Uint8Array(ctWithTag))));
+    store.setItem("shadow-vault:pin:deviceSalt", bytesToHex(deviceSalt));
+    store.setItem("shadow-vault:pin:attempts", "0");
+    // Поле iterations НЕ пишем — его не было в старых версиях.
+  }
+
+  it("legacy-blob (без поля iterations) разблокируется легаси-числом итераций", async () => {
+    const store = new FakeStore();
+    await writeLegacyBlob(store, "1234", MASTER);
+    expect(store.map.has("shadow-vault:pin:iterations")).toBe(false);
+
+    const pin = new PinStore(store);
+    const recovered = await pin.unlockWithPin("1234");
+    expect(Buffer.from(recovered).equals(Buffer.from(MASTER))).toBe(true);
+  });
+
+  it("новый blob пишется с новым числом итераций (и оно записано в store)", async () => {
+    const store = new FakeStore();
+    const pin = new PinStore(store);
+    await pin.enablePin("1234", MASTER);
+
+    expect(store.map.get("shadow-vault:pin:iterations")).toBe(String(PIN_KDF_ITERATIONS));
+    expect(PIN_KDF_ITERATIONS).toBeGreaterThan(PIN_KDF_ITERATIONS_LEGACY);
+
+    // И такой blob честно разблокируется своим (новым) числом итераций.
+    const recovered = await pin.unlockWithPin("1234");
+    expect(Buffer.from(recovered).equals(Buffer.from(MASTER))).toBe(true);
   });
 });
 

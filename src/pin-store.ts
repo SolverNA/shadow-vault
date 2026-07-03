@@ -5,8 +5,21 @@
  *   - PIN НЕ деривирует мастер-ключ напрямую. Вместо этого:
  *       pinKey       = PBKDF2(pin, deviceSalt, iterations, SHA-512) → 32 байта
  *       wrappedMaster = AES-GCM(masterKey, pinKey)  (контейнер v2)
- *     Расшифровать wrappedMaster без PIN невозможно; зная masterKey, PIN не
- *     восстанавливается (PBKDF2 односторонний).
+ *     Зная masterKey, PIN не восстанавливается (PBKDF2 односторонний).
+ *
+ *   - ЧЕСТНАЯ ОЦЕНКА СТОЙКОСТИ: фактическая стойкость wrappedMaster равна
+ *     ЭНТРОПИИ PIN, а не стойкости мастер-пароля. wrappedMaster + deviceSalt
+ *     лежат в localStorage, лимит попыток — чисто клиентский (сам счётчик
+ *     тоже в localStorage). Атакующий, скопировавший данные устройства,
+ *     перебирает PIN офлайн без всяких лимитов: пространство 4–8 цифр — это
+ *     10^4–10^8 вариантов, и даже с сотнями тысяч итераций PBKDF2 такой
+ *     перебор тривиален на GPU (часы, не годы). Итерации лишь удорожают
+ *     перебор, но НЕ делают его невозможным.
+ *     Поэтому PIN — защита от «подглядывания через плечо» и случайного
+ *     доступа (взял телефон со стола), НЕ от атакующего с полным доступом
+ *     к устройству/его файлам. Кому важна эта модель угроз — PIN включать
+ *     не следует, только полный пароль.
+ *
  *   - wrappedMaster + deviceSalt + счётчик попыток хранятся ТОЛЬКО ЛОКАЛЬНО
  *     в window.localStorage. localStorage — per-device, НЕ синхронизируется
  *     ни через Obsidian Sync, ни через облако/git (это не файл vault).
@@ -37,8 +50,19 @@ const LS_ATTEMPTS = LS_PREFIX + "attempts";
 const LS_ITERATIONS = LS_PREFIX + "iterations";
 const LS_BIOMETRIC = LS_PREFIX + "biometric";
 
-/** Итерации PBKDF2 для PIN. PIN короткий, но wrapped-данные device-local. */
-export const PIN_KDF_ITERATIONS = 200_000;
+/**
+ * Итерации PBKDF2 для НОВЫХ PIN-blob'ов. Выровнено с мастер-паролем (600k,
+ * SHA-512): setupPin/unlockWithPin выполняются раз за сессию, задержка
+ * ~0.5–2 сек на mobile приемлема, а стоимость офлайн-перебора растёт втрое.
+ * (Перебор всё равно возможен — см. шапку файла; итерации лишь удорожают его.)
+ */
+export const PIN_KDF_ITERATIONS = 600_000;
+/**
+ * Итерации, которыми писались старые blob'ы ДО того, как число итераций
+ * стало сохраняться в localStorage (LS_ITERATIONS). Если поле отсутствует —
+ * blob создан старой версией и читается с этим значением. НЕ МЕНЯТЬ.
+ */
+export const PIN_KDF_ITERATIONS_LEGACY = 200_000;
 /** Длина случайной соли устройства. */
 export const DEVICE_SALT_LENGTH = 16;
 /** Лимит неверных попыток PIN до сброса PIN-данных. */
@@ -59,7 +83,11 @@ function defaultStore(): DeviceStore | null {
   return g.localStorage ?? null;
 }
 
-/** Деривирует pinKey из PIN + deviceSalt (PBKDF2-SHA512). */
+/**
+ * Деривирует pinKey из PIN + deviceSalt (PBKDF2-SHA512).
+ * Промежуточные сырые байты pinKey зачищаются сразу после импорта в
+ * non-extractable CryptoKey.
+ */
 async function derivePinKey(
   pin: string,
   deviceSalt: Uint8Array,
@@ -73,18 +101,24 @@ async function derivePinKey(
     false,
     ["deriveBits"]
   );
-  const bits = await subtle.deriveBits(
-    { name: "PBKDF2", salt: deviceSalt, iterations, hash: "SHA-512" },
-    material,
-    KEY_LENGTH * 8
+  const bits = new Uint8Array(
+    await subtle.deriveBits(
+      { name: "PBKDF2", salt: deviceSalt, iterations, hash: "SHA-512" },
+      material,
+      KEY_LENGTH * 8
+    )
   );
-  return subtle.importKey(
-    "raw",
-    new Uint8Array(bits),
-    { name: "AES-GCM", length: KEY_LENGTH * 8 },
-    false,
-    ["encrypt", "decrypt"]
-  );
+  try {
+    return await subtle.importKey(
+      "raw",
+      bits,
+      { name: "AES-GCM", length: KEY_LENGTH * 8 },
+      false,
+      ["encrypt", "decrypt"]
+    );
+  } finally {
+    bits.fill(0);
+  }
 }
 
 /** Ошибки PIN-входа. */
@@ -114,6 +148,11 @@ export class PinStore {
   /**
    * Включает PIN-вход: оборачивает masterKey ключом из PIN и сохраняет
    * wrappedMaster+deviceSalt локально. masterKey передаётся как сырые 32 байта.
+   *
+   * ВЛАДЕНИЕ: masterKey остаётся у вызывающего — метод только читает байты
+   * (шифрует их в wrappedMaster); вызывающий обязан зачистить свой буфер
+   * (fill(0)) после вызова. Новые blob'ы пишутся с PIN_KDF_ITERATIONS,
+   * число итераций сохраняется рядом (LS_ITERATIONS) для совместимости.
    */
   async enablePin(pin: string, masterKey: Uint8Array): Promise<void> {
     if (!this.store) {
@@ -146,6 +185,13 @@ export class PinStore {
    * Разблокирует по PIN: разворачивает wrappedMaster → сырой masterKey.
    * Считает неверные попытки; при превышении лимита стирает PIN-данные.
    *
+   * Совместимость: число итераций PBKDF2 читается из LS_ITERATIONS; если
+   * поле отсутствует (blob старой версии) — используется легаси-значение
+   * PIN_KDF_ITERATIONS_LEGACY, которым такие blob'ы были записаны.
+   *
+   * ВЛАДЕНИЕ: возвращаемый сырой masterKey переходит вызывающему — он ОБЯЗАН
+   * зачистить его (fill(0)), как только ключ загружен в движок/обёрнут заново.
+   *
    * @throws PinError       при неверном PIN (с числом оставшихся попыток)
    * @throws PinLockoutError если PIN не настроен или лимит исчерпан
    */
@@ -156,7 +202,12 @@ export class PinStore {
 
     const wrappedHex = this.store.getItem(LS_WRAPPED)!;
     const saltHex = this.store.getItem(LS_DEVICE_SALT)!;
-    const iterations = parseInt(this.store.getItem(LS_ITERATIONS) ?? String(PIN_KDF_ITERATIONS), 10);
+    // Blob без поля итераций — записан старой версией с легаси-числом.
+    const storedIterations = this.store.getItem(LS_ITERATIONS);
+    const parsedIterations = storedIterations === null ? NaN : parseInt(storedIterations, 10);
+    const iterations = Number.isFinite(parsedIterations) && parsedIterations > 0
+      ? parsedIterations
+      : PIN_KDF_ITERATIONS_LEGACY;
 
     // Битый hex в localStorage (повреждённые PIN-данные) — не «неверный PIN»,
     // а необратимая порча: разблокировать таким wrappedMaster нельзя никогда.
