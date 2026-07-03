@@ -171,6 +171,41 @@ describe("ShadowVaultManager — инициализация и пути", () => 
     fs.rmSync(base, { recursive: true, force: true });
   });
 
+  // Авто-вычисление пути читает реальные process.env/platform — надёжно
+  // подменить env можно только на linux (XDG_DATA_HOME).
+  (process.platform === "linux" ? it : it.skip)(
+    "без явного shadowRoot: путь вычисляется в app-data (не сиблинг vault'а)",
+    async () => {
+      const base = fs.mkdtempSync(nodePath.join(os.tmpdir(), "sv-autoloc-"));
+      const origRoot = nodePath.join(base, "vault");
+      fs.mkdirSync(origRoot);
+      const dataHome = nodePath.join(base, "xdg-data");
+      const oldXdg = process.env.XDG_DATA_HOME;
+      process.env.XDG_DATA_HOME = dataHome;
+
+      try {
+        const engine = new CryptoEngine();
+        await engine.deriveKey("test@test.local", "pwd");
+        const manager = new ShadowVaultManager(engine, origRoot);
+
+        // Shadow — внутри app-data, НЕ рядом с vault'ом (утечка в облачный sync)
+        expect(manager.shadowRoot.startsWith(nodePath.join(dataHome, "shadow-vault"))).toBe(true);
+        expect(nodePath.dirname(manager.shadowRoot)).not.toBe(base);
+        expect(fs.existsSync(manager.shadowRoot)).toBe(true);
+
+        // Путь детерминирован (crash recovery между перезапусками)
+        const manager2 = new ShadowVaultManager(engine, origRoot);
+        expect(manager2.shadowRoot).toBe(manager.shadowRoot);
+
+        engine.destroy();
+      } finally {
+        if (oldXdg === undefined) delete process.env.XDG_DATA_HOME;
+        else process.env.XDG_DATA_HOME = oldXdg;
+        fs.rmSync(base, { recursive: true, force: true });
+      }
+    }
+  );
+
   it("shadowAbs и originalAbs корректно строят абсолютные пути", async () => {
     const env = await makeEnv();
     try {

@@ -3,7 +3,8 @@
  *
  * Архитектура:
  *   Оригинальное хранилище (originalRoot)  — содержит .enc + plaintext .obsidian/
- *   Теневое хранилище (shadowRoot)         — сиблинг оригинала, расшифрованный клон
+ *   Теневое хранилище (shadowRoot)         — расшифрованный клон в локальной
+ *                                             app-data (вне облачного sync, см. shadow-location.ts)
  *
  *   После unlock плагин расшифровывает ВСЁ в shadow и монтирует shadow как
  *   adapter.basePath — Obsidian работает с shadow натив но (включая getResourcePath

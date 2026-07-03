@@ -3,8 +3,10 @@
  *
  * Два физических хранилища:
  *   Оригинальное  (originalRoot) — зашифрованные файлы формата <name>.<ext>.enc
- *   Теневое       (shadowRoot)   — расшифрованные файлы <name>.<ext>, рядом с оригинальным,
- *                                  НЕ внутри него: parentDir/.shadow-vault-<hash>
+ *   Теневое       (shadowRoot)   — расшифрованные файлы <name>.<ext> в ЛОКАЛЬНОЙ
+ *                                  app-data директории (вне облачного sync):
+ *                                  <appData>/shadow-vault/shadow-<hash>
+ *                                  (см. shadow-location.ts; fallback — сиблинг vault'а)
  *
  * Маршрутизация:
  *   ┌──────────────────────────────────────────────────────────────────┐
@@ -25,9 +27,9 @@
 import * as fs from "fs";
 import * as fsp from "fs/promises";
 import * as nodePath from "path";
-import * as crypto from "crypto";
 import * as os from "os";
 import { CryptoEngine } from "./crypto-engine";
+import { resolveShadowRoot } from "./shadow-location";
 import {
   detectFormat,
   chunkedVersion,
@@ -102,17 +104,12 @@ export class ShadowVaultManager {
     if (shadowRoot) {
       this.shadowRoot = nodePath.normalize(shadowRoot);
     } else {
-      // Теневое хранилище — РЯДОМ с оригинальным, не внутри.
-      // Детерминированное имя на базе хеша пути: важно для crash recovery после перезапуска.
-      const vaultHash = crypto
-        .createHash("sha256")
-        .update(this.originalRoot)
-        .digest("hex")
-        .slice(0, 16);
-      this.shadowRoot = nodePath.join(
-        nodePath.dirname(this.originalRoot),
-        ".shadow-vault-" + vaultHash
-      );
+      // Теневое хранилище — в ЛОКАЛЬНОЙ app-data директории (вне облачного
+      // sync), с детерминированным именем на базе хеша пути originalRoot:
+      // важно для crash recovery после перезапуска. Если app-data недоступна —
+      // fallback к старому поведению (сиблинг vault'а) с logger.warn.
+      // Единственный источник правды пути — resolveShadowRoot (shadow-location).
+      this.shadowRoot = resolveShadowRoot(this.originalRoot, logger).shadowRoot;
     }
   }
 

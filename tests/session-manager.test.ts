@@ -10,6 +10,7 @@ import * as nodePath from "path";
 import * as os from "os";
 import { SessionManager } from "../src/session-manager";
 import { CryptoEngine } from "../src/crypto-engine";
+import { legacyShadowRoot } from "../src/shadow-location";
 
 // ─────────────────────────────────────────────
 // Хелперы
@@ -503,5 +504,140 @@ describe("SessionManager — сквозной сценарий краша", () =
       expect(fs.existsSync(nodePath.join(env.pluginDir, "session.lock"))).toBe(false);
       expect(env.engine.isUnlocked()).toBe(false);
     } finally { env.cleanup(); }
+  });
+});
+
+// ─────────────────────────────────────────────
+// Recovery из legacy shadow (сиблинг vault'а — расположение до переноса в app-data)
+// ─────────────────────────────────────────────
+
+describe("SessionManager — recovery из legacy shadow (старое расположение)", () => {
+  /** Пишет plaintext в LEGACY shadow (сиблинг originalRoot) — состояние после
+   *  краша ДО обновления плагина на версию с app-data расположением. */
+  async function writePlaintextLegacyShadow(
+    env: TestEnv, relPath: string, plaintext: string, mtime?: Date
+  ): Promise<string> {
+    const legacyRoot = legacyShadowRoot(env.originalRoot);
+    const absPath = nodePath.join(legacyRoot, ...relPath.split("/"));
+    await fsp.mkdir(nodePath.dirname(absPath), { recursive: true });
+    await fsp.writeFile(absPath, plaintext, "utf8");
+    if (mtime) await fsp.utimes(absPath, mtime, mtime);
+    return legacyRoot;
+  }
+
+  it("startSession: непустой legacy shadow без lock-файла детектируется как краш", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncryptedOriginal(env, "note.md", "old");
+      await new Promise(r => setTimeout(r, 100));
+      await writePlaintextLegacyShadow(env, "note.md", "edit before update");
+
+      const result = await env.session.startSession();
+      expect(result.hadCrash).toBe(true);
+      expect(result.recovery?.recoveredFiles).toContain("note.md");
+    } finally { env.cleanup(); }
+  });
+
+  it("recovery восстанавливает правку из legacy shadow в .enc и удаляет legacy-каталог", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncryptedOriginal(env, "note.md", "old content");
+      await new Promise(r => setTimeout(r, 100));
+      const legacyRoot = await writePlaintextLegacyShadow(env, "note.md", "unsynced edit from old version");
+
+      const result = await env.session.recoverFromCrash();
+      expect(result.recoveredFiles).toContain("note.md");
+      expect(result.failedFiles).toHaveLength(0);
+
+      // .enc обновлён данными из legacy shadow
+      const encBuf = await fsp.readFile(nodePath.join(env.originalRoot, "note.md.enc"));
+      expect(env.engine.decryptBuffer(encBuf).toString("utf8"))
+        .toBe("unsynced edit from old version");
+
+      // Legacy-каталог (plaintext в потенциально облачной папке) удалён
+      expect(fs.existsSync(legacyRoot)).toBe(false);
+    } finally { env.cleanup(); }
+  });
+
+  it("файл только в legacy shadow (нет .enc): восстанавливается как новый .enc", async () => {
+    const env = await makeEnv();
+    try {
+      const legacyRoot = await writePlaintextLegacyShadow(env, "sub/created.md", "created before crash");
+
+      const result = await env.session.recoverFromCrash();
+      expect(result.recoveredFiles).toContain("sub/created.md");
+      expect(fs.existsSync(nodePath.join(env.originalRoot, "sub", "created.md.enc"))).toBe(true);
+      expect(fs.existsSync(legacyRoot)).toBe(false);
+    } finally { env.cleanup(); }
+  });
+
+  it("конфликт: правка в ТЕКУЩЕМ shadow новее — она побеждает legacy-копию", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncryptedOriginal(env, "note.md", "oldest");
+      await new Promise(r => setTimeout(r, 100));
+      // Legacy-правка (старая сессия до обновления)
+      await writePlaintextLegacyShadow(env, "note.md", "legacy edit");
+      await new Promise(r => setTimeout(r, 100));
+      // Правка текущей сессии — новее
+      await writePlaintextShadow(env, "note.md", "current edit");
+
+      await env.session.recoverFromCrash();
+
+      const encBuf = await fsp.readFile(nodePath.join(env.originalRoot, "note.md.enc"));
+      expect(env.engine.decryptBuffer(encBuf).toString("utf8")).toBe("current edit");
+    } finally { env.cleanup(); }
+  });
+
+  it("legacy shadow идентичен оригиналу: ничего не восстанавливает, но каталог удаляет", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncryptedOriginal(env, "same.md", "same content");
+      const encStat = await fsp.stat(nodePath.join(env.originalRoot, "same.md.enc"));
+      const legacyRoot = await writePlaintextLegacyShadow(env, "same.md", "same content", encStat.mtime);
+
+      const result = await env.session.recoverFromCrash();
+      expect(result.recoveredFiles).toHaveLength(0);
+      expect(result.failedFiles).toHaveLength(0);
+      expect(fs.existsSync(legacyRoot)).toBe(false);
+    } finally { env.cleanup(); }
+  });
+
+  it("ошибка восстановления из legacy: каталог НЕ удаляется (данные не теряем)", async () => {
+    const env = await makeEnv();
+    try {
+      const legacyRoot = await writePlaintextLegacyShadow(env, "bad.md", "unreadable");
+      await fsp.chmod(nodePath.join(legacyRoot, "bad.md"), 0o000);
+
+      const result = await env.session.recoverFromCrash();
+      expect(result.failedFiles).toContain("bad.md");
+      expect(fs.existsSync(legacyRoot)).toBe(true);
+
+      await fsp.chmod(nodePath.join(legacyRoot, "bad.md"), 0o644); // для cleanup
+    } finally { env.cleanup(); }
+  });
+
+  it("fallback-режим (shadowRoot == legacy-сиблинг): двойной обработки нет", async () => {
+    const base = fs.mkdtempSync(nodePath.join(os.tmpdir(), "sv-session-fb-"));
+    const originalRoot = nodePath.join(base, "original");
+    fs.mkdirSync(originalRoot, { recursive: true });
+    const engine = new CryptoEngine();
+    await engine.deriveKey("test@test.local", "session-test-password");
+    // shadowRoot указывает на ТО ЖЕ место, что legacy-сиблинг (fallback-режим)
+    const shadowRoot = legacyShadowRoot(originalRoot);
+    fs.mkdirSync(shadowRoot, { recursive: true });
+    const session = new SessionManager(engine, originalRoot, shadowRoot, nodePath.join(base, "plugin"));
+    try {
+      fs.writeFileSync(nodePath.join(shadowRoot, "note.md"), "fallback edit");
+
+      const result = await session.recoverFromCrash();
+      // Файл восстановлен ровно один раз, активный shadow НЕ удалён
+      expect(result.recoveredFiles).toEqual(["note.md"]);
+      expect(fs.existsSync(shadowRoot)).toBe(true);
+      expect(fs.existsSync(nodePath.join(originalRoot, "note.md.enc"))).toBe(true);
+    } finally {
+      try { engine.destroy(); } catch { /* уже уничтожен */ }
+      fs.rmSync(base, { recursive: true, force: true });
+    }
   });
 });

@@ -24,6 +24,7 @@ import * as fs from "fs";
 import * as nodePath from "path";
 import * as os from "os";
 import { CryptoEngine } from "./crypto-engine";
+import { legacyShadowRoot } from "./shadow-location";
 import { MTIME_TOLERANCE_MS, atomicWrite, fileExists, isServiceEntryName } from "./fs-utils";
 import { checkFileIntegrity, compareSemantic } from "./integrity-check";
 import type { Logger } from "./logger";
@@ -66,6 +67,16 @@ export class SessionManager {
   /** Старый путь — проверяется и удаляется при обнаружении (миграция) */
   private readonly legacySessionFilePath: string;
 
+  /**
+   * СТАРОЕ расположение shadow (до переноса в app-data): сиблинг хранилища.
+   * После обновления плагина здесь может остаться recovery-shadow от
+   * крашнувшейся сессии старой версии — startSession проверяет ОБА места,
+   * чтобы не потерять несинхронизированные правки. Если резолвер работает
+   * в fallback-режиме, legacyShadowPath совпадает с shadowRoot — тогда
+   * отдельная legacy-обработка отключается (см. legacyShadowDiffers).
+   */
+  private readonly legacyShadowPath: string;
+
   /** Опциональный структурный логгер (DI из main); тесты передают undefined. */
   private readonly logger?: Logger;
 
@@ -80,7 +91,13 @@ export class SessionManager {
   ) {
     this.sessionFilePath = nodePath.join(pluginDirAbs, SESSION_FILE);
     this.legacySessionFilePath = nodePath.join(originalRoot, LEGACY_SESSION_FILE);
+    this.legacyShadowPath = legacyShadowRoot(originalRoot);
     this.logger = logger;
+  }
+
+  /** true если legacy-сиблинг — ОТДЕЛЬНОЕ от текущего shadow место. */
+  private get legacyShadowDiffers(): boolean {
+    return nodePath.normalize(this.legacyShadowPath) !== nodePath.normalize(this.shadowRoot);
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -124,6 +141,17 @@ export class SessionManager {
       this.logger?.warn("session", "shadow vault не пуст — обнаружен краш без lock-файла");
     }
 
+    // ── Legacy shadow (сиблинг vault'а, до переноса в app-data) ────────────
+    // После обновления плагина recovery-shadow крашнувшейся СТАРОЙ версии
+    // лежит в старом месте. Не проверить его — потерять несинхронизированные
+    // правки пользователя (recoverFromCrash обработает оба места).
+    if (!hadCrash && this.legacyShadowDiffers && (await this.shadowHasFilesIn(this.legacyShadowPath))) {
+      hadCrash = true;
+      this.logger?.warn("session", "найден непустой legacy shadow (сиблинг vault'а) — recovery из старого места", {
+        legacyShadow: this.legacyShadowPath,
+      });
+    }
+
     if (hadCrash) {
       recovery = await this.recoverFromCrash();
       this.logger?.info("session", "recovery завершён", {
@@ -147,9 +175,14 @@ export class SessionManager {
 
   /** true если в shadowRoot есть хотя бы один обычный файл (не считая .obsidian symlink) */
   private async shadowHasFiles(): Promise<boolean> {
-    if (!(await fileExists(this.shadowRoot))) return false;
+    return this.shadowHasFilesIn(this.shadowRoot);
+  }
+
+  /** Та же проверка для произвольного корня (текущий shadow или legacy-сиблинг). */
+  private async shadowHasFilesIn(rootAbs: string): Promise<boolean> {
+    if (!(await fileExists(rootAbs))) return false;
     try {
-      const entries = await fsp.readdir(this.shadowRoot, { withFileTypes: true });
+      const entries = await fsp.readdir(rootAbs, { withFileTypes: true });
       for (const e of entries) {
         // Служебные артефакты не считаются данными. Пользовательские dot-пути
         // (.trash и т.п.) — считаются: их остаток в shadow означает краш,
@@ -230,20 +263,67 @@ export class SessionManager {
    *
    * После recovery shadow vault не удаляется — его чистит endSession().
    * startSession() вызывает recoverFromCrash() ДО создания нового .session_active.
+   *
+   * ДВА МЕСТА: recovery проходит и по ТЕКУЩЕМУ shadow (app-data), и по
+   * legacy-сиблингу vault'а (recovery-shadow от версии плагина до переноса).
+   * Порядок важен: сначала текущий shadow, потом legacy. Recovery пишет .enc
+   * с mtime=now, поэтому у второго прохода mtime-фильтр (Этап 0) отсекает
+   * его более СТАРЫЕ копии тех же файлов — побеждает правка из более новой
+   * сессии (текущий shadow всегда новее legacy: legacy мог остаться только
+   * от сессии ДО обновления плагина).
+   *
+   * После успешного legacy-recovery (без failed) legacy-каталог УДАЛЯЕТСЯ:
+   * это plaintext в потенциально облачной папке — именно от него мы уходили.
    */
   async recoverFromCrash(): Promise<CrashRecoveryResult> {
+    const result = await this.recoverFromShadowRoot(this.shadowRoot);
+
+    if (this.legacyShadowDiffers && (await fileExists(this.legacyShadowPath))) {
+      const legacy = await this.recoverFromShadowRoot(this.legacyShadowPath);
+      result.recoveredFiles.push(...legacy.recoveredFiles);
+      result.failedFiles.push(...legacy.failedFiles);
+      result.corruptedShadow.push(...legacy.corruptedShadow);
+
+      if (legacy.failedFiles.length === 0) {
+        // Всё восстановлено (или было идентично) — plaintext-сиблинг больше
+        // не нужен, убираем утечку из облачной папки.
+        try {
+          await fsp.rm(this.legacyShadowPath, { recursive: true, force: true });
+          this.logger?.info("session", "legacy shadow восстановлен и удалён", {
+            path: this.legacyShadowPath,
+            recovered: legacy.recoveredFiles.length,
+          });
+        } catch (err) {
+          this.logger?.warn("session", "legacy shadow восстановлен, но удалить каталог не удалось", {
+            path: this.legacyShadowPath,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      } else {
+        this.logger?.warn("session", "legacy shadow: часть файлов не восстановлена — каталог оставлен для повторного recovery", {
+          path: this.legacyShadowPath,
+          failed: legacy.failedFiles.length,
+        });
+      }
+    }
+
+    return result;
+  }
+
+  /** Recovery-проход по одному shadow-корню (текущему или legacy). */
+  private async recoverFromShadowRoot(shadowRootAbs: string): Promise<CrashRecoveryResult> {
     const recoveredFiles: string[] = [];
     const failedFiles:    string[] = [];
     const corruptedShadow: string[] = [];
 
-    if (!(await fileExists(this.shadowRoot))) {
+    if (!(await fileExists(shadowRootAbs))) {
       return { recoveredFiles, failedFiles, corruptedShadow };
     }
 
-    const shadowFiles = await this.scanShadowFiles();
+    const shadowFiles = await this.scanShadowFilesIn(shadowRootAbs);
 
     for (const normalizedPath of shadowFiles) {
-      const shadowAbs      = nodePath.join(this.shadowRoot,   ...normalizedPath.split("/"));
+      const shadowAbs      = nodePath.join(shadowRootAbs,     ...normalizedPath.split("/"));
       const originalEncAbs = nodePath.join(this.originalRoot, ...normalizedPath.split("/")) + ".enc";
 
       try {
@@ -364,10 +444,15 @@ export class SessionManager {
    * ShadowVaultManager.scanShadowFilesForSync (encrypt-back).
    */
   async scanShadowFiles(relDir = ""): Promise<string[]> {
+    return this.scanShadowFilesIn(this.shadowRoot, relDir);
+  }
+
+  /** Тот же скан для произвольного shadow-корня (текущий или legacy-сиблинг). */
+  private async scanShadowFilesIn(rootAbs: string, relDir = ""): Promise<string[]> {
     const result: string[] = [];
     const absDir = relDir
-      ? nodePath.join(this.shadowRoot, ...relDir.split("/"))
-      : this.shadowRoot;
+      ? nodePath.join(rootAbs, ...relDir.split("/"))
+      : rootAbs;
 
     let entries: fs.Dirent[];
     try {
@@ -385,7 +470,7 @@ export class SessionManager {
 
       const rel = prefix + entry.name;
       if (entry.isDirectory()) {
-        const sub = await this.scanShadowFiles(rel);
+        const sub = await this.scanShadowFilesIn(rootAbs, rel);
         result.push(...sub);
       } else if (entry.isFile()) {
         result.push(rel);
