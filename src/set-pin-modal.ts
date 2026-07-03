@@ -18,6 +18,9 @@ export class SetPinModal extends Modal {
   private btnSubmit!: HTMLButtonElement;
   private errorEl!: HTMLElement;
 
+  /** true — setupPin в процессе: повторный сабмит (Enter/кнопка) игнорируется */
+  private busy = false;
+
   constructor(app: App, private readonly plugin: ShadowVaultPlugin) {
     super(app);
   }
@@ -75,6 +78,7 @@ export class SetPinModal extends Modal {
   }
 
   private async handleSubmit(): Promise<void> {
+    if (this.busy) return;
     this.hideError();
     const pwd = this.inputPwd.value;
     const pin = this.inputPin.value;
@@ -84,14 +88,15 @@ export class SetPinModal extends Modal {
     if (!/^\d{4,8}$/.test(pin)) { this.showError("PIN должен быть 4–8 цифр."); return; }
     if (pin !== pinConfirm) { this.showError("PIN не совпадает."); return; }
 
-    this.btnSubmit.disabled = true;
+    this.setBusy(true);
     try {
       await this.plugin.setupPin(pwd, pin);
       this.inputPwd.value = this.inputPin.value = this.inputPinConfirm.value = "";
       new Notice("🔢 PIN установлен для этого устройства.", 4000);
       super.close();
     } catch (err) {
-      this.btnSubmit.disabled = false;
+      // Снимаем busy ДО showError/focus — focus() на disabled input не сработает.
+      this.setBusy(false);
       if (err instanceof PasswordError) {
         this.showError("Неверный пароль.");
         this.inputPwd.select();
@@ -99,7 +104,19 @@ export class SetPinModal extends Modal {
       } else {
         this.showError(err instanceof Error ? err.message : "Ошибка установки PIN.");
       }
+    } finally {
+      // Страховка: возвращаем форму в рабочее состояние при любом исходе.
+      this.setBusy(false);
     }
+  }
+
+  /** Блокирует форму на время setupPin (PBKDF2 занимает секунды). */
+  private setBusy(active: boolean): void {
+    this.busy = active;
+    this.btnSubmit.disabled = active;
+    this.inputPwd.disabled = active;
+    this.inputPin.disabled = active;
+    this.inputPinConfirm.disabled = active;
   }
 
   private showError(msg: string): void {

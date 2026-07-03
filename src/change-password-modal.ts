@@ -1,4 +1,4 @@
-import { App, Modal } from "obsidian";
+import { App, Modal, Notice } from "obsidian";
 import { PasswordError } from "./auth-service";
 import { createPasswordField } from "./password-field";
 import { isValidEmail } from "./types";
@@ -23,6 +23,12 @@ export class ChangeCredentialsModal extends Modal {
   private btnSubmit!: HTMLButtonElement;
   private errorEl!: HTMLElement;
   private progressEl!: HTMLElement;
+
+  /**
+   * true — changeCredentials в процессе: закрытие модала запрещено,
+   * повторный сабмит (Enter/кнопка) игнорируется.
+   */
+  private busy = false;
 
   private readonly currentEmail: string;
 
@@ -87,11 +93,25 @@ export class ChangeCredentialsModal extends Modal {
     setTimeout(() => this.inputOld.focus(), 50);
   }
 
+  /**
+   * Запрещаем закрытие на время пере-шифровки (тот же приём, что в InitModal):
+   * Escape, крестик и клик по фону в Obsidian сводятся к вызову close(),
+   * поэтому одного перехвата здесь достаточно.
+   */
+  close(): void {
+    if (this.busy) {
+      this.showError("Идёт пере-шифрование — дождитесь завершения, окно закрывать нельзя.");
+      return;
+    }
+    super.close();
+  }
+
   onClose(): void {
     this.contentEl.empty();
   }
 
   private async handleSubmit(): Promise<void> {
+    if (this.busy) return;
     this.hideError();
 
     const oldPwd = this.inputOld.value;
@@ -148,19 +168,34 @@ export class ChangeCredentialsModal extends Modal {
       );
       super.close();
     } catch (err) {
+      // Снимаем блокировку ДО showError/focus — focus() на disabled input не сработает.
       this.setLoading(false);
-      if (err instanceof PasswordError) {
-        this.showError(err.message);
-        this.inputOld.select();
-        this.inputOld.focus();
-      } else {
-        this.showError("Ошибка пере-шифрования. Смотрите консоль разработчика.");
+      const message =
+        err instanceof PasswordError
+          ? err.message
+          : "Ошибка пере-шифрования. Смотрите консоль разработчика.";
+      if (!(err instanceof PasswordError)) {
         console.error("[ShadowVault] changeCredentials:", err);
       }
+      if (!this.contentEl.isConnected) {
+        // Edge: модал уже закрыт (например, выгрузка плагина) — DOM отсоединён,
+        // showError никто не увидит. Сообщаем через Notice.
+        new Notice(`⚠️ ${message}`, 8000);
+        return;
+      }
+      this.showError(message);
+      if (err instanceof PasswordError) {
+        this.inputOld.select();
+        this.inputOld.focus();
+      }
+    } finally {
+      // Страховка: при любом исходе модал снова можно закрыть.
+      this.setLoading(false);
     }
   }
 
   private setLoading(active: boolean): void {
+    this.busy = active;
     this.btnSubmit.disabled = active;
     this.inputOld.disabled = active;
     this.inputEmail.disabled = active;
