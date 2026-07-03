@@ -386,6 +386,119 @@ describe("VirtualShadowManager.reEncryptAll (mobile смена ключа)", () 
   });
 });
 
+describe("VirtualShadowManager.exportToPlaintext (отключение шифрования на mobile)", () => {
+  it("расшифровывает все .enc в plaintext и удаляет .enc", async () => {
+    await vsm.write("a.md", bytes("alpha"));
+    await vsm.write("dir/b.md", bytes("beta"));
+
+    const progress: Array<[number, number, string]> = [];
+    const res = await vsm.exportToPlaintext(".obsidian", (d, t, c) => progress.push([d, t, c]));
+
+    expect(res.failed).toHaveLength(0);
+    expect(res.skippedOrphans).toHaveLength(0);
+    expect(res.exported.sort()).toEqual(["a.md", "dir/b.md"]);
+    // plaintext на месте
+    expect(text(adapter.files.get("a.md")!)).toBe("alpha");
+    expect(text(adapter.files.get("dir/b.md")!)).toBe("beta");
+    // .enc удалены батчем в конце
+    expect(adapter.files.has("a.md.enc")).toBe(false);
+    expect(adapter.files.has("dir/b.md.enc")).toBe(false);
+    expect(progress.length).toBeGreaterThan(0);
+  });
+
+  it("холодный экспорт (пустой кэш) расшифровывает строго из .enc", async () => {
+    await vsm.write("cold.md", bytes("cold payload"));
+
+    // Свежий VSM без прогретого кэша — как после перезапуска приложения.
+    const fresh = new VirtualShadowManager(engine, adapter);
+    const res = await fresh.exportToPlaintext(".obsidian");
+
+    expect(res.failed).toHaveLength(0);
+    expect(text(adapter.files.get("cold.md")!)).toBe("cold payload");
+    expect(adapter.files.has("cold.md.enc")).toBe(false);
+  });
+
+  it("нерасшифрованный .enc (orphan) остаётся на диске и попадает в skippedOrphans", async () => {
+    await vsm.write("good.md", bytes("ok"));
+    // Битый .enc: мусор вместо шифртекста — расшифровка провалится.
+    const garbage = bytes("это не валидный шифртекст вообще");
+    adapter.files.set("broken.md.enc", garbage);
+
+    const res = await vsm.exportToPlaintext(".obsidian");
+
+    expect(res.failed).toHaveLength(0);
+    expect(res.exported).toEqual(["good.md"]);
+    expect(res.skippedOrphans).toEqual(["broken.md"]);
+    // Экспортированный: plaintext на месте, .enc удалён
+    expect(text(adapter.files.get("good.md")!)).toBe("ok");
+    expect(adapter.files.has("good.md.enc")).toBe(false);
+    // КРИТИЧНО: orphan .enc — единственная копия данных — НЕ удалён,
+    // и его «plaintext» не появился
+    expect(adapter.files.get("broken.md.enc")).toBe(garbage);
+    expect(adapter.files.has("broken.md")).toBe(false);
+  });
+
+  it("гейтит write во время экспорта: правка попадает в plaintext, .enc не воскрешает", async () => {
+    await vsm.write("a.md", bytes("v1"));
+    await vsm.write("b.md", bytes("v2"));
+
+    // Правка «a.md» прилетает ПОСЕРЕДИНЕ экспорта — до фикса write писал бы
+    // свежий a.md.enc, который фаза 2 тут же удаляла (потеря правки).
+    let injected = false;
+    const res = await vsm.exportToPlaintext("", (d) => {
+      if (!injected && d >= 1) {
+        injected = true;
+        void vsm.write("a.md", bytes("edited-during-export"));
+      }
+    });
+
+    expect(injected).toBe(true);
+    expect(res.failed).toHaveLength(0);
+    // Правка НЕ потеряна: дописана plaintext'ом из кэша (фаза 1.5)
+    expect(text(adapter.files.get("a.md")!)).toBe("edited-during-export");
+    expect(text(adapter.files.get("b.md")!)).toBe("v2");
+    // .enc удалены и не воскрешены отложенной записью
+    expect(adapter.files.has("a.md.enc")).toBe(false);
+    expect(adapter.files.has("b.md.enc")).toBe(false);
+
+    // Гейт остаётся после успеха: поздняя запись (до unpatch в main) не
+    // создаёт новый .enc в уже расшифрованном хранилище.
+    await vsm.write("a.md", bytes("late-write"));
+    expect(adapter.files.has("a.md.enc")).toBe(false);
+  });
+
+  it("при СБОЕ экспорта .enc не удаляются, а отложенные записи дошифровываются в .enc", async () => {
+    const hooked = new HookedAdapter();
+    const v = new VirtualShadowManager(engine, hooked);
+    await v.write("a.md", bytes("va"));
+    await v.write("b.md", bytes("vb"));
+
+    // Ломаем запись plaintext ТОЛЬКО для a.md (.enc-записи проходят).
+    hooked.beforeWrite = (path) => {
+      if (path === "a.md") throw new Error("disk full");
+    };
+
+    let injected = false;
+    const res = await v.exportToPlaintext("", (d) => {
+      if (!injected && d >= 1) {
+        injected = true;
+        void v.write("b.md", bytes("deferred-edit")); // отложится гейтом
+      }
+    });
+
+    expect(injected).toBe(true);
+    expect(res.failed.map((f) => f.path)).toContain("a.md");
+    // Фаза 2 не выполнялась: оба .enc на диске
+    expect(hooked.files.has("a.md.enc")).toBe(true);
+    expect(hooked.files.has("b.md.enc")).toBe(true);
+    // Шифрование остаётся включённым → отложенная правка дошифрована в .enc
+    expect(text(await engine.decryptBuffer(hooked.files.get("b.md.enc")!))).toBe("deferred-edit");
+    // Гейт снят: обычные записи снова идут в .enc
+    await v.write("c.md", bytes("after-fail"));
+    expect(hooked.files.has("c.md.enc")).toBe(true);
+  });
+});
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Интеграция РЕАЛЬНОЙ связки AdapterPatcher + MobileAdapter + VSM
 // (регрессия: до фикса MobileAdapter звал патченные методы адаптера →

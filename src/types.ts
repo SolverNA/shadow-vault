@@ -66,6 +66,23 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 };
 
 /**
+ * Результат экспорта plaintext при отключении шифрования — общий контракт
+ * обеих платформ (desktop ShadowVaultManager.exportShadowToOriginal и
+ * mobile VirtualShadowManager.exportToPlaintext):
+ *   - exported       — пути (без .enc), чей plaintext записан и верифицирован;
+ *   - failed         — пути с ошибкой экспорта (при непустом failed НИ ОДИН
+ *                      .enc не удаляется — вызывающий прерывает отключение);
+ *   - skippedOrphans — .enc, которые не удалось расшифровать (повреждены или
+ *                      зашифрованы другим ключом): остаются на диске как
+ *                      единственная копия данных, вызывающий предупреждает.
+ */
+export interface PlainExportResult {
+  exported: string[];
+  failed: Array<{ path: string; error: string }>;
+  skippedOrphans: string[];
+}
+
+/**
  * Константа для верификации пароля.
  * Шифруется при создании хранилища и расшифровывается при каждом входе.
  * Значение намеренно нейтральное — не раскрывает информацию о пользователе.

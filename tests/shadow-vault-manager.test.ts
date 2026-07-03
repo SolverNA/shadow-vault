@@ -1163,6 +1163,72 @@ describe("ShadowVaultManager — exportShadowToOriginal (безопасный о
       expect(fs.readFileSync(brokenEnc).equals(garbage)).toBe(true);
     } finally { env.cleanup(); }
   });
+
+  it("гейтит encryptOne во время экспорта: правка не воскрешает .enc и попадает в plaintext", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "a.md", "alpha");
+      await writeEncrypted(env, "b.md", "beta");
+      await env.manager.decryptAllToShadow();
+
+      // Правка «a.md» прилетает ПОСЕРЕДИНЕ экспорта (через onProgress) —
+      // до фикса encryptOne писал свежий .enc, который фаза 2 тут же удаляла,
+      // и правка терялась.
+      let injected = false;
+      const res = await env.manager.exportShadowToOriginal((done) => {
+        if (!injected && done >= 1) {
+          injected = true;
+          fs.writeFileSync(nodePath.join(env.shadowRoot, "a.md"), "edited-during-export");
+          void env.manager.encryptOne("a.md"); // должен отложиться, НЕ писать .enc
+        }
+      });
+      expect(injected).toBe(true);
+      expect(res.failed).toHaveLength(0);
+      await env.manager.drainPending();
+
+      // Правка НЕ потеряна: ре-экспортирована plaintext'ом (фаза 1.5)
+      expect(fs.readFileSync(nodePath.join(env.origRoot, "a.md"), "utf8"))
+        .toBe("edited-during-export");
+      // .enc удалены и НЕ воскрешены отложенной записью
+      expect(fs.existsSync(nodePath.join(env.origRoot, "a.md.enc"))).toBe(false);
+      expect(fs.existsSync(nodePath.join(env.origRoot, "b.md.enc"))).toBe(false);
+
+      // Гейт остаётся после успеха: поздний encryptOne (событие «в полёте»
+      // до unmount/endSession) не воскрешает .enc в расшифрованном хранилище.
+      await env.manager.encryptOne("a.md");
+      expect(fs.existsSync(nodePath.join(env.origRoot, "a.md.enc"))).toBe(false);
+    } finally { env.cleanup(); }
+  });
+
+  it("при СБОЕ экспорта гейт снимается и отложенные правки дошифровываются обратно в .enc", async () => {
+    const env = await makeEnv();
+    try {
+      await writeEncrypted(env, "a.md", "alpha");
+      await writeEncrypted(env, "boom.md", "explode");
+      await env.manager.decryptAllToShadow();
+
+      // Детерминированный сбой фазы 1: plaintext-путь boom.md — каталог.
+      fs.mkdirSync(nodePath.join(env.origRoot, "boom.md"), { recursive: true });
+
+      let injected = false;
+      const res = await env.manager.exportShadowToOriginal((done) => {
+        if (!injected && done >= 1) {
+          injected = true;
+          fs.writeFileSync(nodePath.join(env.shadowRoot, "a.md"), "edited-during-failed-export");
+          void env.manager.encryptOne("a.md"); // отложится гейтом
+        }
+      });
+      expect(injected).toBe(true);
+      expect(res.failed.map(f => f.path)).toContain("boom.md");
+
+      // Шифрование остаётся включённым → отложенная правка дошифрована в .enc
+      await env.manager.drainPending();
+      const encA = fs.readFileSync(nodePath.join(env.origRoot, "a.md.enc"));
+      expect(env.engine.decryptBuffer(encA).toString("utf8")).toBe("edited-during-failed-export");
+      // .enc не удалялись (фаза 2 не выполнялась)
+      expect(fs.existsSync(nodePath.join(env.origRoot, "boom.md.enc"))).toBe(true);
+    } finally { env.cleanup(); }
+  });
 });
 
 // ─────────────────────────────────────────────

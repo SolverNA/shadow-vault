@@ -57,6 +57,7 @@ import {
   walkDir,
 } from "./fs-utils";
 import type { Logger } from "./logger";
+import type { PlainExportResult } from "./types";
 
 /**
  * Параллелизм bulk-операций.
@@ -272,6 +273,23 @@ export class ShadowVaultManager {
   private deferredDuringRekey: Set<string> = new Set();
 
   /**
+   * true пока идёт exportShadowToOriginal (отключение шифрования):
+   * write-through приостановлен. Без гейта правка файла ПОСЛЕ его экспорта
+   * писала бы свежий .enc, который фаза 2 экспорта тут же удаляла — правка
+   * терялась. После УСПЕШНОГО экспорта гейт НЕ снимается: сессия сейчас
+   * завершится (disableEncryption → unmount/endSession), и поздние
+   * encryptOne не должны воскрешать .enc в уже расшифрованном хранилище.
+   */
+  private exportInProgress = false;
+
+  /**
+   * Пути, чьи encryptOne были отложены гейтом exportInProgress. При успехе
+   * экспорта они ре-экспортируются PLAINTEXT'ом (фаза 1.5), при провале —
+   * дошифровываются обратно в .enc (шифрование остаётся включённым).
+   */
+  private deferredDuringExport: Set<string> = new Set();
+
+  /**
    * Регистрирует promise write-through в набор pendingWrites и
    * саморегистрирует его удаление по завершении (успех или ошибка).
    * Возвращает тот же promise для удобной цепочки в вызывающем коде.
@@ -460,6 +478,14 @@ export class ShadowVaultManager {
       // паролем. Откладываем путь: flushDeferredAfterRekey() дошифрует его
       // после переключения на новый движок.
       this.deferredDuringRekey.add(normalizedPath);
+      return;
+    }
+    if (this.exportInProgress) {
+      // Отключение шифрования: запись нового .enc опасна — фаза 2 экспорта
+      // удаляет .enc, и правка потерялась бы. Откладываем путь: при успехе
+      // экспорта он будет ре-экспортирован plaintext'ом (фаза 1.5), при
+      // провале — дошифрован обратно в .enc (см. exportShadowToOriginal).
+      this.deferredDuringExport.add(normalizedPath);
       return;
     }
     const previous = this.encryptLocks.get(normalizedPath) ?? Promise.resolve();
@@ -724,17 +750,65 @@ export class ShadowVaultManager {
    *
    * Идемпотентность: повторный вызов после частичного успеха безопасен —
    * фаза 1 перезапишет plaintext (verify пройдёт), фаза 2 удалит .enc.
+   *
+   * ГЕЙТ WRITE-THROUGH (симметрично reEncryptAll/rekeyInProgress): на время
+   * экспорта encryptOne откладывает пути в deferredDuringExport — иначе правка
+   * файла после его экспорта писала бы свежий .enc, который фаза 2 удаляет
+   * (потеря правки). Отложенные пути ре-экспортируются plaintext'ом в фазе 1.5.
+   * При УСПЕХЕ гейт остаётся взведённым (сессия сейчас завершится, поздние
+   * encryptOne не должны воскрешать .enc), при ПРОВАЛЕ — снимается, а
+   * отложенные правки дошифровываются обратно в .enc.
    */
   async exportShadowToOriginal(
     onProgress?: (done: number, total: number, current: string) => void
-  ): Promise<{
-    exported: string[];
-    failed: Array<{ path: string; error: string }>;
-    skippedOrphans: string[];
-  }> {
+  ): Promise<PlainExportResult> {
+    this.exportInProgress = true;
+    let success = false;
+    try {
+      const result = await this.exportShadowToOriginalInner(onProgress);
+      success = result.failed.length === 0;
+      return result;
+    } finally {
+      if (!success) {
+        // Экспорт не удался — шифрование остаётся включённым: снимаем гейт
+        // и дошифровываем отложенные правки обратно в .enc.
+        this.exportInProgress = false;
+        this.flushDeferredAfterExport();
+      }
+    }
+  }
+
+  /**
+   * Экспорт одного файла shadow → оригинал plaintext с verify.
+   * Атомарная запись (tmp + rename) + побайтовая сверка с источником.
+   */
+  private async exportOnePlain(rel: string): Promise<void> {
+    const src = this.shadowAbs(rel);
+    const dst = this.originalAbs(rel);
+    await fsp.mkdir(nodePath.dirname(dst), { recursive: true });
+
+    // Атомарная запись plaintext: tmp + rename, чтобы сбой посреди копии
+    // не оставил усечённый/повреждённый оригинал.
+    const buf = await fsp.readFile(src);
+    await atomicWrite(dst, buf);
+
+    // Verify: побайтовая сверка записанного оригинала с источником.
+    const ok = await filesEqual(src, dst);
+    if (!ok) {
+      throw new Error("verify не прошёл: записанный plaintext не совпал с shadow");
+    }
+  }
+
+  private async exportShadowToOriginalInner(
+    onProgress?: (done: number, total: number, current: string) => void
+  ): Promise<PlainExportResult> {
     const exported: string[] = [];
     const failed: Array<{ path: string; error: string }> = [];
     const skippedOrphans: string[] = [];
+
+    // Дренаж in-flight encryptOne, начатых ДО гейта: их .enc не должны
+    // дописаться после фазы 2 (воскрешение удалённого .enc).
+    await this.drainPending();
 
     const shadowFiles = await this.scanShadowFilesForSync();
     const total = shadowFiles.length;
@@ -744,21 +818,7 @@ export class ShadowVaultManager {
     for (let i = 0; i < total; i++) {
       const rel = shadowFiles[i];
       try {
-        const src = this.shadowAbs(rel);
-        const dst = this.originalAbs(rel);
-        await fsp.mkdir(nodePath.dirname(dst), { recursive: true });
-
-        // Атомарная запись plaintext: tmp + rename, чтобы сбой посреди копии
-        // не оставил усечённый/повреждённый оригинал.
-        const buf = await fsp.readFile(src);
-        await atomicWrite(dst, buf);
-
-        // Verify: побайтовая сверка записанного оригинала с источником.
-        const ok = await filesEqual(src, dst);
-        if (!ok) {
-          throw new Error("verify не прошёл: записанный plaintext не совпал с shadow");
-        }
-
+        await this.exportOnePlain(rel);
         exported.push(rel);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -776,6 +836,35 @@ export class ShadowVaultManager {
         failed: failed.length,
       });
       return { exported, failed, skippedOrphans };
+    }
+
+    // ── ФАЗА 1.5: ре-экспорт правок, отложенных гейтом write-through ──
+    // Правки, прилетевшие во время фазы 1, лежат в shadow (plaintext) и в
+    // deferredDuringExport. Ре-экспортируем их, чтобы plaintext в оригинале
+    // не был stale. Несколько проходов: ре-экспорт может пересечься с новыми
+    // правками (лимит — защита от бесконечного цикла).
+    for (let pass = 0; pass < 10 && this.deferredDuringExport.size > 0; pass++) {
+      const deferred = [...this.deferredDuringExport];
+      this.deferredDuringExport.clear();
+      this.logger?.debug("shadow", "export фаза 1.5: ре-экспорт отложенных правок", {
+        pass,
+        files: deferred.length,
+      });
+      for (const rel of deferred) {
+        try {
+          // Файл могли удалить после правки — тогда ре-экспортировать нечего.
+          if (!(await fileExists(this.shadowAbs(rel)))) continue;
+          await this.exportOnePlain(rel);
+          if (!exported.includes(rel)) exported.push(rel);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.logger?.error("shadow", "export отложенной правки не удался", { path: rel, error: msg });
+          failed.push({ path: rel, error: msg });
+        }
+      }
+      if (failed.length > 0) {
+        return { exported, failed, skippedOrphans };
+      }
     }
 
     // ── ФАЗА 2: все экспорты успешны → удаляем .enc батчем в конце ──
@@ -1224,14 +1313,28 @@ export class ShadowVaultManager {
    * Fire-and-forget через trackPending — drainPending()/shutdown их дождётся.
    */
   private flushDeferredAfterRekey(): void {
-    if (this.deferredDuringRekey.size === 0) return;
-    const paths = [...this.deferredDuringRekey];
-    this.deferredDuringRekey.clear();
-    this.logger?.debug("shadow", "дошифровка отложенных на время пере-шифровки", { files: paths.length });
+    this.flushDeferredEncrypts(this.deferredDuringRekey, "пере-шифровки");
+  }
+
+  /**
+   * Дошифровывает пути, отложенные гейтом exportInProgress, обратно в .enc.
+   * Вызывается ТОЛЬКО при неудачном экспорте (шифрование остаётся включённым);
+   * при успехе отложенные пути ре-экспортируются plaintext'ом в фазе 1.5.
+   */
+  private flushDeferredAfterExport(): void {
+    this.flushDeferredEncrypts(this.deferredDuringExport, "экспорта");
+  }
+
+  /** Общий флаш отложенных encryptOne (fire-and-forget через trackPending). */
+  private flushDeferredEncrypts(deferred: Set<string>, context: string): void {
+    if (deferred.size === 0) return;
+    const paths = [...deferred];
+    deferred.clear();
+    this.logger?.debug("shadow", `дошифровка отложенных на время ${context}`, { files: paths.length });
     for (const normalizedPath of paths) {
       void this.trackPending(
         this.encryptOne(normalizedPath).catch((err) => {
-          this.logger?.error("shadow", "отложенный encryptOne после пере-шифровки не удался", {
+          this.logger?.error("shadow", `отложенный encryptOne после ${context} не удался`, {
             path: normalizedPath,
             error: err instanceof Error ? err.message : String(err),
           });

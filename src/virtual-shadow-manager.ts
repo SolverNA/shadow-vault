@@ -9,6 +9,7 @@ import { detectFormat, plaintextSizeFromContainer } from "./crypto/format";
 import { migrateBuffer, probeLegacyPassword } from "./crypto/migration";
 import type { LegacyVariant } from "./crypto/legacy";
 import type { Logger } from "./logger";
+import type { PlainExportResult } from "./types";
 
 export class VirtualShadowManager {
   private cache: Map<string, ArrayBuffer> = new Map();
@@ -20,6 +21,24 @@ export class VirtualShadowManager {
    * Записи чистятся по завершении хвоста очереди — Map не растёт бесконечно.
    */
   private writeLocks: Map<string, Promise<unknown>> = new Map();
+
+  /**
+   * true пока идёт exportToPlaintext (отключение шифрования на mobile):
+   * дисковая часть write() откладывается (кэш обновляется как обычно).
+   * Без гейта правка файла ПОСЛЕ его экспорта писала бы свежий .enc, который
+   * фаза 2 экспорта тут же удаляла — правка терялась. После УСПЕШНОГО
+   * экспорта гейт НЕ снимается: вызывающий (main.disableEncryption) сразу
+   * снимает патч адаптера, и поздние записи не должны воскрешать .enc.
+   */
+  private exportInProgress = false;
+
+  /**
+   * Пути, чьи дисковые записи отложены гейтом exportInProgress (актуальный
+   * plaintext уже в кэше). При успехе экспорта дописываются PLAINTEXT'ом
+   * (фаза 1.5), при провале — шифруются обратно в .enc.
+   */
+  private deferredDuringExport: Set<string> = new Set();
+
   private engine: WebCryptoEngine;
   private adapter: PlatformAdapter;
   /** Опциональный структурный логгер (DI из main); тесты передают undefined. */
@@ -96,6 +115,15 @@ export class VirtualShadowManager {
 
     // Optimistic-кэш: обновляем сразу, до постановки в очередь на диск.
     this.cache.set(normalizedPath, snapshot);
+
+    // Гейт экспорта (отключение шифрования): дисковую запись .enc откладываем —
+    // фаза 2 экспорта удаляет .enc, и свежая запись потерялась бы. Актуальные
+    // данные уже в кэше; exportToPlaintext допишет их plaintext'ом (фаза 1.5)
+    // либо, при провале экспорта, зашифрует обратно в .enc.
+    if (this.exportInProgress) {
+      this.deferredDuringExport.add(normalizedPath);
+      return;
+    }
 
     // Дисковая часть сериализована per-path: параллельные записи одного пути
     // ложатся на диск строго в порядке вызова write.
@@ -445,6 +473,205 @@ export class VirtualShadowManager {
     // Переключаем движок чтения на новый ключ и чистим кэш.
     this.engine = newEngine;
     this.cache.clear();
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Экспорт plaintext (отключение шифрования на mobile)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Экспортирует все .enc хранилища в plaintext и удаляет .enc — mobile-аналог
+   * desktop ShadowVaultManager.exportShadowToOriginal (тот же контракт
+   * PlainExportResult и та же двухфазная схема):
+   *
+   *   ФАЗА 1 — для каждого .enc: расшифровать (кэш приоритетнее — там самая
+   *     свежая версия), записать plaintext через ОРИГИНАЛЬНЫЙ адаптер,
+   *     верифицировать read-back'ом. .enc НЕ трогаются. Нерасшифрованные
+   *     (повреждены/чужой ключ) → skippedOrphans, их .enc остаются на диске
+   *     как единственная копия данных. Ошибка записи/verify → failed.
+   *   ФАЗА 1.5 — дописать правки, отложенные гейтом write-through (из кэша).
+   *   ФАЗА 2 — только если failed пуст: удалить .enc СТРОГО экспортированных.
+   *
+   * ГЕЙТ WRITE-THROUGH: на время экспорта дисковая часть write() откладывается
+   * (см. exportInProgress). При успехе гейт остаётся взведённым — вызывающий
+   * немедленно снимает патч адаптера (записи пойдут plaintext'ом нативно),
+   * при провале гейт снимается и отложенное шифруется обратно в .enc.
+   */
+  async exportToPlaintext(
+    configDir: string,
+    onProgress?: (done: number, total: number, current: string) => void
+  ): Promise<PlainExportResult> {
+    this.exportInProgress = true;
+    let success = false;
+    try {
+      const result = await this.exportToPlaintextInner(configDir, onProgress);
+      success = result.failed.length === 0;
+      return result;
+    } finally {
+      if (!success) {
+        // Экспорт не удался — шифрование остаётся включённым: снимаем гейт
+        // и дошифровываем отложенные записи обратно в .enc.
+        this.exportInProgress = false;
+        await this.flushDeferredAfterExport();
+      }
+    }
+  }
+
+  private async exportToPlaintextInner(
+    configDir: string,
+    onProgress?: (done: number, total: number, current: string) => void
+  ): Promise<PlainExportResult> {
+    const exported: string[] = [];
+    const failed: Array<{ path: string; error: string }> = [];
+    const skippedOrphans: string[] = [];
+
+    // Дожидаемся дисковых записей, начатых ДО гейта: поздний writeBinary не
+    // должен воскресить .enc после его удаления в фазе 2.
+    await Promise.allSettled([...this.writeLocks.values()]);
+
+    const encFiles = await this.scanEncFiles(configDir);
+    const total = encFiles.length;
+    this.logger?.info("vshadow", "export → plaintext (фаза 1: расшифровка+verify)", { files: total });
+
+    // ── ФАЗА 1: расшифровываем и пишем plaintext, .enc не трогаем ──
+    for (let i = 0; i < total; i++) {
+      const encPath = encFiles[i];
+      const plainPath = encPath.slice(0, -".enc".length);
+      try {
+        let plain: ArrayBuffer;
+        if (this.cache.has(plainPath)) {
+          // Кэш — самая свежая версия (optimistic write мог ещё не долететь).
+          plain = this.cache.get(plainPath)!.slice(0);
+        } else {
+          const encrypted = await this.adapter.readBinary(encPath);
+          try {
+            plain = await this.engine.decryptBuffer(encrypted);
+          } catch {
+            // Не расшифровался (повреждён или чужой ключ) → orphan: .enc —
+            // единственная копия данных, НЕ удаляем и не считаем ошибкой.
+            skippedOrphans.push(plainPath);
+            onProgress?.(i + 1, total, plainPath);
+            continue;
+          }
+        }
+        await this.exportOnePlain(plainPath, plain);
+        exported.push(plainPath);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.logger?.error("vshadow", `export файла не удался: ${plainPath}`, {
+          path: plainPath,
+          error: msg,
+        });
+        failed.push({ path: plainPath, error: msg });
+      }
+      onProgress?.(i + 1, total, plainPath);
+    }
+
+    if (failed.length > 0) {
+      this.logger?.error("vshadow", "export: часть файлов не удалась — .enc НЕ удаляем", {
+        failed: failed.length,
+      });
+      return { exported, failed, skippedOrphans };
+    }
+
+    if (skippedOrphans.length > 0) {
+      this.logger?.warn("vshadow", "export: orphan .enc оставлены на диске", {
+        count: skippedOrphans.length,
+        files: skippedOrphans,
+      });
+    }
+
+    // ── ФАЗА 1.5: дописываем правки, отложенные гейтом (из кэша) ──
+    // Несколько проходов: пока дописываем, могут прилететь новые записи.
+    for (let pass = 0; pass < 10 && this.deferredDuringExport.size > 0; pass++) {
+      const deferred = [...this.deferredDuringExport];
+      this.deferredDuringExport.clear();
+      this.logger?.debug("vshadow", "export фаза 1.5: дозапись отложенных правок", {
+        pass,
+        files: deferred.length,
+      });
+      for (const plainPath of deferred) {
+        const data = this.cache.get(plainPath);
+        if (!data) continue; // удалён после записи — дописывать нечего
+        try {
+          await this.exportOnePlain(plainPath, data.slice(0));
+          if (!exported.includes(plainPath)) exported.push(plainPath);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.logger?.error("vshadow", `export отложенной правки не удался: ${plainPath}`, {
+            path: plainPath,
+            error: msg,
+          });
+          failed.push({ path: plainPath, error: msg });
+        }
+      }
+      if (failed.length > 0) {
+        return { exported, failed, skippedOrphans };
+      }
+    }
+
+    // ── ФАЗА 2: удаляем .enc СТРОГО экспортированных файлов ──
+    this.logger?.info("vshadow", "export фаза 2: удаление .enc", { exported: exported.length });
+    for (const plainPath of exported) {
+      try {
+        await this.adapter.remove(plainPath + ".enc");
+      } catch (err) {
+        // Plaintext уже на месте и проверен — данные не потеряны. Логируем;
+        // повторное отключение шифрования до-удалит остатки.
+        this.logger?.error("vshadow", `export: не удалось удалить .enc: ${plainPath}`, {
+          path: plainPath,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    this.logger?.info("vshadow", "export завершён", {
+      files: exported.length,
+      errors: failed.length,
+      skippedOrphans: skippedOrphans.length,
+    });
+    return { exported, failed, skippedOrphans };
+  }
+
+  /**
+   * Записывает plaintext через оригинальный адаптер и верифицирует read-back'ом
+   * (побайтовая сверка) — .enc удаляется в фазе 2 только после такой проверки.
+   */
+  private async exportOnePlain(plainPath: string, plain: ArrayBuffer): Promise<void> {
+    await this.adapter.writeBinary(plainPath, plain);
+    const check = new Uint8Array(await this.adapter.readBinary(plainPath));
+    const orig = new Uint8Array(plain);
+    if (check.length !== orig.length) {
+      throw new Error("verify не прошёл: длина записанного plaintext не совпала");
+    }
+    for (let k = 0; k < check.length; k++) {
+      if (check[k] !== orig[k]) {
+        throw new Error("verify не прошёл: записанный plaintext не совпал");
+      }
+    }
+  }
+
+  /**
+   * Шифрует отложенные гейтом записи обратно в .enc — только при НЕУДАЧНОМ
+   * экспорте (шифрование остаётся включённым, правки нельзя терять).
+   */
+  private async flushDeferredAfterExport(): Promise<void> {
+    for (let pass = 0; pass < 10 && this.deferredDuringExport.size > 0; pass++) {
+      const paths = [...this.deferredDuringExport];
+      this.deferredDuringExport.clear();
+      for (const p of paths) {
+        const data = this.cache.get(p);
+        if (!data) continue;
+        try {
+          await this.write(p, data.slice(0)); // гейт уже снят → обычный путь в .enc
+        } catch (err) {
+          this.logger?.error("vshadow", `дошифровка отложенной записи не удалась: ${p}`, {
+            path: p,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+    }
   }
 
   async migrateLegacyToV2(
