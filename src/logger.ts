@@ -182,7 +182,12 @@ export class Logger {
   private ring: LogEntry[] = [];
   private pending: string[] = [];
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
-  private flushing = false;
+  /**
+   * Промис текущего in-flight flush (null, если flush не идёт).
+   * close() обязан его дождаться перед финальным сбросом pending —
+   * иначе хвост логов, накопленный за время записи, терялся бы.
+   */
+  private flushPromise: Promise<void> | null = null;
   private dirEnsured = false;
   private closed = false;
 
@@ -285,9 +290,28 @@ export class Logger {
 
   /** Принудительно сбрасывает накопленный буфер в файл. */
   async flush(): Promise<void> {
-    if (this.flushing) return;
+    // Flush уже идёт — дожидаемся его вместо параллельной записи в тот же
+    // файл (важно для close(): вызов не должен «проваливаться» молча).
+    if (this.flushPromise) {
+      await this.flushPromise;
+      return;
+    }
     if (this.pending.length === 0) return;
-    this.flushing = true;
+    const run = this.doFlush();
+    this.flushPromise = run;
+    try {
+      await run;
+    } finally {
+      this.flushPromise = null;
+      // Если за время флаша накопилось ещё (или батч вернулся после ошибки) —
+      // планируем следующий. При closed таймер не ставится (см. scheduleFlush):
+      // остаток добирает финальный flush внутри close().
+      if (this.pending.length > 0) this.scheduleFlush();
+    }
+  }
+
+  /** Тело одного flush-прохода. Никогда не бросает (best-effort). */
+  private async doFlush(): Promise<void> {
     const batch = this.pending;
     this.pending = [];
     try {
@@ -301,17 +325,11 @@ export class Logger {
         await this.adapter.write(file, data);
       }
     } catch (err) {
-      // Логгер не должен ронять плагин. Возвращаем батч обратно (best-effort),
-      // но не зацикливаемся — только если не закрыт.
-      if (!this.closed) {
-        this.pending.unshift(...batch);
-      }
+      // Логгер не должен ронять плагин. Возвращаем батч обратно (best-effort) —
+      // его подберёт следующий flush (в т.ч. финальный из close()).
+      this.pending.unshift(...batch);
       // Печатаем в консоль напрямую, чтобы не рекурсировать через log().
       console.error("[ShadowVault] Logger.flush failed:", err);
-    } finally {
-      this.flushing = false;
-      // Если за время флаша накопилось ещё — планируем следующий.
-      if (this.pending.length > 0) this.scheduleFlush();
     }
   }
 
@@ -371,14 +389,29 @@ export class Logger {
     }
   }
 
-  /** Останавливает таймер и сбрасывает остаток. Вызывать в onunload. */
+  /**
+   * Останавливает таймер, дожидается in-flight flush и сбрасывает остаток
+   * pending. Вызывать в onunload. Best-effort: никогда не бросает.
+   */
   async close(): Promise<void> {
+    if (this.closed) return;
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
-    await this.flush();
-    this.closed = true;
+    try {
+      // 1. Дожидаемся текущего in-flight flush: если он упадёт, его батч
+      //    вернётся в pending (см. doFlush) и не потеряется.
+      if (this.flushPromise) await this.flushPromise;
+      // 2. Финальный сброс остатка pending (включая хвост, накопленный за
+      //    время in-flight flush, и возвращённый после ошибки батч).
+      if (this.pending.length > 0) await this.flush();
+    } catch (err) {
+      // Не рекурсируем через log() — прямая печать в консоль.
+      console.error("[ShadowVault] Logger.close failed:", err);
+    } finally {
+      this.closed = true;
+    }
   }
 
   /** Список файлов логов (для UI / очистки). */

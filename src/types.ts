@@ -54,6 +54,14 @@ export interface PluginSettings {
    * можно через кнопку «Зашифровать хранилище» (потребуется перезапуск).
    */
   encryptionDisabled: boolean;
+
+  /**
+   * true — подробное логирование (уровень DEBUG), false — только INFO и выше.
+   * Управляется тумблером «Подробное логирование» в настройках и читается
+   * в main.initDiagnostics при старте (настройки загружаются ДО инициализации
+   * логгера). По умолчанию включено.
+   */
+  debugLogging: boolean;
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
@@ -63,6 +71,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   formatVersion: 2,
   shadowVaultPath: "",
   encryptionDisabled: false,
+  debugLogging: true,
 };
 
 /**

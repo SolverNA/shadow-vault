@@ -246,9 +246,14 @@ export class ShadowVaultSettingTab extends PluginSettingTab {
       )
       .addToggle((tg) => {
         tg
-          .setValue(plugin.logger.getMinLevel() <= LogLevel.DEBUG)
+          .setValue(plugin.settings.debugLogging)
           .onChange((v) => {
+            // Runtime-переключение + персист в настройках: без сохранения
+            // выключенный debug молча включался бы обратно после рестарта
+            // (initDiagnostics читает debugLogging при старте).
             plugin.logger.setMinLevel(v ? LogLevel.DEBUG : LogLevel.INFO);
+            plugin.settings.debugLogging = v;
+            void plugin.saveSettings();
             new Notice(v ? "Подробное логирование включено." : "Логирование: только важные события.", 3000);
           });
       });

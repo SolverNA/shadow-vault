@@ -196,6 +196,88 @@ describe("Logger — маскирование секретов", () => {
   });
 });
 
+describe("Logger — close", () => {
+  it("close() сбрасывает pending без ожидания таймера", async () => {
+    const adapter = new MemAdapter();
+    const log = makeLogger(adapter); // flushIntervalMs огромный — таймер не успеет
+    log.info("t", "tail-entry-1");
+    log.info("t", "tail-entry-2");
+    await log.close();
+
+    const content = adapter.files.get(log.logFile) ?? "";
+    expect(content).toContain("tail-entry-1");
+    expect(content).toContain("tail-entry-2");
+  });
+
+  it("close() дожидается in-flight flush и дописывает хвост, накопленный за время записи", async () => {
+    const adapter = new MemAdapter();
+    // Замедляем первую запись: flush «висит», пока мы не отпустим барьер.
+    let release!: () => void;
+    const barrier = new Promise<void>((r) => { release = r; });
+    const origWrite = adapter.write.bind(adapter);
+    let firstWrite = true;
+    adapter.write = async (path: string, data: string) => {
+      if (firstWrite) {
+        firstWrite = false;
+        await barrier;
+      }
+      return origWrite(path, data);
+    };
+
+    const log = makeLogger(adapter);
+    log.info("t", "in-flight-entry");
+    const inFlight = log.flush(); // первый flush повис на барьере
+
+    // Хвост, прилетевший во время in-flight flush.
+    log.info("t", "late-entry");
+
+    const closing = log.close();
+    release();
+    await inFlight;
+    await closing;
+
+    const content = adapter.files.get(log.logFile) ?? "";
+    expect(content).toContain("in-flight-entry");
+    expect(content).toContain("late-entry");
+  });
+
+  it("close() дописывает батч, возвращённый в pending после ошибки in-flight flush", async () => {
+    const adapter = new MemAdapter();
+    // Первая запись падает — батч должен вернуться в pending и быть
+    // записан финальным flush'ем внутри close().
+    const origWrite = adapter.write.bind(adapter);
+    let failFirst = true;
+    adapter.write = async (path: string, data: string) => {
+      if (failFirst) {
+        failFirst = false;
+        throw new Error("simulated write failure");
+      }
+      return origWrite(path, data);
+    };
+
+    const log = makeLogger(adapter);
+    log.info("t", "must-survive");
+    await log.flush(); // упал, батч вернулся в pending
+    await log.close(); // финальный flush пишет остаток
+
+    const content = adapter.files.get(log.logFile) ?? "";
+    expect(content).toContain("must-survive");
+  });
+
+  it("после close() log() — no-op, close() идемпотентен и не бросает", async () => {
+    const adapter = new MemAdapter();
+    const log = makeLogger(adapter);
+    log.info("t", "before-close");
+    await log.close();
+    log.info("t", "after-close");
+    await expect(log.close()).resolves.toBeUndefined();
+
+    const content = adapter.files.get(log.logFile) ?? "";
+    expect(content).toContain("before-close");
+    expect(content).not.toContain("after-close");
+  });
+});
+
 describe("Logger — clear", () => {
   it("удаляет все файлы логов", async () => {
     const adapter = new MemAdapter();
