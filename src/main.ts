@@ -109,6 +109,15 @@ export default class ShadowVaultPlugin extends Plugin {
    */
   private earlyListOriginal: ((path: string) => Promise<ListedFiles>) | null = null;
 
+  /**
+   * Открытый в данный момент InitModal (окно пароля) или null.
+   * Нужен для: (1) принудительного закрытия в onunload — модал незакрываем
+   * by design, и без forceClose() он оставался бы поверх UI мёртвого плагина;
+   * (2) защиты от второго модала поверх первого (openInitModal — no-op,
+   * пока предыдущий модал открыт).
+   */
+  private initModal: InitModal | null = null;
+
   // ═══════════════════════════════════════════════════════════════════════
   // Жизненный цикл плагина
   // ═══════════════════════════════════════════════════════════════════════
@@ -174,6 +183,15 @@ export default class ShadowVaultPlugin extends Plugin {
       try { off(); } catch { /* ignore */ }
     }
     this.globalErrorHandlers = [];
+    // Закрываем окно пароля, если оно открыто: незакрываемый by design модал
+    // мёртвого плагина навсегда завис бы поверх UI, а при обновлении плагина
+    // новый onload открыл бы второй модал поверх первого.
+    try { this.initModal?.forceClose(); } catch { /* ignore */ }
+    this.initModal = null;
+    // Восстанавливаем adapter.list, если плагин выгружают ДО unlock
+    // (unlock-фазы уже восстановили бы его сами — вызов идемпотентен).
+    // Иначе list навсегда остаётся подменённым замыканием мёртвого плагина.
+    this.restoreEarlyListPatch();
     // Obsidian закрывается агрессивно и НЕ ждёт async-shutdown — поэтому
     // используем sync-версию очистки. Write-through уже сохранил все
     // изменения в оригинал на каждый save, на shutdown остаётся только
@@ -527,9 +545,15 @@ export default class ShadowVaultPlugin extends Plugin {
   }
 
   /**
-   * Отключает шифрование: все файлы из shadow экспортируются как plaintext
+   * Отключает шифрование: все зашифрованные файлы экспортируются как plaintext
    * в оригинал, .enc удаляются, плагин переходит в спящий режим.
-   * Требует активной сессии (vault разблокирован).
+   * Требует активной сессии (vault разблокирован). Кросс-платформенно:
+   *   - desktop: ShadowVaultManager.exportShadowToOriginal (shadow → оригинал);
+   *   - mobile:  VirtualShadowManager.exportToPlaintext (расшифровка .enc
+   *              через оригинальный адаптер + запись plaintext).
+   * Write-through на время экспорта гейтится ВНУТРИ менеджеров (см.
+   * exportInProgress) — правка файла после его экспорта не создаёт .enc,
+   * который фаза 2 экспорта удалила бы (потеря правки).
    *
    * После успеха пользователю нужно перезапустить Obsidian (мы делаем
    * полный shutdown — текущий процесс продолжать с распатченным адаптером
@@ -538,22 +562,29 @@ export default class ShadowVaultPlugin extends Plugin {
   async disableEncryption(
     onProgress?: (done: number, total: number, current: string) => void
   ): Promise<void> {
-    if (!this.sessionActive || !this.shadowManager) {
+    const manager = this.isDesktop ? this.shadowManager : this.virtualShadowManager;
+    if (!this.sessionActive || !manager) {
       throw new Error("Хранилище не разблокировано.");
     }
 
     console.info("[ShadowVault] disableEncryption: старт");
 
-    // 1. Экспорт plaintext в оригинал, удаление .enc
-    const result = await this.shadowManager.exportShadowToOriginal(onProgress);
+    // 1. Экспорт plaintext в оригинал, удаление .enc (write-through гейтится
+    //    внутри менеджера на обеих платформах).
+    const result = this.isDesktop
+      ? await this.shadowManager!.exportShadowToOriginal(onProgress)
+      : await this.virtualShadowManager!.exportToPlaintext(
+          this.app.vault.configDir,
+          onProgress
+        );
     if (result.failed.length > 0) {
       throw new Error(
         `Не удалось экспортировать ${result.failed.length} файл(ов). ` +
         `См. консоль для деталей. Шифрование не отключено.`
       );
     }
-    // Orphan .enc (не расшифровались при unlock — повреждены или зашифрованы
-    // другим ключом) НЕ удалены: их plaintext не экспортирован, .enc —
+    // Orphan .enc (не расшифровались — повреждены или зашифрованы другим
+    // ключом) НЕ удалены: их plaintext не экспортирован, .enc —
     // единственная копия данных. Предупреждаем пользователя.
     if (result.skippedOrphans.length > 0) {
       console.warn(
@@ -568,6 +599,28 @@ export default class ShadowVaultPlugin extends Plugin {
       );
     }
 
+    if (!this.isDesktop) {
+      // ── Mobile: патч снимаем СРАЗУ после успешного экспорта ──────────────
+      // Экспорт шёл при пропатченном адаптере (write-through гейтился внутри
+      // VSM: записи оседали в кэше). Немедленный unpatch минимизирует окно,
+      // в котором поздняя запись попала бы только в кэш и потерялась: после
+      // снятия патча записи идут plaintext'ом через нативный адаптер.
+      // Настройки сохраняем ПОСЛЕ unpatch: saveData уходит на диск асинхронно,
+      // и держать патч на время этой записи незачем.
+      this.sessionActive = false;
+      this.cleanupMobileState(); // unpatch + очистка кэша + destroy ключа
+
+      this.settings.verificationBlob = null;
+      this.settings.encryptionDisabled = true;
+      await this.saveSettings();
+      // Шифрование отключено → PIN больше не нужен и невалиден.
+      new PinStore().clearPin();
+
+      console.info("[ShadowVault] disableEncryption: готово (mobile)");
+      return;
+    }
+
+    // ── Desktop ────────────────────────────────────────────────────────────
     // 2. Сохраняем настройки до cleanup адаптера —
     //    если что-то упадёт ниже, флаг encryptionDisabled уже стоит
     this.settings.verificationBlob = null;
@@ -580,9 +633,9 @@ export default class ShadowVaultPlugin extends Plugin {
     this.sessionActive = false;
     try {
       const adapter = this.app.vault.adapter as unknown as IDataAdapter;
-      this.shadowManager.unpatch(adapter);
-      this.shadowManager.unmount(adapter);
-      await this.shadowManager.teardownObsidianSymlink();
+      this.shadowManager!.unpatch(adapter);
+      this.shadowManager!.unmount(adapter);
+      await this.shadowManager!.teardownObsidianSymlink();
     } catch (err) {
       console.error("[ShadowVault] disableEncryption: cleanup адаптера:", err);
     } finally {
@@ -623,6 +676,13 @@ export default class ShadowVaultPlugin extends Plugin {
   // ═══════════════════════════════════════════════════════════════════════
 
   private async openInitModal(): Promise<void> {
+    // Защита от второго модала поверх первого: лишний вызов (например
+    // lockVault при уже запертом хранилище) — no-op, пока окно открыто.
+    if (this.initModal) {
+      this.logger?.debug("main", "openInitModal: модал уже открыт — пропускаем");
+      return;
+    }
+
     // Детекция: verificationBlob отсутствует (плагин считает что это первый
     // запуск), но в оригинале уже лежат .enc файлы. Значит data.json утерян —
     // нужно предупредить и предложить выбор: восстановить старым паролем или
@@ -635,16 +695,24 @@ export default class ShadowVaultPlugin extends Plugin {
       );
     }
 
-    new InitModal(
+    const modal = new InitModal(
       this.app,
       this.settings,
       (s) => this.saveSettings(s),
-      (result) => { void this.onUnlock(result); },
+      // Успешный unlock — единственный штатный путь закрытия модала:
+      // обнуляем ссылку ДО onUnlock, чтобы повторный lockVault мог открыть
+      // модал заново, а onunload не пытался закрыть уже закрытое окно.
+      (result) => {
+        this.initModal = null;
+        void this.onUnlock(result);
+      },
       orphanVault,
       // Защита от отравления verificationBlob: на first-run пароль проверяется
       // trial-decrypt'ом существующего .enc ДО записи блоба (обе платформы).
       (engine, password) => this.validateFirstRunPassword(engine, password)
-    ).open();
+    );
+    this.initModal = modal;
+    modal.open();
   }
 
   /**
@@ -906,10 +974,7 @@ export default class ShadowVaultPlugin extends Plugin {
 
       // ── Phase 5: восстанавливаем оригинальный list() ──────────────────
       const adapter = this.app.vault.adapter as unknown as IDataAdapter;
-      if (this.earlyListOriginal) {
-        adapter.list = this.earlyListOriginal;
-        this.earlyListOriginal = null;
-      }
+      this.restoreEarlyListPatch();
 
       // ── Phase 5.5: миграция legacy → v2 (ФАЗА 4) ──────────────────────
       // Старые .enc (формат до v2) надо перешифровать новым v2-ключом ДО
@@ -1207,10 +1272,7 @@ export default class ShadowVaultPlugin extends Plugin {
 
       // Восстанавливаем оригинальный list() если был ранний патч — тоже до
       // создания MobileAdapter, чтобы он захватил нетронутый list.
-      if (this.earlyListOriginal) {
-        (adapter as any).list = this.earlyListOriginal;
-        this.earlyListOriginal = null;
-      }
+      this.restoreEarlyListPatch();
 
       this.platformAdapter = new MobileAdapter(this.app.vault);
 
@@ -1656,6 +1718,12 @@ export default class ShadowVaultPlugin extends Plugin {
     }
     this.sessionManager = null;
 
+    // Ранний патч list мог остаться, если инициализация упала ДО unlock-фазы
+    // восстановления (desktop Phase 5). Идемпотентно возвращаем оригинал —
+    // иначе после ошибки init adapter.list навсегда держал бы замыкание
+    // недоинициализированного плагина.
+    this.restoreEarlyListPatch();
+
     // Desktop: удаляем осиротевший shadow + session.lock (лениво через node-fs).
     if (this.isDesktop) {
       try {
@@ -1915,6 +1983,21 @@ export default class ShadowVaultPlugin extends Plugin {
    * Ранняя подмена транслирует .enc → .md без ключа шифрования, только
    * переименование, чтобы первичный скан видел правильные имена файлов.
    */
+  /**
+   * Восстанавливает оригинальный adapter.list(), подменённый patchListEarly().
+   * Идемпотентен: после первого восстановления earlyListOriginal обнуляется,
+   * повторные вызовы — no-op. Вызывается из unlock-фаз (desktop Phase 5 /
+   * mobile Phase 2), rollbackInitialization и onunload — где бы ни оборвался
+   * жизненный цикл, ранний патч не должен пережить плагин (замыкание держало
+   * бы объекты мёртвого плагина, а list навсегда остался бы подменённым).
+   */
+  private restoreEarlyListPatch(): void {
+    if (!this.earlyListOriginal) return;
+    const adapter = this.app.vault.adapter as unknown as IDataAdapter;
+    adapter.list = this.earlyListOriginal;
+    this.earlyListOriginal = null;
+  }
+
   private patchListEarly(): void {
     const adapter = this.app.vault.adapter as unknown as IDataAdapter;
     if (typeof adapter.getBasePath !== "function") return;
