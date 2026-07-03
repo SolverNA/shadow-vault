@@ -97,6 +97,17 @@ export class InitModal extends Modal {
     if (this.allowClose) super.close();
   }
 
+  /**
+   * Принудительное закрытие в обход защиты allowClose. Используется ТОЛЬКО
+   * плагином при выгрузке (onunload): без него незакрываемый by design модал
+   * оставался бы поверх UI от уже мёртвого плагина (а при обновлении плагина
+   * новый onload открывал бы второй модал поверх первого). Идемпотентен.
+   */
+  forceClose(): void {
+    this.allowClose = true;
+    this.close();
+  }
+
   onClose(): void {
     this.contentEl.empty();
   }
