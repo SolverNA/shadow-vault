@@ -6,23 +6,29 @@
  *   Теневое хранилище (shadowRoot)         — расшифрованный клон в локальной
  *                                             app-data (вне облачного sync, см. shadow-location.ts)
  *
- *   После unlock плагин расшифровывает ВСЁ в shadow и монтирует shadow как
- *   adapter.basePath — Obsidian работает с shadow натив но (включая getResourcePath
- *   для картинок/PDF). Параллельно patch() ставит write-through encrypt в оригинал.
+ *   Desktop: после unlock плагин расшифровывает ВСЁ в shadow и монтирует shadow
+ *   как adapter.basePath — Obsidian работает с shadow нативно (включая
+ *   getResourcePath для картинок/PDF). Методы адаптера НЕ патчатся: write-through
+ *   encrypt в оригинал делают подписки на vault-события
+ *   (setupVaultEventHandlersDesktop → ShadowVaultManager.encryptOne и др.).
  *
- * Порядок инициализации (важен):
+ *   Mobile: реального shadow-каталога нет — VirtualShadowManager держит
+ *   расшифрованный кэш в памяти, а AdapterPatcher.patch() подменяет методы
+ *   адаптера (прозрачный decrypt-on-read / encrypt-on-write поверх .enc).
+ *
+ * Порядок инициализации desktop (важен):
  *   AuthResult (engine) →
  *   ShadowVaultManager.initialize() →
- *   miграция plaintext (если есть) →
+ *   миграция plaintext (если есть) →
  *   decryptAllToShadow() — расшифровываем .enc → shadow →
  *   setupObsidianSymlink() — shadow/.obsidian → original/.obsidian →
  *   mount(adapter) — adapter.basePath = shadowRoot →
- *   patch(adapter) — write-through encrypt в оригинал →
+ *   setupVaultEventHandlers() — write-through encrypt в оригинал →
  *   SessionManager.startSession() — recovery + .session_active
  *
- * Порядок завершения (также важен):
+ * Порядок завершения desktop (также важен):
  *   encryptShadowChangesToOriginal() — финальная синхронизация изменений →
- *   unpatch + unmount(adapter) — восстанавливаем оригинальный basePath →
+ *   unmount(adapter) — восстанавливаем оригинальный basePath →
  *   teardownObsidianSymlink() →
  *   SessionManager.endSession() — удаление shadow + ключ destroy
  */
@@ -94,6 +100,13 @@ export default class ShadowVaultPlugin extends Plugin {
   private sessionActive = false;
 
   /**
+   * true с момента onunload — навсегда. Гейт для колбэков, переживающих
+   * выгрузку плагина (например onLayoutReady, который Obsidian не отписывает):
+   * колбэк мёртвого плагина не должен открывать InitModal.
+   */
+  private unloaded = false;
+
+  /**
    * true с момента входа в shutdown()/onunload до полного завершения.
    * Гейт для vault-обработчиков: пока флаг взведён, менеджер вот-вот будет
    * (или уже) обнулён — события Obsidian, прилетевшие «в полёте» (autosave/flush
@@ -105,8 +118,9 @@ export default class ShadowVaultPlugin extends Plugin {
 
   /**
    * Ссылка на оригинальный adapter.list() до ранней подмены.
-   * Нужна чтобы перед полным патчингом восстановить настоящий оригинал,
-   * иначе unpatch() вернёт раннюю подмену вместо нетронутого метода.
+   * Нужна чтобы восстановить настоящий оригинал перед созданием MobileAdapter
+   * и AdapterPatcher.patch() (mobile) или перед mount (desktop) — иначе адаптер
+   * навсегда держал бы раннюю подмену вместо нетронутого метода.
    */
   private earlyListOriginal: ((path: string) => Promise<ListedFiles>) | null = null;
 
@@ -165,8 +179,23 @@ export default class ShadowVaultPlugin extends Plugin {
       },
     });
 
+    // Единственная регистрация beforeunload на весь жизненный цикл плагина.
+    // Раньше обработчик вешался на каждый unlock (desktop и mobile пути) —
+    // циклы lock/unlock копили дубли до выгрузки плагина. Guard sessionActive
+    // делает вызов no-op вне активной сессии.
+    this.registerDomEvent(window as Window, "beforeunload", () => {
+      if (!this.sessionActive) return;
+      console.info("[ShadowVault] beforeunload: sync cleanup");
+      if (this.isDesktop) this.syncCleanup();
+      else this.syncCleanupMobile();
+    });
+
     // Показываем модал ввода пароля когда workspace готов к отображению UI
     this.app.workspace.onLayoutReady(() => {
+      // Колбэк onLayoutReady не привязан к жизненному циклу плагина: если
+      // плагин выгружен до готовности layout, без проверки флага он открыл бы
+      // InitModal мёртвого плагина.
+      if (this.unloaded) return;
       void this.openInitModal();
     });
 
@@ -174,9 +203,10 @@ export default class ShadowVaultPlugin extends Plugin {
   }
 
   onunload(): void {
-    // Взводим гейт первым делом: при закрытии Obsidian шлёт flush/autosave
-    // события «в полёте» — обработчики должны их игнорировать, а не
-    // дереференсить обнуляемый shadowManager.
+    // Взводим гейты первым делом: unloaded — чтобы пережившие выгрузку колбэки
+    // (onLayoutReady) не оживляли UI мёртвого плагина; shuttingDown — чтобы
+    // flush/autosave события «в полёте» не дереференсили обнуляемый shadowManager.
+    this.unloaded = true;
     this.shuttingDown = true;
     this.logger?.info("main", "onunload: старт", { sessionActive: this.sessionActive });
     // Снимаем глобальные обработчики ошибок.
@@ -218,6 +248,10 @@ export default class ShadowVaultPlugin extends Plugin {
    * Инициализирует логгер и баг-репортер. Запись идёт через Obsidian adapter
    * (кросс-платформенно desktop+mobile), без top-level node:fs. Каталоги —
    * внутри папки данных плагина: <configDir>/plugins/<id>/{logs,bug-reports}.
+   *
+   * ВАЖНО: вызывается ПОСЛЕ loadSettings() (см. порядок в onload) — уровень
+   * логирования берётся из сохранённой настройки debugLogging, иначе
+   * выключенный пользователем debug молча включался бы после рестарта.
    */
   private initDiagnostics(): void {
     const adapter = this.app.vault.adapter as unknown as LogAdapter;
@@ -225,8 +259,8 @@ export default class ShadowVaultPlugin extends Plugin {
     const logDir = `${pluginDir}/logs`;
     const reportDir = `${pluginDir}/bug-reports`;
 
-    // По умолчанию подробное логирование (пользователь просил «подробнейшее»).
-    const minLevel = LogLevel.DEBUG;
+    // Уровень — из настроек (по умолчанию DEBUG, см. DEFAULT_SETTINGS).
+    const minLevel = this.settings.debugLogging ? LogLevel.DEBUG : LogLevel.INFO;
 
     this.logger = new Logger(adapter, {
       logDir,
@@ -630,11 +664,10 @@ export default class ShadowVaultPlugin extends Plugin {
     // Шифрование отключено → PIN больше не нужен и невалиден.
     new PinStore().clearPin();
 
-    // 3. Снимаем mount/patch адаптера и удаляем shadow
+    // 3. Снимаем mount адаптера и удаляем shadow
     this.sessionActive = false;
     try {
       const adapter = this.app.vault.adapter as unknown as IDataAdapter;
-      this.shadowManager!.unpatch(adapter);
       this.shadowManager!.unmount(adapter);
       await this.shadowManager!.teardownObsidianSymlink();
     } catch (err) {
@@ -1034,14 +1067,8 @@ export default class ShadowVaultPlugin extends Plugin {
       // ── Phase 10: подписки на vault events для мирроринга в .enc ──────
       this.setupVaultEventHandlers();
 
-      // ── Phase 11: lifecycle hooks ─────────────────────────────────────
-      this.registerDomEvent(window as Window, "beforeunload", () => {
-        if (this.sessionActive) {
-          console.info("[ShadowVault] beforeunload: sync cleanup");
-          this.syncCleanup();
-        }
-      });
-
+      // ── Phase 11: lifecycle ───────────────────────────────────────────
+      // beforeunload зарегистрирован один раз в onload (guard sessionActive).
       this.shuttingDown = false;
       this.sessionActive = true;
 
@@ -1315,14 +1342,8 @@ export default class ShadowVaultPlugin extends Plugin {
       // ── Phase 7: подписки на vault events ─────────────────────────────
       this.setupVaultEventHandlers();
 
-      // ── Phase 8: lifecycle hooks ──────────────────────────────────────
-      this.registerDomEvent(window as Window, "beforeunload", () => {
-        if (this.sessionActive) {
-          console.info("[ShadowVault] beforeunload: mobile cleanup");
-          this.syncCleanupMobile();
-        }
-      });
-
+      // ── Phase 8: lifecycle ────────────────────────────────────────────
+      // beforeunload зарегистрирован один раз в onload (guard sessionActive).
       this.shuttingDown = false;
       this.sessionActive = true;
 
@@ -1723,7 +1744,6 @@ export default class ShadowVaultPlugin extends Plugin {
 
     if (this.shadowManager) {
       const adapter = this.app.vault.adapter as unknown as IDataAdapter;
-      this.shadowManager.unpatch(adapter);
       this.shadowManager.unmount(adapter);
       this.shadowManager = null;
     }
@@ -1777,7 +1797,7 @@ export default class ShadowVaultPlugin extends Plugin {
    * Порядок операций строго определён:
    *   1. encryptShadowChangesToOriginal() — финальная синхронизация изменений
    *      из shadow в оригинал.enc (страховка от пропущенных write-through).
-   *   2. unpatch() и unmount() — восстанавливаем адаптер до оригинала,
+   *   2. unmount() — восстанавливаем basePath адаптера до оригинала,
    *      ПЕРЕД удалением shadow vault, чтобы Obsidian не обращался к нему.
    *   3. teardownObsidianSymlink() — снимаем symlink .obsidian.
    *   4. SessionManager.endSession() — удаляем shadow vault, уничтожаем ключ.
@@ -1851,16 +1871,15 @@ export default class ShadowVaultPlugin extends Plugin {
       }
     }
 
-    // 2. Снимаем патч и mount с адаптера
+    // 2. Снимаем mount с адаптера
     try {
       if (this.shadowManager) {
         const adapter = this.app.vault.adapter as unknown as IDataAdapter;
-        this.shadowManager.unpatch(adapter);
         this.shadowManager.unmount(adapter);
         await this.shadowManager.teardownObsidianSymlink();
       }
     } catch (err) {
-      console.error("[ShadowVault] unpatch/unmount адаптера:", err);
+      console.error("[ShadowVault] unmount адаптера:", err);
     } finally {
       this.shadowManager = null;
     }
@@ -2164,7 +2183,7 @@ export default class ShadowVaultPlugin extends Plugin {
    * в lockVault() где у нас есть полноценный async-цикл.
    *
    * Порядок:
-   *   1. unpatch + unmount адаптера — Obsidian возвращается к оригинальному basePath.
+   *   1. unmount адаптера — Obsidian возвращается к оригинальному basePath.
    *   2. fs.unlinkSync символической ссылки .obsidian (только если это симлинк).
    *   3. fs.rmSync теневого хранилища целиком.
    *   4. fs.unlinkSync session.lock в папке плагина.
@@ -2212,9 +2231,7 @@ export default class ShadowVaultPlugin extends Plugin {
         console.error("[ShadowVault] sync проверка несхороненных:", e);
       }
 
-      // 1. unpatch + unmount
-      try { this.shadowManager.unpatch(adapter); console.debug("[ShadowVault] sync unpatch ok"); }
-      catch (e) { console.error("[ShadowVault] sync unpatch:", e); }
+      // 1. unmount
       try { this.shadowManager.unmount(adapter); console.debug("[ShadowVault] sync unmount ok"); }
       catch (e) { console.error("[ShadowVault] sync unmount:", e); }
 
