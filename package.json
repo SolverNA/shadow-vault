@@ -1,6 +1,6 @@
 {
   "name": "you-encrypt",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Transparent AES-256-GCM encryption plugin for Obsidian via VFS adapter monkey-patching",
   "main": "main.js",
   "scripts": {
